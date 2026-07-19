@@ -36,7 +36,7 @@ codex（パス指定時）/ cursor-agent / claude 用プロンプトには対象
 
 ### claude（役割レビュアー、選定した役割ごとに1インスタンス）
 
-- `cat <プロンプトファイル> | timeout 600 claude -p --model opus --tools "Read,Glob,Grep" > <出力ファイル> 2>&1`。`--tools "Read,Glob,Grep"` で読み取り専用ツールに制限する。`--permission-mode plan` は `-p` と併用すると ExitPlanMode 呼び出しに失敗して指摘本文が最終メッセージから消えるため使わない。
+- `cat <プロンプトファイル> | timeout 600 claude -p --model <モデル> --tools "Read,Glob,Grep" > <出力ファイル> 2>&1`。`<モデル>` には Step 3 で役割ごとに選定したエイリアス（`sonnet` または `opus`）を指定する。`--tools "Read,Glob,Grep"` で読み取り専用ツールに制限する。`--permission-mode plan` は `-p` と併用すると ExitPlanMode 呼び出しに失敗して指摘本文が最終メッセージから消えるため使わない。
 - 役割プロンプトはスキルのベースディレクトリ配下の `references/roles.md` から取得し、対象（パスまたは差分範囲）を埋め込む。
 
 ## 出力の成功判定・リトライ・欠席（Step 4）
