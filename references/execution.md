@@ -26,10 +26,10 @@ codex（パス指定時）/ cursor-agent / claude 用プロンプトには対象
 
 ### codex（役割レビュアー、選定した役割ごとに1インスタンス）
 
-- git 差分対象: `timeout 600 codex exec review --uncommitted -o <出力ファイル> - < <役割プロンプトファイル>`、デフォルトブランチ差分なら `timeout 600 codex exec review --base <ブランチ> -o <出力ファイル> - < <役割プロンプトファイル>`（`-` で stdin からプロンプトを読み、`-o` で最終メッセージをファイル出力する）。
-- パス指定対象: `timeout 600 codex exec -s read-only --skip-git-repo-check -o <出力ファイル> - < <役割プロンプトファイル>`（`-` で stdin からプロンプトを読む）。`--skip-git-repo-check` は git リポジトリ外での即時失敗を防ぐ。
+- モデルと reasoning effort は `~/.codex/config.toml` の既定に依存せず明示指定する（既定は別用途＝コーディング委譲のために変わり得るため）。共通プレフィックスを `codex -m gpt-5.6-sol -c model_reasoning_effort="<effort>"` とし、`<effort>` には Step 3 で役割ごとに選定した値（`high` または `xhigh`）を入れる。
+- git 差分対象: `timeout 600 codex -m gpt-5.6-sol -c model_reasoning_effort="<effort>" exec review --uncommitted -o <出力ファイル> - < <役割プロンプトファイル>`、デフォルトブランチ差分なら同プレフィックスで `exec review --base <ブランチ> -o <出力ファイル> - < <役割プロンプトファイル>`（`-` で stdin からプロンプトを読み、`-o` で最終メッセージをファイル出力する）。
+- パス指定対象: `timeout 600 codex -m gpt-5.6-sol -c model_reasoning_effort="<effort>" exec -s read-only --skip-git-repo-check -o <出力ファイル> - < <役割プロンプトファイル>`（`-` で stdin からプロンプトを読む）。`--skip-git-repo-check` は git リポジトリ外での即時失敗を防ぐ。
 - 役割プロンプトはスキルのベースディレクトリ配下の `references/roles.md` から取得し、対象（パスまたは差分範囲）を埋め込む。出力ファイル名は roles.md の各役割見出しの `role-<slug>.md` に従う。
-- reasoning effort は既定（`~/.codex/config.toml` の high）のまま起動し、Step 3 で xhigh に選定した役割のみ `codex -c model_reasoning_effort="xhigh" exec ...` のように `-c` を `codex` 直後に付けて上書きする。
 
 ### cursor-agent（汎用レビュアー、1インスタンス。既定で無効 — SKILL.md Step 3 で明示指定時のみ起動）
 
