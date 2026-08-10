@@ -6,7 +6,7 @@ SKILL.md の Step 4・6・7 から参照される実行手順。制御フロー�
 
 - 各レビュアーの作業ディレクトリは、git 管理下なら共通のリポジトリルート、非 git なら対象ディレクトリ（ファイル指定ならその親）とする。パス指定が複数のルート（リポジトリまたは非 git の対象ディレクトリ）にまたがり、作業ディレクトリを一意に決められない場合は中断してユーザーに確認する。
 - プロンプトはシェル引数に直接埋め込まず、イテレーションディレクトリにファイルとして保存し、codex / claude は stdin で、cursor-agent はパス参照で渡す（シェル特殊文字や可変長フラグに壊されるのを防ぐ）。
-- プロンプトファイル・出力ファイルは絶対パスで指定する（作業ディレクトリは対象プロジェクトのルートで、スクラッチパッドはその外にあるため）。出力先は当該イテレーションディレクトリ配下（例 `iter-1/codex.md`, `iter-1/cursor.md`, `iter-1/role-security.md`）。
+- プロンプトファイル・出力ファイルは絶対パスで指定する（作業ディレクトリは対象プロジェクトのルートで、スクラッチパッドはその外にあるため）。出力先は当該イテレーションディレクトリ配下（例 `iter-1/claude.md`, `iter-1/role-security.md`）。
 
 ## 時間制限（Step 4）
 
@@ -24,20 +24,21 @@ codex（パス指定時）/ cursor-agent / claude 用プロンプトには対象
 
 ## レビュアー別コマンド（Step 4）
 
-### codex（汎用レビュアー、1インスタンス）
+### codex（役割レビュアー、選定した役割ごとに1インスタンス）
 
-- git 差分対象: `timeout 600 codex exec review --uncommitted -o <出力ファイル> - < <プロンプトファイル>`、デフォルトブランチ差分なら `timeout 600 codex exec review --base <ブランチ> -o <出力ファイル> - < <プロンプトファイル>`（`-` で stdin からプロンプトを読み、`-o` で最終メッセージをファイル出力する）。
-- パス指定対象: `timeout 600 codex exec -s read-only --skip-git-repo-check -o <出力ファイル> - < <プロンプトファイル>`（`-` で stdin からプロンプトを読む）。`--skip-git-repo-check` は git リポジトリ外での即時失敗を防ぐ。
+- git 差分対象: `timeout 600 codex exec review --uncommitted -o <出力ファイル> - < <役割プロンプトファイル>`、デフォルトブランチ差分なら `timeout 600 codex exec review --base <ブランチ> -o <出力ファイル> - < <役割プロンプトファイル>`（`-` で stdin からプロンプトを読み、`-o` で最終メッセージをファイル出力する）。
+- パス指定対象: `timeout 600 codex exec -s read-only --skip-git-repo-check -o <出力ファイル> - < <役割プロンプトファイル>`（`-` で stdin からプロンプトを読む）。`--skip-git-repo-check` は git リポジトリ外での即時失敗を防ぐ。
+- 役割プロンプトはスキルのベースディレクトリ配下の `references/roles.md` から取得し、対象（パスまたは差分範囲）を埋め込む。出力ファイル名は roles.md の各役割見出しの `role-<slug>.md` に従う。
+- reasoning effort は既定（`~/.codex/config.toml` の high）のまま起動し、Step 3 で xhigh に選定した役割のみ `codex -c model_reasoning_effort="xhigh" exec ...` のように `-c` を `codex` 直後に付けて上書きする。
 
-### cursor-agent（汎用レビュアー、1インスタンス）
+### cursor-agent（汎用レビュアー、1インスタンス。既定で無効 — SKILL.md Step 3 で明示指定時のみ起動）
 
 - cursor-agent は長いプロンプトを引数で渡すと exit 0 のまま空出力になるため、プロンプトファイルのパスを含む短い指示を引数に渡し、cursor-agent 自身にファイルを読ませる: `timeout 600 cursor-agent -p --mode plan --trust --output-format text "まず <プロンプトファイル> を読み、その指示に従ってレビューを実行し、指示された報告フォーマットで結果を出力すること" > <出力ファイル> 2>&1`。plan モードは読み取り専用。
 - `--trust` はヘッドレス実行に必要。対象リポジトリの信頼を確認できない場合はユーザーに確認し、許可されなければ cursor-agent を欠席として最終レポートに明記する。
 
-### claude（役割レビュアー、選定した役割ごとに1インスタンス）
+### claude（汎用レビュアー、1インスタンス、Fable 5）
 
-- `cat <プロンプトファイル> | timeout 600 claude -p --model <モデル> --tools "Read,Glob,Grep" > <出力ファイル> 2>&1`。`<モデル>` には Step 3 で役割ごとに選定したエイリアス（`sonnet` または `opus`）を指定する。`--tools "Read,Glob,Grep"` で読み取り専用ツールに制限する。`--permission-mode plan` は `-p` と併用すると ExitPlanMode 呼び出しに失敗して指摘本文が最終メッセージから消えるため使わない。
-- 役割プロンプトはスキルのベースディレクトリ配下の `references/roles.md` から取得し、対象（パスまたは差分範囲）を埋め込む。
+- `cat <プロンプトファイル> | timeout 600 claude -p --model claude-fable-5 --tools "Read,Glob,Grep" > <出力ファイル> 2>&1`。`--tools "Read,Glob,Grep"` で読み取り専用ツールに制限する。`--permission-mode plan` は `-p` と併用すると ExitPlanMode 呼び出しに失敗して指摘本文が最終メッセージから消えるため使わない。
 
 ## 出力の成功判定・リトライ・欠席（Step 4）
 

@@ -1,13 +1,13 @@
 # multi-review-skill
 
-Claude Code 用スキル。codex / cursor-agent / claude に並列でコードレビューを依頼し、呼び出し元が指摘を選別・修正指揮し、未解決の妥当な指摘がなくなるまで再レビューを繰り返す。claude レビュアーは役割ごとにモデルを選定する（既定 sonnet、高難度の役割のみ opus）。
+Claude Code 用スキル。claude（汎用・Fable 5）と codex（役割別）に並列でコードレビューを依頼し、呼び出し元が指摘を選別・修正指揮し、未解決の妥当な指摘がなくなるまで再レビューを繰り返す。codex 役割レビュアーは役割ごとに reasoning effort を選定する（既定 high、高難度の役割のみ xhigh）。
 
 レビュアーは指摘を出すだけで、妥当性の判定はスキルを実行するメインセッションが行う。却下した指摘は理由付きで台帳に記録し、再レビュー時にレビュアーへ提示するため、同じ誤検知でループが空回りしない。本スキルの手順書自体を multi-review で9イテレーション・セルフレビューし、99件の修正を経て全レビュアー「問題なし」まで収束させて検証した。
 
 ## 必要なもの
 
 - Claude Code（実行主体）
-- レビュアー CLI（認証済みであること）: [codex](https://github.com/openai/codex) / [cursor-agent](https://cursor.com/cli) / claude
+- レビュアー CLI（認証済みであること）: [codex](https://github.com/openai/codex) / claude（[cursor-agent](https://cursor.com/cli) は既定で無効。起動時に明示した場合のみ使用）
 
 一部の CLI がなくても動く。未インストールのレビュアーは欠席として最終レポートに記録される。
 
