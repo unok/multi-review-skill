@@ -36,9 +36,9 @@ codex（パス指定時）/ cursor-agent / claude 用プロンプトには対象
 - cursor-agent は長いプロンプトを引数で渡すと exit 0 のまま空出力になるため、プロンプトファイルのパスを含む短い指示を引数に渡し、cursor-agent 自身にファイルを読ませる: `timeout 600 cursor-agent -p --mode plan --trust --output-format text "まず <プロンプトファイル> を読み、その指示に従ってレビューを実行し、指示された報告フォーマットで結果を出力すること" > <出力ファイル> 2>&1`。plan モードは読み取り専用。
 - `--trust` はヘッドレス実行に必要。対象リポジトリの信頼を確認できない場合はユーザーに確認し、許可されなければ cursor-agent を欠席として最終レポートに明記する。
 
-### claude（汎用レビュアー、1インスタンス、Fable 5）
+### claude（汎用レビュアー、1インスタンス、Fable 5.1）
 
-- `cat <プロンプトファイル> | timeout 600 claude -p --model claude-fable-5 --tools "Read,Glob,Grep" > <出力ファイル> 2>&1`。`--tools "Read,Glob,Grep"` で読み取り専用ツールに制限する。`--permission-mode plan` は `-p` と併用すると ExitPlanMode 呼び出しに失敗して指摘本文が最終メッセージから消えるため使わない。
+- `cat <プロンプトファイル> | timeout 600 claude -p --model claude-fable-5-1 --tools "Read,Glob,Grep" > <出力ファイル> 2>&1`。`--tools "Read,Glob,Grep"` で読み取り専用ツールに制限する。`--permission-mode plan` は `-p` と併用すると ExitPlanMode 呼び出しに失敗して指摘本文が最終メッセージから消えるため使わない。
 
 ## 出力の成功判定・リトライ・欠席（Step 4）
 
