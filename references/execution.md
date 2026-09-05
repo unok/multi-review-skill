@@ -26,9 +26,9 @@ codex（パス指定時）/ cursor-agent / claude 用プロンプトには対象
 
 ### codex（役割レビュアー、選定した役割ごとに1インスタンス）
 
-- モデルと reasoning effort は `~/.codex/config.toml` の既定に依存せず明示指定する（既定は別用途＝コーディング委譲のために変わり得るため）。共通プレフィックスを `codex -m gpt-6-astra -c model_reasoning_effort="<effort>"` とし、`<effort>` には Step 3 で役割ごとに選定した値（`medium` または `xhigh`）を入れる。
-- git 差分対象: `timeout 600 codex -m gpt-6-astra -c model_reasoning_effort="<effort>" exec review --uncommitted -o <出力ファイル> - < <役割プロンプトファイル>`、デフォルトブランチ差分なら同プレフィックスで `exec review --base <ブランチ> -o <出力ファイル> - < <役割プロンプトファイル>`（`-` で stdin からプロンプトを読み、`-o` で最終メッセージをファイル出力する）。
-- パス指定対象: `timeout 600 codex -m gpt-6-astra -c model_reasoning_effort="<effort>" exec -s read-only --skip-git-repo-check -o <出力ファイル> - < <役割プロンプトファイル>`（`-` で stdin からプロンプトを読む）。`--skip-git-repo-check` は git リポジトリ外での即時失敗を防ぐ。
+- モデルと reasoning effort は `~/.codex/config.toml` の既定に依存せず明示指定する（既定は別用途＝コーディング委譲のために変わり得るため）。共通プレフィックスを `codex -m <モデル> -c model_reasoning_effort="<effort>"` とし、`<モデル>` は総合なら `gpt-6-astra`、専門役割なら `gpt-5.6-sol`、`<effort>` には Step 3 で役割ごとに選定した値（`high` または `xhigh`）を入れる。以下のコマンド例は専門役割（sol）の形で、総合は `-m gpt-6-astra` に置き換える。
+- git 差分対象: `timeout 600 codex -m gpt-5.6-sol -c model_reasoning_effort="<effort>" exec review --uncommitted -o <出力ファイル> - < <役割プロンプトファイル>`、デフォルトブランチ差分なら同プレフィックスで `exec review --base <ブランチ> -o <出力ファイル> - < <役割プロンプトファイル>`（`-` で stdin からプロンプトを読み、`-o` で最終メッセージをファイル出力する）。
+- パス指定対象: `timeout 600 codex -m gpt-5.6-sol -c model_reasoning_effort="<effort>" exec -s read-only --skip-git-repo-check -o <出力ファイル> - < <役割プロンプトファイル>`（`-` で stdin からプロンプトを読む）。`--skip-git-repo-check` は git リポジトリ外での即時失敗を防ぐ。
 - 役割プロンプトはスキルのベースディレクトリ配下の `references/roles.md` から取得し、対象（パスまたは差分範囲）を埋め込む。出力ファイル名は roles.md の各役割見出しの `role-<slug>.md` に従う。
 
 ### cursor-agent（汎用レビュアー、1インスタンス。既定で無効 — SKILL.md Step 3 で明示指定時のみ起動）
@@ -36,8 +36,9 @@ codex（パス指定時）/ cursor-agent / claude 用プロンプトには対象
 - cursor-agent は長いプロンプトを引数で渡すと exit 0 のまま空出力になるため、プロンプトファイルのパスを含む短い指示を引数に渡し、cursor-agent 自身にファイルを読ませる: `timeout 600 cursor-agent -p --mode plan --trust --output-format text "まず <プロンプトファイル> を読み、その指示に従ってレビューを実行し、指示された報告フォーマットで結果を出力すること" > <出力ファイル> 2>&1`。plan モードは読み取り専用。
 - `--trust` はヘッドレス実行に必要。対象リポジトリの信頼を確認できない場合はユーザーに確認し、許可されなければ cursor-agent を欠席として最終レポートに明記する。
 
-### claude（汎用レビュアー、1インスタンス、Fable 5.1）
+### claude（総合レビュアー、1インスタンス、Fable 5.1）
 
+- プロンプトは roles.md の総合役割（codex の総合インスタンスと同一）に共通報告フォーマットと対象埋め込みを連結したもの。出力先は `claude.md`。
 - `cat <プロンプトファイル> | timeout 600 claude -p --model claude-fable-5-1 --tools "Read,Glob,Grep" > <出力ファイル> 2>&1`。`--tools "Read,Glob,Grep"` で読み取り専用ツールに制限する。`--permission-mode plan` は `-p` と併用すると ExitPlanMode 呼び出しに失敗して指摘本文が最終メッセージから消えるため使わない。
 
 ## 出力の成功判定・リトライ・欠席（Step 4）
