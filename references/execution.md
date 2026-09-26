@@ -24,7 +24,7 @@ codex（パス指定時）/ cursor-agent / claude 用プロンプトには対象
 
 ## レビュアー別コマンド（Step 4）
 
-### codex（役割レビュアー、選定した役割ごとに1インスタンス）
+### codex（総合レビュアー、1インスタンス。専門役割は claude で起動する）
 
 - モデルと reasoning effort は `~/.codex/config.toml` の既定に依存せず明示指定する（既定は別用途＝コーディング委譲のために変わり得るため）。共通プレフィックスを `codex -m <モデル> -c model_reasoning_effort="<effort>"` とし、`<モデル>` は総合の `gpt-6-luna`（codex は総合のみ。専門役割は claude の Opus 5.5 で起動する。後述）、`<effort>` は `max` 固定とする。
 - git 差分対象: `timeout 600 codex -m gpt-6-luna -c model_reasoning_effort="<effort>" exec review --uncommitted -o <出力ファイル> - < <役割プロンプトファイル>`、デフォルトブランチ差分なら同プレフィックスで `exec review --base <ブランチ> -o <出力ファイル> - < <役割プロンプトファイル>`（`-` で stdin からプロンプトを読み、`-o` で最終メッセージをファイル出力する）。
