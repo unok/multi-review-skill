@@ -56,6 +56,50 @@ codex（パス指定時）/ cursor-agent / claude 用プロンプトには対象
 
 Step 7 の diff 照合は、このスナップショット（複製の場合はその複製）との比較で行う。
 
+## 台帳 `findings.json`（Step 2・5・7）
+
+呼び出し元が書く唯一の正本。`jev-guard ledger render` と `jev-guard rereview` が読む。
+
+```json
+{
+  "reviewId": "multi-review-<タイムスタンプ>",
+  "iteration": 1,
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "高",
+      "source": "codex-general",
+      "file": "src/register.ts",
+      "line": 42,
+      "problem": "email が未検証のまま DB に保存される",
+      "fixSummary": "zod で email 形式を検証し、不正なら 400 を返す",
+      "status": "fixed"
+    },
+    {
+      "id": "F2",
+      "severity": "低",
+      "source": "claude-general",
+      "file": "src/register.ts",
+      "line": 10,
+      "problem": "命名が不統一",
+      "status": "rejected",
+      "reason": "既存規約に従っている"
+    }
+  ]
+}
+```
+
+- `id` は実行内で一意（`F1`, `F2`, …。イテレーションをまたいでも振り直さない）。`severity` は `高` / `中` / `低`。`source` は出所レビュアー（共通指摘は `,` 区切りで列挙）。
+- `status` は `unresolved` / `fixed` / `on_hold` / `rejected`。`reason` は `rejected` と `on_hold` で必須、それ以外は書かない（`null` も不可）。`fixSummary` は `fixed` にしたときに書く。
+- `iteration` は現在のイテレーション番号に更新する。
+
+## ゲート `jev-guard rereview`（Step 7）
+
+- 修正 diff をイテレーションディレクトリに保存する: git 管理下なら委譲前スナップショットとの差分（`git diff HEAD` の出力に untracked ファイルの本文を連結したもの）を `iter-N/fix.diff` に書く。複製モードなら複製と現在のファイルの `diff -u` を連結して書く。
+- 実行: `jev-guard rereview --findings <レビューディレクトリ>/findings.json --diff iter-N/fix.diff --base-summary "<Step 1 で確定した対象の1行要約>"`。判定は標準出力の JSON。`verdict`（`needed` / `skippable`）、`reason`、`findings[]`（指摘ごとの `resolved` と `confidence`）、`newRisk`、`verdictId`、`skippable` のときは `reviewPrompt` を持つ。
+- 結末の記録: `jev-guard record --id <verdictId> --outcome accepted|overruled [--note "<理由>"]`。`skippable` を採用したか覆したかを判定ログに残す。`needed` には記録しない。
+- 判定ログは `~/.local/share/jev-guard/verdicts.jsonl`（`JEV_GUARD_LOG_DIR` で変更可）。集計は `jev-guard stats`。
+
 ## 品質チェック（Step 6 の基準・Step 7 の判定）
 
 - 実行コマンドはプロジェクトの構成ファイル（package.json / Makefile / pyproject.toml / build.gradle 等）や CLAUDE.md から検出する。検出したコマンドにはレビュアーとは分離した時間制限（1800秒目安）を前置する。品質チェックは対象プロジェクトのコードを実行するため、ユーザー自身が開発している信頼済みプロジェクトを前提とする。
