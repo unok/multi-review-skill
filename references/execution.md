@@ -24,11 +24,11 @@ codex（パス指定時）/ cursor-agent / claude 用プロンプトには対象
 
 ## レビュアー別コマンド（Step 4）
 
-### codex（役割レビュアー、選定した役割ごとに1インスタンス）
+### codex（総合レビュアー、1インスタンス。専門役割は claude で起動する）
 
-- モデルと reasoning effort は `~/.codex/config.toml` の既定に依存せず明示指定する（既定は別用途＝コーディング委譲のために変わり得るため）。共通プレフィックスを `codex -m <モデル> -c model_reasoning_effort="<effort>"` とし、`<モデル>` は総合の `gpt-6-sol`（codex は総合のみ。専門役割は claude の Opus 5.5 で起動する。後述）、`<effort>` は `medium` 固定とする。
-- git 差分対象: `timeout 600 codex -m gpt-6-sol -c model_reasoning_effort="<effort>" exec review --uncommitted -o <出力ファイル> - < <役割プロンプトファイル>`、デフォルトブランチ差分なら同プレフィックスで `exec review --base <ブランチ> -o <出力ファイル> - < <役割プロンプトファイル>`（`-` で stdin からプロンプトを読み、`-o` で最終メッセージをファイル出力する）。
-- パス指定対象: `timeout 600 codex -m gpt-6-sol -c model_reasoning_effort="<effort>" exec -s read-only --skip-git-repo-check -o <出力ファイル> - < <役割プロンプトファイル>`（`-` で stdin からプロンプトを読む）。`--skip-git-repo-check` は git リポジトリ外での即時失敗を防ぐ。
+- モデルと reasoning effort は `~/.codex/config.toml` の既定に依存せず明示指定する（既定は別用途＝コーディング委譲のために変わり得るため）。共通プレフィックスを `codex -m <モデル> -c model_reasoning_effort="<effort>"` とし、`<モデル>` は総合の `gpt-6-luna`（codex は総合のみ。専門役割は claude の Opus 5.5 で起動する。後述）、`<effort>` は `max` 固定とする。
+- git 差分対象: `timeout 600 codex -m gpt-6-luna -c model_reasoning_effort="<effort>" exec review --uncommitted -o <出力ファイル> - < <役割プロンプトファイル>`、デフォルトブランチ差分なら同プレフィックスで `exec review --base <ブランチ> -o <出力ファイル> - < <役割プロンプトファイル>`（`-` で stdin からプロンプトを読み、`-o` で最終メッセージをファイル出力する）。
+- パス指定対象: `timeout 600 codex -m gpt-6-luna -c model_reasoning_effort="<effort>" exec -s read-only --skip-git-repo-check -o <出力ファイル> - < <役割プロンプトファイル>`（`-` で stdin からプロンプトを読む）。`--skip-git-repo-check` は git リポジトリ外での即時失敗を防ぐ。
 - 役割プロンプトはスキルのベースディレクトリ配下の `references/roles.md` から取得し、対象（パスまたは差分範囲）を埋め込む。出力ファイル名は roles.md の各役割見出しの `role-<slug>.md` に従う。
 
 ### cursor-agent（汎用レビュアー、1インスタンス。既定で無効 — SKILL.md Step 3 で明示指定時のみ起動）
@@ -39,7 +39,7 @@ codex（パス指定時）/ cursor-agent / claude 用プロンプトには対象
 ### claude（総合レビュアー＝Fable 5.1 の 1 インスタンス、専門役割＝Opus 5.5（effort high）の役割ごとのインスタンス）
 
 - 総合: プロンプトは roles.md の総合役割（codex の総合インスタンスと同一）に共通報告フォーマットと対象埋め込みを連結したもの。出力先は `claude.md`。
-- 専門役割: roles.md の各役割プロンプトに共通報告フォーマットと対象埋め込みを連結し、`--model claude-opus-5-5 --effort high` で役割ごとに起動する。出力先は `role-<slug>.md`。コマンド形は総合と同じで、`--model` を置き換えて `--effort high` を加える: `cat <プロンプトファイル> | timeout 600 claude -p --model claude-opus-5-5 --effort high --tools "Read,Glob,Grep" > <出力ファイル> 2>&1`（2026-09-11 に gpt-6-sol から変更）。
+- 専門役割: roles.md の各役割プロンプトに共通報告フォーマットと対象埋め込みを連結し、`--model claude-opus-5-5 --effort high` で役割ごとに起動する。出力先は `role-<slug>.md`。コマンド形は総合と同じで、`--model` を置き換えて `--effort high` を加える: `cat <プロンプトファイル> | timeout 600 claude -p --model claude-opus-5-5 --effort high --tools "Read,Glob,Grep" > <出力ファイル> 2>&1`（2026-09-11 に gpt-6-luna から変更）。
 - 総合のコマンド: `cat <プロンプトファイル> | timeout 600 claude -p --model claude-fable-5-1 --tools "Read,Glob,Grep" > <出力ファイル> 2>&1`。`--tools "Read,Glob,Grep"` で読み取り専用ツールに制限する。`--permission-mode plan` は `-p` と併用すると ExitPlanMode 呼び出しに失敗して指摘本文が最終メッセージから消えるため使わない。
 
 ## 出力の成功判定・リトライ・欠席（Step 4）
@@ -55,6 +55,50 @@ codex（パス指定時）/ cursor-agent / claude 用プロンプトには対象
 - HEAD が存在しない（コミット0件）または非 git 対象: 対象ファイルを複製して保存する。作業ツリー全体の複製はしない。これらのモードでは対象外ファイルへの修正を照合できないため、修正委譲の指示に「対象外ファイルは変更しない。変更が必要になった場合は中断して呼び出し元に報告する」を含める。
 
 Step 7 の diff 照合は、このスナップショット（複製の場合はその複製）との比較で行う。
+
+## 台帳 `findings.json`（Step 2・5・7）
+
+呼び出し元が書く唯一の正本。`jev-guard ledger render` と `jev-guard rereview` が読む。
+
+```json
+{
+  "reviewId": "multi-review-<タイムスタンプ>",
+  "iteration": 1,
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "高",
+      "source": "codex-general",
+      "file": "src/register.ts",
+      "line": 42,
+      "problem": "email が未検証のまま DB に保存される",
+      "fixSummary": "zod で email 形式を検証し、不正なら 400 を返す",
+      "status": "fixed"
+    },
+    {
+      "id": "F2",
+      "severity": "低",
+      "source": "claude-general",
+      "file": "src/register.ts",
+      "line": 10,
+      "problem": "命名が不統一",
+      "status": "rejected",
+      "reason": "既存規約に従っている"
+    }
+  ]
+}
+```
+
+- `id` は実行内で一意（`F1`, `F2`, …。イテレーションをまたいでも振り直さない）。`severity` は `高` / `中` / `低`。`source` は出所レビュアー（共通指摘は `,` 区切りで列挙）。
+- `status` は `unresolved` / `fixed` / `on_hold` / `rejected`。`reason` は `rejected` と `on_hold` で必須、それ以外は書かない（`null` も不可）。`fixSummary` は `fixed` にしたときに書く。
+- `iteration` は現在のイテレーション番号に更新する。
+
+## ゲート `jev-guard rereview`（Step 7）
+
+- 修正 diff をイテレーションディレクトリに保存する: git 管理下なら委譲前スナップショットとの差分（`git diff HEAD` の出力に untracked ファイルの本文を連結したもの）を `iter-N/fix.diff` に書く。複製モードなら複製と現在のファイルの `diff -u` を連結して書く。
+- 実行: `jev-guard rereview --findings <レビューディレクトリ>/findings.json --diff iter-N/fix.diff --base-summary "<Step 1 で確定した対象の1行要約>"`。判定は標準出力の JSON。`verdict`（`needed` / `skippable`）、`reason`、`findings[]`（指摘ごとの `resolved` と `confidence`）、`newRisk`、`verdictId`、`skippable` のときは `reviewPrompt` を持つ。
+- 結末の記録: `jev-guard record --id <verdictId> --outcome accepted|overruled [--note "<理由>"]`。`skippable` を採用したか覆したかを判定ログに残す。`needed` には記録しない。
+- 判定ログは `~/.local/share/jev-guard/verdicts.jsonl`（`JEV_GUARD_LOG_DIR` で変更可）。集計は `jev-guard stats`。
 
 ## 品質チェック（Step 6 の基準・Step 7 の判定）
 
