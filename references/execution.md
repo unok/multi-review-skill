@@ -73,7 +73,8 @@ Step 7 の diff 照合は、このスナップショット（複製の場合は�
       "line": 42,
       "problem": "email が未検証のまま DB に保存される",
       "fixSummary": "zod で email 形式を検証し、不正なら 400 を返す",
-      "status": "fixed"
+      "status": "fixed",
+      "fixedIteration": 1
     },
     {
       "id": "F2",
@@ -90,7 +91,7 @@ Step 7 の diff 照合は、このスナップショット（複製の場合は�
 ```
 
 - `id` は実行内で一意（`F1`, `F2`, …。イテレーションをまたいでも振り直さない）。`severity` は `高` / `中` / `低`。`source` は出所レビュアー（共通指摘は `,` 区切りで列挙）。
-- `status` は `unresolved` / `fixed` / `on_hold` / `rejected`。`reason` は `rejected` と `on_hold` で必須、それ以外は書かない（`null` も不可）。`fixSummary` は `fixed` にしたときに書く。
+- `status` は `unresolved` / `fixed` / `on_hold` / `rejected`。`reason` は `rejected` と `on_hold` で必須、それ以外は書かない（`null` も不可）。`fixSummary` は `fixed` にしたときに書く。`fixedIteration` は修正したイテレーションの正の整数を記録する。省略された修正済み指摘は rereview の対象外。
 - `iteration` は現在のイテレーション番号に更新する。
 
 ## ゲート `jev-guard rereview`（Step 7）
