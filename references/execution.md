@@ -42,6 +42,12 @@ codex（パス指定時）/ cursor-agent / claude 用プロンプトには対象
 - 専門役割: roles.md の各役割プロンプトに共通報告フォーマットと対象埋め込みを連結し、`--model claude-opus-5-5 --effort high` で役割ごとに起動する。出力先は `role-<slug>.md`。コマンド形は総合と同じで、`--model` を置き換えて `--effort high` を加える: `cat <プロンプトファイル> | timeout 600 claude -p --model claude-opus-5-5 --effort high --tools "Read,Glob,Grep" > <出力ファイル> 2>&1`（2026-09-11 に gpt-6-luna から変更）。
 - 総合のコマンド: `cat <プロンプトファイル> | timeout 600 claude -p --model claude-fable-5-1 --tools "Read,Glob,Grep" > <出力ファイル> 2>&1`。`--tools "Read,Glob,Grep"` で読み取り専用ツールに制限する。`--permission-mode plan` は `-p` と併用すると ExitPlanMode 呼び出しに失敗して指摘本文が最終メッセージから消えるため使わない。
 
+### ja-review（日本語校閲レビュアー、条件付き — SKILL.md Step 3 の条件を満たすときだけ起動）
+
+- 起動手順の正は ja-review スキル（`~/.claude/skills/ja-review/SKILL.md`）の Step 1〜3 とする。対象は multi-review の Step 1 で確定した範囲（差分モードなら同じ変更行）を使い、ja-review の Step 1 で対象を決め直さない。
+- バッチのプロンプト（`batch-N.txt`）と出力は、当該イテレーションディレクトリ配下の `ja-review/` に置く（出力は `ja-review/out-N.md`）。agy のコマンド形・時間制限・成功判定・1 回だけの再実行は ja-review スキルに従う。全バッチが失敗したら ja-review を欠席として扱う。
+- 他のレビュアーと同じメッセージ内でバックグラウンド起動する。指摘の選別は SKILL.md Step 5 で行う（ja-review の Step 5 以降の報告・修正は実行しない）。
+
 ## 出力の成功判定・リトライ・欠席（Step 4）
 
 - 出力ファイルが共通報告フォーマットの指摘または「問題なし」を含むことを成功条件とする。exit 0 でも空・形式外・締めの挨拶だけの出力は失敗としてリトライ対象にする。
