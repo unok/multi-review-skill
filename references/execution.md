@@ -15,10 +15,10 @@ SKILL.md の Step 4・6・7 から参照される実行手順。制御フロー�
 
 ## 対象埋め込みの生成（Step 4）
 
-codex（パス指定時）/ cursor-agent / claude 用プロンプトには対象を具体的に埋め込む。パス指定なら対象パス一覧を書く。git 差分の場合、claude は `--tools "Read,Glob,Grep"` でコマンドを実行できないため、呼び出し元が差分本文と対象ファイル一覧をプロンプトに埋め込む。cursor-agent 用プロンプトにも同じ差分本文とファイル一覧を埋め込む。差分基準は対象のモードで分岐し、codex のコマンドと対応させる。
+全レビュアーのプロンプトに対象を具体的に埋め込む。パス指定なら対象パス一覧を書く。git 差分の場合、呼び出し元が差分本文と対象ファイル一覧を codex / claude / cursor-agent のプロンプトに埋め込む（claude は `--tools "Read,Glob,Grep"` でコマンドを実行できず、codex は `exec review` の差分指定を使えないため。後述）。差分基準は対象のモードで分岐する。
 
-- 未コミット変更モード（codex は `--uncommitted`）: `git diff HEAD` の出力＋untracked ファイルの本文＋`git status --porcelain` 由来のファイル一覧を埋め込む。HEAD が存在しない（コミットが1つもない）場合は全対象ファイルの本文を差分の代わりに埋め込む。
-- ベース差分モード（codex は `--base <ブランチ>`）: merge-base 起点の `git diff <base>...HEAD` の出力とファイル一覧を埋め込む。再レビューでは、修正で生じた未コミットの差分（`git diff HEAD` の出力と untracked ファイルの本文）を claude / cursor-agent に加えて codex のプロンプトにも埋め込む（`--base` は未コミット修正を見ないため、codex には埋め込まない一般規定の例外。SKILL.md Step 7 の規定に対応）。
+- 未コミット変更モード: `git diff HEAD` の出力＋untracked ファイルの本文＋`git status --porcelain` 由来のファイル一覧を埋め込む。HEAD が存在しない（コミットが1つもない）場合は全対象ファイルの本文を差分の代わりに埋め込む。
+- ベース差分モード: merge-base 起点の `git diff <base>...HEAD` の出力とファイル一覧を埋め込む。再レビューでは、修正で生じた未コミットの差分（`git diff HEAD` の出力と untracked ファイルの本文）も全レビュアーのプロンプトに加える（SKILL.md Step 7 の規定に対応）。
 
 差分が大きすぎる場合は、差分全文をイテレーションディレクトリにファイルとして保存し、その絶対パスをプロンプトに記載して各レビュアーに読ませる（claude は Read で読める）。対象判定・ファイル一覧・全レビュアーで同じ範囲を使う。
 
@@ -27,8 +27,8 @@ codex（パス指定時）/ cursor-agent / claude 用プロンプトには対象
 ### codex（総合レビュアー、1インスタンス。専門役割は claude で起動する）
 
 - モデルと reasoning effort は `~/.codex/config.toml` の既定に依存せず明示指定する（既定は別用途＝コーディング委譲のために変わり得るため）。共通プレフィックスを `codex -m <モデル> -c model_reasoning_effort="<effort>"` とし、`<モデル>` は総合の `gpt-6.1-sol`（codex は総合のみ。専門役割は claude の Opus 5.5 で起動する。後述）、`<effort>` は `medium` 固定とする。
-- git 差分対象: `timeout 600 codex -m gpt-6.1-sol -c model_reasoning_effort="<effort>" exec review --uncommitted -o <出力ファイル> - < <役割プロンプトファイル>`、デフォルトブランチ差分なら同プレフィックスで `exec review --base <ブランチ> -o <出力ファイル> - < <役割プロンプトファイル>`（`-` で stdin からプロンプトを読み、`-o` で最終メッセージをファイル出力する）。
-- パス指定対象: `timeout 600 codex -m gpt-6.1-sol -c model_reasoning_effort="<effort>" exec -s read-only --skip-git-repo-check -o <出力ファイル> - < <役割プロンプトファイル>`（`-` で stdin からプロンプトを読む）。`--skip-git-repo-check` は git リポジトリ外での即時失敗を防ぐ。
+- コマンドは対象のモードによらず `timeout 600 codex -m gpt-6.1-sol -c model_reasoning_effort="<effort>" exec -s read-only --skip-git-repo-check -o <出力ファイル> - < <役割プロンプトファイル>` とする（`-` で stdin からプロンプトを読み、`-o` で最終メッセージをファイル出力する）。`--skip-git-repo-check` は git リポジトリ外での即時失敗を防ぐ。git 差分は前述の対象埋め込みでプロンプトに含める。
+- `exec review --uncommitted` / `exec review --base <ブランチ>` は使わない。codex-cli 0.161.0 ではどちらもプロンプトとの併用を受け付けず（`the argument '--uncommitted' cannot be used with '[PROMPT]'`）、役割プロンプトと報告フォーマットを渡せないため。
 - 役割プロンプトはスキルのベースディレクトリ配下の `references/roles.md` から取得し、対象（パスまたは差分範囲）を埋め込む。出力ファイル名は roles.md の各役割見出しの `role-<slug>.md` に従う。
 
 ### cursor-agent（汎用レビュアー、1インスタンス。既定で無効 — SKILL.md Step 3 で明示指定時のみ起動）
