@@ -46,7 +46,7 @@ SKILL.md の Step 4・6・7 から参照される実行手順。制御フロー�
 
 - 起動手順の正は ja-review スキル（`~/.claude/skills/ja-review/SKILL.md`）の Step 1〜3 とする。対象は multi-review の Step 1 で確定した範囲（差分モードなら同じ変更行）を使い、ja-review の Step 1 で対象を決め直さない。
 - バッチのプロンプト（`batch-N.txt`）と出力は、当該イテレーションディレクトリ配下の `ja-review/` に置く（出力は `ja-review/out-N.md`）。agy のコマンド形・時間制限・成功判定・1 回だけの再実行は ja-review スキルに従う。全バッチが失敗したら ja-review を欠席として扱う。
-- 他のレビュアーと同じメッセージ内でバックグラウンド起動する。指摘の選別は SKILL.md Step 5 で行う（ja-review の Step 5 以降の報告・修正は実行しない）。
+- 他のレビュアーと並べて起動する（起動方式は SKILL.md Step 4）。指摘の選別は SKILL.md Step 5 で行う（ja-review の Step 5 以降の報告・修正は実行しない）。
 
 ## 出力の成功判定・リトライ・欠席（Step 4）
 
