@@ -103,7 +103,7 @@ Step 7 の diff 照合は、このスナップショット（複製の場合は�
 ## ゲート `jev-guard rereview`（Step 7）
 
 - 修正 diff をイテレーションディレクトリに保存する: git 管理下なら委譲前スナップショットとの差分（`git diff HEAD` の出力に untracked ファイルの本文を連結したもの）を `iter-N/fix.diff` に書く。複製モードなら複製と現在のファイルの `diff -u` を連結して書く。
-- 実行: `jev-guard rereview --findings <レビューディレクトリ>/findings.json --diff iter-N/fix.diff --base-summary "<Step 1 で確定した対象の1行要約>"`。判定は標準出力の JSON。`verdict`（`needed` / `skippable`）、`reason`、`findings[]`（指摘ごとの `resolved` と `confidence`）、`newRisk`、`verdictId`、`skippable` のときは `reviewPrompt` を持つ。
+- 実行: `jev-guard rereview --provider claude --findings <レビューディレクトリ>/findings.json --diff iter-N/fix.diff --base-summary "<Step 1 で確定した対象の1行要約>"`。判定は標準出力の JSON。`verdict`（`needed` / `skippable`）、`reason`、`findings[]`（指摘ごとの `resolved` と `confidence`）、`newRisk`、`verdictId`、`skippable` のときは `reviewPrompt` を持つ。
 - 結末の記録: `jev-guard record --id <verdictId> --outcome accepted|overruled [--note "<理由>"]`。`skippable` を採用したか覆したかを判定ログに残す。`needed` には記録しない。
 - 判定ログは `~/.local/share/jev-guard/verdicts.jsonl`（`JEV_GUARD_LOG_DIR` で変更可）。集計は `jev-guard stats`。
 
