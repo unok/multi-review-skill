@@ -1,6 +1,6 @@
 # multi-review-skill
 
-Claude Code と Codex の両方から使うスキル。claude（総合＝Fable 5.1 medium、専門役割＝Opus 5.5 high）と codex（総合＝gpt-6.1-sol medium）に並列でコードレビューを依頼し、呼び出し元が指摘を選別して修正を指揮し、未解決の妥当な指摘がなくなるまで再レビューを繰り返す。`--profile codex` で総合の claude 枠を Opus 5.5 high、専門役割を codex（gpt-6.1-sol high）に切り替えられる。
+Claude Code と Codex の両方から使うスキル。claude（総合＝Opus 5.5 medium、専門役割＝Opus 5.5 high）と codex（総合＝gpt-6.1-sol medium）に並列でコードレビューを依頼し、呼び出し元が指摘を選別して修正を指揮し、未解決の妥当な指摘がなくなるまで再レビューを繰り返す。`--profile codex` で総合の claude 枠を Opus 5.5 high、専門役割を codex（gpt-6.1-sol high）に切り替えられる。
 
 レビュアーは指摘を出すだけで、妥当性の判定はスキルを実行するメインセッションが行う。却下した指摘は理由付きで台帳に記録し、再レビュー時にレビュアーへ提示するため、同じ誤検知でループが空回りしない。本スキルの手順書自体を multi-review で9イテレーション・セルフレビューし、99件の修正を経て全レビュアー「問題なし」まで収束させて検証した。
 
