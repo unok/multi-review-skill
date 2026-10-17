@@ -1,6 +1,6 @@
 # multi-review-skill
 
-Claude Code と Codex の両方から使うスキル。claude（総合＝Fable 5.1、専門役割＝Opus 5.5 high）と codex（総合＝gpt-6.1-sol）に並列でコードレビューを依頼し、呼び出し元が指摘を選別・修正指揮し、未解決の妥当な指摘がなくなるまで再レビューを繰り返す。codex の総合レビュアーの reasoning effort は medium 固定。
+Claude Code と Codex の両方から使うスキル。claude（総合＝Fable 5.1、専門役割＝Opus 5.5 high）と codex（総合＝gpt-6.1-sol）に並列でコードレビューを依頼し、呼び出し元が指摘を選別して修正を指揮し、未解決の妥当な指摘がなくなるまで再レビューを繰り返す。`--profile codex` で総合の Claude 枠を Opus 5.5 high、専門役割を codex（gpt-6.1-sol high）に切り替えられる。codex の総合は両構成とも medium。
 
 レビュアーは指摘を出すだけで、妥当性の判定はスキルを実行するメインセッションが行う。却下した指摘は理由付きで台帳に記録し、再レビュー時にレビュアーへ提示するため、同じ誤検知でループが空回りしない。本スキルの手順書自体を multi-review で9イテレーション・セルフレビューし、99件の修正を経て全レビュアー「問題なし」まで収束させて検証した。
 
@@ -25,7 +25,8 @@ Claude Code では `/multi-review` または「複眼レビューして」、Cod
 
 - 引数なし: git の未コミット変更を対象にする。なければデフォルトブランチとの差分
 - パス指定: `/multi-review src/billing` のようにディレクトリ・ファイルを対象にできる
-- レビュアーの除外・限定: 「codex 抜きで」「claude だけで」
+- レビュアーの除外・限定: 「codex 抜きで」「claude だけで」。指定した CLI の全役割に適用
+- モデル構成: `$multi-review --profile codex`（パスとの併用例: `$multi-review --profile codex src/billing`）。省略時と `--profile default` は従来構成で、呼び出し元による自動切り替えはしない
 
 1イテレーションは、レビュアー並列起動 → 選別（修正方針サマリを表示）→ 修正サブエージェントへの委譲 → diff 照合と品質チェック → 再レビューの順に進む。上限は5イテレーションで、到達時は残存指摘を報告して停止する。
 

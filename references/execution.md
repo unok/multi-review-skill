@@ -24,23 +24,24 @@ SKILL.md の Step 2・4・5・6・7・8 から参照される実行手順。制�
 
 ## レビュアー別コマンド（Step 4）
 
-### codex（総合レビュアー、1インスタンス。専門役割は claude で起動する）
+### codex（総合1インスタンス。`codex` プロファイルでは専門役割も担当）
 
-- モデルと reasoning effort は `~/.codex/config.toml` の既定に依存せず明示指定する（既定は別用途＝コーディング委譲のために変わり得るため）。共通プレフィックスを `codex -m <モデル> -c model_reasoning_effort="<effort>"` とし、`<モデル>` は総合の `gpt-6.1-sol`（codex は総合のみ。専門役割は claude の Opus 5.5 で起動する。後述）、`<effort>` は `medium` 固定とする。
+- モデルと reasoning effort は `~/.codex/config.toml` の既定に依存せず明示指定する（既定はコーディング委譲用に変わり得るため）。モデルは `gpt-6.1-sol`、effort は総合 `medium`、`codex` プロファイルの専門役割 `high`。専門役割は役割ごとに別インスタンスで起動する（`default` では claude が担当）。
 - コマンドは対象のモードによらず `timeout 600 codex -m gpt-6.1-sol -c model_reasoning_effort="<effort>" exec -s read-only --skip-git-repo-check -o <出力ファイル> - < <役割プロンプトファイル>` とする（`-` で stdin からプロンプトを読み、`-o` で最終メッセージをファイル出力する）。`--skip-git-repo-check` は git リポジトリ外での即時失敗を防ぐ。git 差分は前述の対象埋め込みでプロンプトに含める。
 - `exec review --uncommitted` / `exec review --base <ブランチ>` は使わない。codex-cli 0.161.0 ではどちらもプロンプトとの併用を受け付けず（`the argument '--uncommitted' cannot be used with '[PROMPT]'`）、役割プロンプトと報告フォーマットを渡せないため。
-- 役割プロンプトはスキルのベースディレクトリ配下の `references/roles.md` から取得し、対象（パスまたは差分範囲）を埋め込む。出力ファイル名は roles.md の各役割見出しの `role-<slug>.md` に従う。
+- 役割プロンプトはスキルのベースディレクトリ配下の `references/roles.md` から取得し、対象（パスまたは差分範囲）を埋め込む。出力ファイル名は総合が `role-general.md`、専門役割が roles.md の各役割見出しの `role-<slug>.md`。台帳の `source` は `codex-general` / `codex-<slug>` とする。
 
 ### cursor-agent（汎用レビュアー、1インスタンス。既定で無効 — SKILL.md Step 3 で明示指定時のみ起動）
 
 - cursor-agent は長いプロンプトを引数で渡すと exit 0 のまま空出力になるため、プロンプトファイルのパスを含む短い指示を引数に渡し、cursor-agent 自身にファイルを読ませる: `timeout 600 cursor-agent -p --mode plan --trust --output-format text "まず <プロンプトファイル> を読み、その指示に従ってレビューを実行し、指示された報告フォーマットで結果を出力すること" > <出力ファイル> 2>&1`。plan モードは読み取り専用。
 - `--trust` はヘッドレス実行に必要。対象リポジトリの信頼を確認できない場合はユーザーに確認し、許可されなければ cursor-agent を欠席として最終レポートに明記する。
 
-### claude（総合レビュアー＝Fable 5.1 の 1 インスタンス、専門役割＝Opus 5.5（effort high）の役割ごとのインスタンス）
+### claude（総合1インスタンス。`default` プロファイルでは専門役割も担当）
 
-- 総合: プロンプトは roles.md の総合役割（codex の総合インスタンスと同一）に共通報告フォーマットと対象埋め込みを連結したもの。出力先は `claude.md`。
-- 専門役割: roles.md の各役割プロンプトに共通報告フォーマットと対象埋め込みを連結し、`--model claude-opus-5-5 --effort high` で役割ごとに起動する。出力先は `role-<slug>.md`。コマンド形は総合と同じで、`--model` を置き換えて `--effort high` を加える: `cat <プロンプトファイル> | timeout 600 claude -p --model claude-opus-5-5 --effort high --tools "Read,Glob,Grep" > <出力ファイル> 2>&1`（2026-09-11 に gpt-6-luna から変更）。
-- 総合のコマンド: `cat <プロンプトファイル> | timeout 600 claude -p --model claude-fable-5-1 --tools "Read,Glob,Grep" > <出力ファイル> 2>&1`。`--tools "Read,Glob,Grep"` で読み取り専用ツールに制限する。`--permission-mode plan` は `-p` と併用すると ExitPlanMode 呼び出しに失敗して指摘本文が最終メッセージから消えるため使わない。
+- 総合: `default` は Fable 5.1、`codex` は Opus 5.5 high。プロンプトは roles.md の総合役割（codex の総合インスタンスと同一）に共通報告フォーマットと対象埋め込みを連結したもの。出力先は `claude.md`、台帳の `source` は `claude-general`。
+- 専門役割（`default` のみ）: roles.md の各役割プロンプトに共通報告フォーマットと対象埋め込みを連結し、`--model claude-opus-5-5 --effort high` で役割ごとに起動する。出力先は `role-<slug>.md`。`cat <プロンプトファイル> | timeout 600 claude -p --model claude-opus-5-5 --effort high --tools "Read,Glob,Grep" > <出力ファイル> 2>&1`。台帳の `source` は `claude-<slug>`。
+- 総合のコマンド（`default`）: `cat <プロンプトファイル> | timeout 600 claude -p --model claude-fable-5-1 --tools "Read,Glob,Grep" > <出力ファイル> 2>&1`。`--tools "Read,Glob,Grep"` で読み取り専用ツールに制限する。`--permission-mode plan` は `-p` と併用すると ExitPlanMode 呼び出しに失敗して指摘本文が最終メッセージから消えるため使わない。
+- 総合のコマンド（`codex`）: `cat <プロンプトファイル> | timeout 600 claude -p --model claude-opus-5-5 --effort high --tools "Read,Glob,Grep" > <出力ファイル> 2>&1`。このプロファイルでは claude の専門役割を起動しない。
 
 ### ja-review（日本語校閲レビュアー、条件付き — SKILL.md Step 3 の条件を満たすときだけ起動）
 
@@ -116,7 +117,8 @@ Step 7 の diff 照合は、このスナップショット（複製の場合は�
 
 - 対象: <Step 1 で確定した対象の1行要約>
 - イテレーション: <N>（打ち切った場合はその理由）
-- レビュアー: <起動したレビュアーと役割> / 欠席: <なし or 一覧>
+- プロファイル: <default|codex>
+- レビュアー: <起動した CLI・役割・モデル・effort> / 欠席: <なし or 一覧>
 - ゲート: <イテレーションごとの結果を「iter-1: …」の形で>
 - 品質チェック: <Step 8 のラベル>
 
