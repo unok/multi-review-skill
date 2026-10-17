@@ -38,9 +38,9 @@ SKILL.md の Step 2・4・5・6・7・8 から参照される実行手順。制�
 
 ### claude（総合1インスタンス。`default` プロファイルでは専門役割も担当）
 
-- 総合: `default` は Fable 5.1、`codex` は Opus 5.5 high。プロンプトは roles.md の総合役割（codex の総合インスタンスと同一）に共通報告フォーマットと対象埋め込みを連結したもの。出力先は `claude.md`、台帳の `source` は `claude-general`。
+- 総合: `default` は Fable 5.1 medium、`codex` は Opus 5.5 high。プロンプトは roles.md の総合役割（codex の総合インスタンスと同一）に共通報告フォーマットと対象埋め込みを連結したもの。出力先は `claude.md`、台帳の `source` は `claude-general`。
 - 専門役割（`default` のみ）: roles.md の各役割プロンプトに共通報告フォーマットと対象埋め込みを連結し、`--model claude-opus-5-5 --effort high` で役割ごとに起動する。出力先は `role-<slug>.md`。`cat <プロンプトファイル> | timeout 600 claude -p --model claude-opus-5-5 --effort high --tools "Read,Glob,Grep" > <出力ファイル> 2>&1`。台帳の `source` は `claude-<slug>`。
-- 総合のコマンド（`default`）: `cat <プロンプトファイル> | timeout 600 claude -p --model claude-fable-5-1 --tools "Read,Glob,Grep" > <出力ファイル> 2>&1`。`--tools "Read,Glob,Grep"` で読み取り専用ツールに制限する。`--permission-mode plan` は `-p` と併用すると ExitPlanMode 呼び出しに失敗して指摘本文が最終メッセージから消えるため使わない。
+- 総合のコマンド（`default`）: `cat <プロンプトファイル> | timeout 600 claude -p --model claude-fable-5-1 --effort medium --tools "Read,Glob,Grep" > <出力ファイル> 2>&1`。`--tools "Read,Glob,Grep"` で読み取り専用ツールに制限する。`--permission-mode plan` は `-p` と併用すると ExitPlanMode 呼び出しに失敗して指摘本文が最終メッセージから消えるため使わない。
 - 総合のコマンド（`codex`）: `cat <プロンプトファイル> | timeout 600 claude -p --model claude-opus-5-5 --effort high --tools "Read,Glob,Grep" > <出力ファイル> 2>&1`。このプロファイルでは claude の専門役割を起動しない。
 
 ### ja-review（日本語校閲レビュアー、条件付き — SKILL.md Step 3 の条件を満たすときだけ起動）
