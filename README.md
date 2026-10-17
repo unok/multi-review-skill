@@ -1,12 +1,12 @@
 # multi-review-skill
 
-Claude Code 用スキル。claude（総合＝Fable 5.1、専門役割＝Opus 5.5 high）と codex（総合＝gpt-6.1-sol）に並列でコードレビューを依頼し、呼び出し元が指摘を選別・修正指揮し、未解決の妥当な指摘がなくなるまで再レビューを繰り返す。codex の総合レビュアーの reasoning effort は medium 固定。
+Claude Code と Codex の両方から使うスキル。claude（総合＝Fable 5.1、専門役割＝Opus 5.5 high）と codex（総合＝gpt-6.1-sol）に並列でコードレビューを依頼し、呼び出し元が指摘を選別・修正指揮し、未解決の妥当な指摘がなくなるまで再レビューを繰り返す。codex の総合レビュアーの reasoning effort は medium 固定。
 
 レビュアーは指摘を出すだけで、妥当性の判定はスキルを実行するメインセッションが行う。却下した指摘は理由付きで台帳に記録し、再レビュー時にレビュアーへ提示するため、同じ誤検知でループが空回りしない。本スキルの手順書自体を multi-review で9イテレーション・セルフレビューし、99件の修正を経て全レビュアー「問題なし」まで収束させて検証した。
 
 ## 必要なもの
 
-- Claude Code（実行主体）
+- Claude Code または Codex（実行主体）
 - レビュアー CLI（認証済みであること）: [codex](https://github.com/openai/codex) / claude（[cursor-agent](https://cursor.com/cli) は既定で無効。起動時に明示した場合のみ使用）
 
 一部の CLI がなくても動く。未インストールのレビュアーは欠席として最終レポートに記録される。
@@ -15,12 +15,13 @@ Claude Code 用スキル。claude（総合＝Fable 5.1、専門役割＝Opus 5.5
 
 ```bash
 git clone https://github.com/unok/multi-review-skill.git ~/git/multi-review-skill
-ln -s ~/git/multi-review-skill ~/.claude/skills/multi-review
+ln -s ~/git/multi-review-skill ~/.claude/skills/multi-review   # Claude Code
+ln -s ~/git/multi-review-skill ~/.codex/skills/multi-review    # Codex
 ```
 
 ## 使い方
 
-Claude Code で `/multi-review` または「複眼レビューして」と入力する。
+Claude Code では `/multi-review` または「複眼レビューして」、Codex では `$multi-review` と入力する（Codex では暗黙の起動を `agents/openai.yaml` で無効にしているので、名前を指定して起動する）。
 
 - 引数なし: git の未コミット変更を対象にする。なければデフォルトブランチとの差分
 - パス指定: `/multi-review src/billing` のようにディレクトリ・ファイルを対象にできる
