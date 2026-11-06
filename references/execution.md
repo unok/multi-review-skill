@@ -18,7 +18,7 @@ SKILL.md の Step 2・4・5・6・7・8 から参照される実行手順。制�
 全レビュアーのプロンプトに、そのイテレーションのレビュー対象範囲を具体的に埋め込む。パス指定なら対象パス一覧を書く。git 差分の場合、呼び出し元が差分本文と対象ファイル一覧を codex / claude / cursor-agent のプロンプトに埋め込む（claude は `--tools "Read,Glob,Grep"` でコマンドを実行できず、codex は `exec review` の差分指定を使えないため。後述）。差分基準は対象のモードで分岐する。
 
 - 未コミット変更モード: `git diff HEAD` の出力＋untracked ファイルの本文＋`git status --porcelain` 由来のファイル一覧を埋め込む。HEAD が存在しない（コミットが1つもない）場合は全対象ファイルの本文を差分の代わりに埋め込む。
-- ベース差分モード: merge-base 起点の `git diff <base>...HEAD` の出力とファイル一覧を埋め込む。再レビューでは、修正で生じた未コミットの差分（`git diff HEAD` の出力と untracked ファイルの本文）も全レビュアーのプロンプトに加える（SKILL.md Step 7 の規定に対応）。
+- ベース差分モード: merge-base 起点の `git diff <base>...HEAD` の出力とファイル一覧を埋め込む。再レビューでは、修正で生じた未コミットの差分（`git diff HEAD` の出力と untracked ファイルの本文で、イテレーションをまたぐ累積の差分）も全レビュアーのプロンプトに加える（SKILL.md Step 7 の規定に対応）。
 
 差分が大きすぎる場合は、差分全文をイテレーションディレクトリにファイルとして保存し、その絶対パスをプロンプトに記載して各レビュアーに読ませる（claude は Read で読める）。対象判定・ファイル一覧・全レビュアーで同じ範囲を使う。
 
@@ -54,18 +54,50 @@ SKILL.md の Step 2・4・5・6・7・8 から参照される実行手順。制�
 - 出力ファイルが共通報告フォーマットの指摘または「問題なし」を含むことを成功条件とする。exit 0 でも空・形式外・締めの挨拶だけの出力は失敗としてリトライ対象にする。
 - 失敗・タイムアウトしたレビュアーは1度だけ再起動する。それでも失敗なら欠席として除外し、最終レポートに明記する。
 
-## スナップショット（Step 6）
+## スナップショットと修正 diff（Step 6・7）
 
-委譲の直前にスナップショットをイテレーションディレクトリへ保存する（元々未コミット変更が対象の場合に修正分を特定するため）。
+委譲前スナップショットはイテレーションごとに1回、初回委譲の直前にだけ保存し、差し戻し・再委譲でも同じものを使う。`git diff HEAD` はレビュー対象の未コミット変更まで含んでゲートが毎回 `needed`（理由 `new_risk`）を返すため採用しない。`git stash create` は untracked を含まないため採用しない。利用者のインデックスを写す案は assume-unchanged・skip-worktree のフラグと racy-git の判定を引き継ぎ、変更が木に入らないため採用しない。
 
-- git 管理下で HEAD あり: `git diff HEAD` の出力と untracked ファイルの一覧および内容を保存する。
-- HEAD が存在しない（コミット0件）または非 git 対象（複製モード）: レビュー対象範囲と委譲する指摘の位置に含まれるファイルを複製して保存する。作業ツリー全体の複製はしない。スナップショット外のファイルへの修正は diff 照合できないため、実装せずに報告する。
-
-Step 7 の diff 照合は、このスナップショット（複製の場合はその複製）との比較で行う。
+- 木の方式（`snapshot.mode` が `tree`）での保存（git 管理下）: リポジトリルートで次を実行し、HEAD があれば HEAD から、なければ空の一時インデックスを作り、作業ツリーを反映した木の ID を保存する。`<イテレーションディレクトリ>` は絶対パスで指定する。
+  ```bash
+  set -o pipefail
+  if git rev-parse --verify HEAD >/dev/null 2>&1; then
+    GIT_INDEX_FILE="<イテレーションディレクトリ>/snapshot.index" git read-tree HEAD
+  else
+    GIT_INDEX_FILE="<イテレーションディレクトリ>/snapshot.index" git read-tree --empty
+  fi &&
+    GIT_INDEX_FILE="<イテレーションディレクトリ>/snapshot.index" git add -A &&
+    (git ls-files -z -c -i --exclude-standard | GIT_INDEX_FILE="<イテレーションディレクトリ>/snapshot.index" git update-index --add --remove -z --stdin) &&
+    GIT_INDEX_FILE="<イテレーションディレクトリ>/snapshot.index" git write-tree > "<イテレーションディレクトリ>/snapshot.tree"
+  ```
+  HEAD または利用者のインデックスで追跡する ignore 対象と untracked を含め、追跡外の ignore 対象は含めない。全ファイルを毎回ハッシュし直すため、大きなリポジトリでは数秒かかる。利用者のインデックス・作業ツリー・ブランチは変わらず、一時インデックスと木の ID はイテレーションディレクトリ内に置く。refs は作らず、利用者の `.git/objects` に書いた参照されない blob などは、`gc.pruneExpire`（既定 2週間）を過ぎた後の `git gc` で消える。git-lfs・eol 変換などの clean フィルタがあるファイルは、木に入る内容・委譲前の本文・修正 diff がいずれもフィルタ後の内容になる。diff 照合で委譲前の本文を読むには、`git cat-file -p "$(cat "<イテレーションディレクトリ>/snapshot.tree"):<リポジトリルートからのパス>"` を使う。
+- 複製モード（`copy`）での保存（非 git 対象・木の保存の代替）: レビュー対象範囲と委譲する指摘の位置に含まれる、存在するファイルの作業ディレクトリからの相対パスを各パスの後に NUL を付けて（`printf '%s\0' "$path"`）、`<イテレーションディレクトリ>/snapshot.files` に保存し、親ディレクトリを作って各ファイルを `<イテレーションディレクトリ>/snapshot/<パス>` に複製する。作業ツリー全体の複製はしない。スナップショット外のファイルへの修正は diff 照合できないため、実装せずに報告する。委譲前の本文は保存した複製から読む。
+- 修正 diff の生成: `<イテレーションディレクトリ>/snapshot.mode` の `tree` / `copy` に従い、保存と同じ方式を使う。木の方式なら `rm -f "<イテレーションディレクトリ>/after.tree"` で古い木の ID を削除してから、上記の木の生成手順で `snapshot.index`・`snapshot.tree` を `after.index`・`after.tree` に置き換えて実行する。保存した木同士を比較し、出力形式を固定した差分を `<イテレーションディレクトリ>/fix.diff` に書く。
+  ```bash
+  snapshot_tree=$(cat "<イテレーションディレクトリ>/snapshot.tree") &&
+    after_tree=$(cat "<イテレーションディレクトリ>/after.tree") &&
+    git -c core.quotePath=false diff-tree -p -r --no-color --no-ext-diff --no-textconv --no-renames \
+      "$snapshot_tree" "$after_tree" > "<イテレーションディレクトリ>/fix.diff"
+  ```
+  複製モードなら作業ディレクトリで次を実行する。手順全体の終了コードは 0（成功）か 2（失敗）で、呼び出し元が確認する。
+  ```bash
+  (
+    test -r "<イテレーションディレクトリ>/snapshot.files" || exit 2
+    : > "<イテレーションディレクトリ>/fix.diff" || exit 2
+    while IFS= read -r -d '' path; do
+      if diff -uN --label "a/$path" --label "b/$path" -- "<イテレーションディレクトリ>/snapshot/$path" "$path" >> "<イテレーションディレクトリ>/fix.diff"; then :
+      else result=$?; test "$result" -eq 1 || exit 2
+      fi
+    done < "<イテレーションディレクトリ>/snapshot.files" || exit 2
+    exit 0
+  )
+  ```
+  `$path` は作業ディレクトリ（「作業ディレクトリと絶対パス」）からの相対パスで、台帳の `file` と同じ基準にする。`-N` は削除を空ファイルとの差分にし、`--label` は mtime を除く。新規ファイルはスナップショット外として共通指示の「実装前の報告」に従い、空ファイルの削除は呼び出し元がファイルの有無を直接照合する。
+- 失敗条件: 上記コマンド・ファイル複製・方式の記録と読み取り・出力保存の失敗、木の ID の空出力、または `snapshot.mode` が `tree` / `copy` 以外の場合。木の保存の代替は上記の複製モードの手順を参照する。空や古い出力を照合・ゲートに使わない。
 
 ## 委譲の共通指示（Step 6・7）
 
-初回委譲・差し戻し・再委譲には、指摘一覧（指摘 ID・全位置・問題・修正案・該当する指摘の【パターン】）、レビュー対象範囲、作業ディレクトリ（「作業ディレクトリと絶対パス」で決定）、git と HEAD の有無、品質チェック、複製モードのスナップショット対象ファイル、失敗内容（差し戻し時）、承認内容（承認済み指摘）、以下の共通指示を渡す。範囲は「対象埋め込みの生成」に従って書き込む。「パターンの指摘」の定義は SKILL.md Step 4 を正とし、「実装前の報告」の基準は Step 5 を正とし、ブロック内はその写しとする。multi-review を実行させないのは、修正サブエージェントが CLAUDE.md / AGENTS.md の規定に従って入れ子で起動するのを防ぐためである。
+初回委譲・差し戻し・再委譲には、指摘一覧（指摘 ID・全位置・問題・修正案・該当する指摘の【パターン】）、レビュー対象範囲、作業ディレクトリ（「作業ディレクトリと絶対パス」で決定）、git と HEAD の有無、保存方式（`snapshot.mode`）、品質チェック、複製モードのスナップショット対象ファイル、失敗内容（差し戻し時）、承認内容（承認済み指摘）、以下の共通指示を渡す。範囲は「対象埋め込みの生成」に従って書き込む。「パターンの指摘」の定義は SKILL.md Step 4 を正とし、「実装前の報告」の基準は Step 5 を正とし、ブロック内はその写しとする。multi-review を実行させないのは、修正サブエージェントが CLAUDE.md / AGENTS.md の規定に従って入れ子で起動するのを防ぐためである。
 
 ```text
 指摘を解消する最小の変更をする。行を足す前に、既存文の修正・削除で対応できないか検討する。
@@ -120,8 +152,7 @@ multi-review は呼び出し元が実施するので実行しない。
 
 ## ゲート `jev-guard rereview`（Step 7）
 
-- 修正 diff をイテレーションディレクトリに保存する: git 管理下なら委譲前スナップショットとの差分（`git diff HEAD` の出力に untracked ファイルの本文を連結したもの）を `iter-N/fix.diff` に書く。複製モードなら複製と現在のファイルの `diff -u` を連結して書く。
-- 実行: `jev-guard rereview --provider claude --findings <レビューディレクトリ>/findings.json --diff iter-N/fix.diff --base-summary "<Step 1 で確定した対象の1行要約>"`。判定は標準出力の JSON。`verdict`（`needed` / `skippable`）、`reason`、`findings[]`（指摘ごとの `resolved` と `confidence`）、`newRisk`、`verdictId`、`skippable` のときは `reviewPrompt` を持つ。
+- 実行: `jev-guard rereview --provider claude --findings "<レビューディレクトリ>/findings.json" --diff "<イテレーションディレクトリ>/fix.diff" --base-summary "<Step 1 で確定した対象の1行要約>"`。判定は標準出力の JSON。`verdict`（`needed` / `skippable`）、`reason`、`findings[]`（指摘ごとの `resolved` と `confidence`）、`newRisk`、`verdictId` を含み、`skippable` のときは `reviewPrompt` も持つ。
 - 結末の記録: `jev-guard record --id <verdictId> --outcome accepted|overruled [--note "<理由>"]`。`skippable` を採用したか覆したかを判定ログに残す。`needed` には記録しない。
 - 判定ログは `~/.local/share/jev-guard/verdicts.jsonl`（`JEV_GUARD_LOG_DIR` で変更可）。集計は `jev-guard stats`。
 
@@ -171,3 +202,4 @@ multi-review は呼び出し元が実施するので実行しない。
 - 基準記録（Step 6・初回イテレーション）: 品質チェックを検出できた場合のみ委譲前に1回実行して基準結果を記録する。基準実行にも同じ時間制限（1800秒目安）を前置し、超過・実行不能なら「基準なし」とする。未検出も「基準なし」とする。
 - 失敗の分類（Step 7）: 基準結果と照合して「既存の失敗」か「回帰」かを判定する。基準がない（未検出・判定不能・修正後に初めて検出）場合は回帰と断定せず「判定不能」とする。
 - `.multi-review/` 配下のファイル（レポートファイル等）が原因の失敗は、基準記録・回帰判定のいずれからも除外する。
+- 品質チェック前後の比較（Step 7）: 木の方式なら、`cp "<イテレーションディレクトリ>/after.tree" "<イテレーションディレクトリ>/after-before-check.tree"` で ID を退避し、チェック後に古い `after.tree` を削除してから、「スナップショットと修正 diff」の木の生成手順で `after.index`・`after.tree` を1回だけ作り直す。`cmp -s "<イテレーションディレクトリ>/after-before-check.tree" "<イテレーションディレクトリ>/after.tree"` の終了コード 0 は変化なし、1 は変化ありを示す。変化があれば保存済みの木同士を比較して `fix.diff` だけを作り直す。複製モードなら `fix.diff` を `after-before-check.diff` に退避し、チェック後に同節の手順で差分を作り直して `cmp -s "<イテレーションディレクトリ>/after-before-check.diff" "<イテレーションディレクトリ>/fix.diff"` で比較する。複製モードではチェック前後で `snapshot.files` の各ファイルの有無も記録して比べ、差分または有無が変われば変化ありとする。退避の失敗・`cmp` の終了コード 2 以上を比較失敗とする。委譲前スナップショットは更新しない。

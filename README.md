@@ -33,7 +33,7 @@ Claude Code では `/multi-review` または「複眼レビューして」、Cod
 ## 構成
 
 - `SKILL.md` — 制御フロー（分岐・状態管理・終了条件）
-- `references/execution.md` — 実行詳細（レビュアー別コマンド形・スナップショット・品質チェック）
+- `references/execution.md` — 実行詳細（レビュアー別コマンド形・スナップショットと修正 diff・品質チェック）
 - `references/roles.md` — 役割カタログ（総合 / セキュリティ / バグハント / アーキテクチャなど13役割）
 - `CONTEXT.md` — 用語集
 
