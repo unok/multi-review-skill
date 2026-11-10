@@ -5,7 +5,7 @@ SKILL.md の Step 2・4・5・6・7・8 から参照される実行手順。制�
 ## 作業ディレクトリと絶対パス（Step 4）
 
 - 各レビュアーの作業ディレクトリは、git 管理下なら共通のリポジトリルート、非 git なら対象ディレクトリ（ファイル指定ならその親）とする。パス指定が複数のルート（リポジトリまたは非 git の対象ディレクトリ）にまたがり、作業ディレクトリを一意に決められない場合は中断してユーザーに確認する。
-- プロンプトはシェル引数に直接埋め込まず、イテレーションディレクトリにファイルとして保存し、codex / claude は stdin で、cursor-agent はパス参照で渡す（シェル特殊文字や可変長フラグに壊されるのを防ぐ）。
+- プロンプトはシェル引数に直接埋め込まず、イテレーションディレクトリにファイルとして保存し、codex と claude に stdin で渡す（シェル特殊文字や可変長フラグに壊されるのを防ぐ）。
 - プロンプトファイル・出力ファイルは絶対パスで指定する（作業ディレクトリは対象プロジェクトのルートで、スクラッチパッドはその外にあるため）。出力先は当該イテレーションディレクトリ配下（例 `iter-1/claude.md`, `iter-1/role-security.md`）。
 
 ## 時間制限（Step 4）
@@ -15,7 +15,7 @@ SKILL.md の Step 2・4・5・6・7・8 から参照される実行手順。制�
 
 ## 対象埋め込みの生成（Step 4）
 
-全レビュアーのプロンプトに、そのイテレーションのレビュー対象範囲を具体的に埋め込む。パス指定なら対象パス一覧を書く。git 差分の場合、呼び出し元が差分本文と対象ファイル一覧を codex / claude / cursor-agent のプロンプトに埋め込む（claude は `--tools "Read,Glob,Grep"` でコマンドを実行できず、codex は `exec review` の差分指定を使えないため。後述）。差分基準は対象のモードで分岐する。
+全レビュアーのプロンプトに、そのイテレーションのレビュー対象範囲を具体的に埋め込む。パス指定なら対象パス一覧を書く。git 差分の場合、呼び出し元が差分本文と対象ファイル一覧を codex と claude のプロンプトに埋め込む（claude は `--tools "Read,Glob,Grep"` でコマンドを実行できず、codex は `exec review` の差分指定を使えないため。後述）。差分基準は対象のモードで分岐する。
 
 - 未コミット変更モード: `git diff HEAD` の出力＋untracked ファイルの本文＋`git status --porcelain` 由来のファイル一覧を埋め込む。HEAD が存在しない（コミットが1つもない）場合は全対象ファイルの本文を差分の代わりに埋め込む。
 - ベース差分モード: merge-base 起点の `git diff <base>...HEAD` の出力とファイル一覧を埋め込む。再レビューでは、修正で生じた未コミットの差分（`git diff HEAD` の出力と untracked ファイルの本文で、イテレーションをまたぐ累積の差分）も全レビュアーのプロンプトに加える（SKILL.md Step 7 の規定に対応）。
@@ -30,11 +30,6 @@ SKILL.md の Step 2・4・5・6・7・8 から参照される実行手順。制�
 - コマンドは対象のモードによらず `timeout 600 codex -m gpt-6.1-sol -c model_reasoning_effort="<effort>" exec -s read-only --skip-git-repo-check -o <出力ファイル> - < <役割プロンプトファイル>` とする（`-` で stdin からプロンプトを読み、`-o` で最終メッセージをファイル出力する）。`--skip-git-repo-check` は git リポジトリ外での即時失敗を防ぐ。git 差分は前述の対象埋め込みでプロンプトに含める。
 - `exec review --uncommitted` / `exec review --base <ブランチ>` は使わない。codex-cli 0.161.0 ではどちらもプロンプトとの併用を受け付けず（`the argument '--uncommitted' cannot be used with '[PROMPT]'`）、役割プロンプトと報告フォーマットを渡せないため。
 - 役割プロンプトはスキルのベースディレクトリ配下の `references/roles.md` から取得し、対象（パスまたは差分範囲）を埋め込む。出力ファイル名は総合が `role-general.md`、専門役割が roles.md の各役割見出しの `role-<slug>.md`。台帳の `source` は `codex-general` / `codex-<slug>` とする。
-
-### cursor-agent（汎用レビュアー、1インスタンス。既定で無効 — SKILL.md Step 3 で明示指定時のみ起動）
-
-- cursor-agent は長いプロンプトを引数で渡すと exit 0 のまま空出力になるため、プロンプトファイルのパスを含む短い指示を引数に渡し、cursor-agent 自身にファイルを読ませる: `timeout 600 cursor-agent -p --mode plan --trust --output-format text "まず <プロンプトファイル> を読み、その指示に従ってレビューを実行し、指示された報告フォーマットで結果を出力すること" > <出力ファイル> 2>&1`。plan モードは読み取り専用。
-- `--trust` はヘッドレス実行に必要。対象リポジトリの信頼を確認できない場合はユーザーに確認し、許可されなければ cursor-agent を欠席として最終レポートに明記する。
 
 ### claude（総合1インスタンス。`default` プロファイルでは専門役割も担当）
 
@@ -184,9 +179,19 @@ multi-review は呼び出し元が実施するので実行しない。
 
 ## ゲート `jev-guard rereview`（Step 7）
 
-- 実行: `jev-guard rereview --provider claude --findings "<レビューディレクトリ>/findings.json" --diff "<イテレーションディレクトリ>/fix.diff" --base-summary "<Step 1 で確定した対象の1行要約>"`。判定は標準出力の JSON。`verdict`（`needed` / `skippable`）、`reason`、`findings[]`（指摘ごとの `resolved` と `confidence`）、`newRisk`、`verdictId` を含み、`skippable` のときは `reviewPrompt` も持つ。
-- 結末の記録: `jev-guard record --id <verdictId> --outcome accepted|overruled [--note "<理由>"]`。`skippable` を採用したか覆したかを判定ログに残す。`needed` には記録しない。
+- 実行: `jev-guard rereview --provider claude --findings "<レビューディレクトリ>/findings.json" --diff "<イテレーションディレクトリ>/fix.diff" --base-summary "<Step 1 で確定した対象の1行要約>"`。判定は標準出力の JSON。
+- 結末の記録: `jev-guard record --id <verdictId> --outcome accepted`。`needed` を覆すときは `jev-guard record --id <verdictId> --outcome overruled --note '詳細は <gate-overrule.md の絶対パス>'`。`--note` には反証本文を入れず、パスはシェルの単一引用符で安全に渡す（パス内の単一引用符は `'"'"'` として渡す）。
 - 判定ログは `~/.local/share/jev-guard/verdicts.jsonl`（`JEV_GUARD_LOG_DIR` で変更可）。集計は `jev-guard stats`。
+
+### needed の根拠確認と反証
+
+ゲートには誤判定があるため、呼び出し元が根拠を修正 diff で確かめた場合に限り覆せる。呼び出し元も早く終わらせる方向に判断しがちなため、引用と具体的な反証を必須とする。
+
+反証の記録が残らないまま覆すのを防ぐため、次の内容を `<イテレーションディレクトリ>/gate-overrule.md` に保存する。
+
+- 指摘: `resolved: false` の各指摘の ID と `findings[].rationale`、再判定があれば `rechecks` の該当内容を挙げ、修正 diff（`fix.diff`）の該当行・位置の引用と、それぞれの理由に答える具体的な反証を書く。
+- 新リスク: `newRisk.value: true` の `newRisk.rationale` に加え、`sections[]` の `newRiskProbability >= 0.5`（jev-guard が新リスクありと判定するしきい値）の全区画の `newRiskRationale` を1つずつ挙げ、区画の `path` と各根拠への反証を書く。「差分にない」とされた修正の diff 上の位置と該当行、「テストがない」とされたテストの名前と実行結果などを示す。同一の根拠は反証を共有し、対応する全区画を明記する。
+- 確認結果: 全根拠との対応と、Step 7 で行ったダブルチェックの結果を書く。根拠が欠落・不明の場合や反証できない根拠も記載する。
 
 ## 範囲外の記録 `out-of-scope.md`（Step 6・7・8）
 
@@ -203,7 +208,7 @@ multi-review は呼び出し元が実施するので実行しない。
 - イテレーション: <N>（打ち切った場合はその理由）
 - プロファイル: <default|codex>
 - レビュアー: <起動した CLI・役割・モデル・effort> / 欠席: <なし or 一覧>
-- ゲート: <イテレーションごとの結果を「iter-1: …」の形で>
+- ゲート: <イテレーションごとに「iter-1: …」と記載。ラベルと記載事項は SKILL.md Step 8 を参照>
 - 品質チェック: <Step 8 のラベル>
 - jev-guard rules: <検査結果・誤判定の記録、未実施の理由・エラー出力>
 
