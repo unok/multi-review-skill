@@ -7,7 +7,7 @@ Claude Code と Codex の両方から使うスキル。claude（総合＝Opus 5.
 ## 必要なもの
 
 - Claude Code または Codex（実行主体）
-- レビュアー CLI（認証済みであること）: [codex](https://github.com/openai/codex) / claude（[cursor-agent](https://cursor.com/cli) は既定で無効。起動時に明示した場合のみ使用）
+- レビュアー CLI（認証済みであること）: [codex](https://github.com/openai/codex) と claude
 
 一部の CLI がなくても動く。未インストールのレビュアーは欠席として最終レポートに記録される。
 
