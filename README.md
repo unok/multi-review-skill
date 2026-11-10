@@ -6,6 +6,7 @@ Claude Code と Codex の両方から使うスキル。claude（総合＝Opus 5.
 
 ## 必要なもの
 
+- Python 3.9 以上（標準ライブラリのみ）と POSIX 環境の git・diff
 - Claude Code または Codex（実行主体）
 - レビュアー CLI（認証済みであること）: [codex](https://github.com/openai/codex) と claude
 
@@ -33,8 +34,10 @@ Claude Code では `/multi-review` または「複眼レビューして」、Cod
 ## 構成
 
 - `SKILL.md` — 制御フロー（分岐・状態管理・終了条件）
-- `references/execution.md` — 実行詳細（レビュアー別コマンド形・スナップショットと修正 diff・品質チェック）
+- `references/execution.md` — CLI の引数・成果物・終了コードと、呼び出し元の照合・判断
 - `references/roles.md` — 役割カタログ（総合 / セキュリティ / バグハント / アーキテクチャなど13役割）
+- `scripts/mr.py` — 差分・プロンプト・並列実行・台帳・rules・ゲートの機械的処理
+- `tests/` — `python3 -m unittest` で実行するテスト（外部レビュアーとゲートは偽 CLI）
 - `CONTEXT.md` — 用語集
 
 ## ライセンス
