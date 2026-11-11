@@ -26,7 +26,7 @@
 | `mr decisions R remove ID...` | 指定した決定事項を削除し、`decisions.md` を生成。未知 ID があれば全件未削除 |
 | `mr decisions R render` | `decisions.json` から `decisions.md` を生成。jev-guard は使わない |
 | `mr rules I` | 条件確認・実行後、`rules.json` と生出力を保存。候補の妥当性は呼び出し元が確かめる |
-| `mr gate I` | `gate.json` と生出力。必要フィールドと型、覆せる形式条件 `overruleEligible`、反証対象 `grounds` までを返す。反証・ダブルチェック・record は行わない |
+| `mr gate I` | `gate.json` と生出力。必要フィールドと型、覆せる形式条件 `overruleEligible`、反証対象 `grounds` までを返し、実行統計を1行追記する。反証・ダブルチェック・record は行わない |
 
 終了コードは 0＝処理完了（規定の未実施・一部欠席を含む）、1＝生成・保存・データ不正 / 全レビュアー失敗、2＝引数形式不正またはゲートの API キー未設定による指示待ち、10＝rules の候補あり。0 だけでゲート採用や検査済みと判断せず、JSON の `status`・`reason` を読む。
 `run.json` は実行条件の保存先で、台帳スキーマには含めない。`diffBudget` の既定は200000 bytes、超過時も全文を保存する。`timeout` は600秒、`jaTimeout` は1800秒で、いずれも `init` の同名 kebab-case オプションで設定できる。差分の上限は正の整数、時間制限は正の有限数とする。`--roles` 省略時は `pattern-consistency,naming-symmetry`（既存実装との一貫性・命名の対称性）、空文字なら専門役割なし。役割・プロファイル・除外は次のイテレーションに引き継ぐ。
@@ -178,7 +178,7 @@ multi-review は呼び出し元が実施するので実行しない。
 }
 ```
 
-`mr init` は、利用者共通の `${XDG_CONFIG_HOME:-$HOME/.config}/multi-review/decisions.json` → 対象ルートの `.multi-review/decisions.json` の順に常設入力を取り込む。git はリポジトリルート、非 git は解決済みの `--cwd` を対象ルートとする。XDG_CONFIG_HOME が未設定・空文字・相対パスなら無視し、`$HOME/.config` を使う。HOME を絶対パスで決められない場合は利用者共通の常設ファイルを不存在として扱い、プロジェクトの常設ファイルは通常どおり読む。どちらのファイルも任意で、有効なリンクは読み、壊れたリンクはエラーにする。形式は add と同じ単体オブジェクトまたは配列だが、許すフィールドは `type`・`body`・`reason` だけで、`findingIds` は空配列でも受け付けない。`--no-standing-decisions` なら探索・読み取りを行わない。プロジェクトの常設ファイルは作業ツリー専用で、コミットして共有する使い方は想定しない。Step 8 で `.multi-review/` を `.git/info/exclude` に入れると、このファイルも無視対象になる。共有が必要な決定は利用者共通のファイルに置く。未追跡の常設ファイルをレビュー対象にしたくなければ `.git/info/exclude` か `.gitignore` に入れる。追跡済みなら `--path` で対象を絞る。
+`mr init` は、利用者共通の `${XDG_CONFIG_HOME:-$HOME/.config}/multi-review/decisions.json` → 対象ルートの `.multi-review/decisions.json` の順に常設入力を取り込む。git はリポジトリルート、非 git は解決済みの `--cwd` を対象ルートとする。XDG_CONFIG_HOME が未設定・空文字・相対パスなら無視し、`$HOME/.config` を使う。HOME が空文字、または絶対パスで決められない場合は利用者共通の常設ファイルを不存在として扱い、プロジェクトの常設ファイルは通常どおり読む。どちらのファイルも任意で、有効なリンクは読み、壊れたリンクはエラーにする。形式は add と同じ単体オブジェクトまたは配列だが、許すフィールドは `type`・`body`・`reason` だけで、`findingIds` は空配列でも受け付けない。`--no-standing-decisions` なら探索・読み取りを行わない。プロジェクトの常設ファイルは作業ツリー専用で、コミットして共有する使い方は想定しない。Step 8 で `.multi-review/` を `.git/info/exclude` に入れると、このファイルも無視対象になる。共有が必要な決定は利用者共通のファイルに置く。未追跡の常設ファイルをレビュー対象にしたくなければ `.git/info/exclude` か `.gitignore` に入れる。追跡済みなら `--path` で対象を絞る。
 
 取り込みは add と同じ検証・採番・重複防止・上限を使い、全件を検証してから保存する。不正入力はファイルパスと要素位置（配列は0始まりの `[n]`、単体は `[0]`）を診断して終了1。JSON の解析失敗はファイルと解析エラーを示す。init の保存失敗時も生成途中の状態ファイルを巻き戻し、R とロックは残す。取り込み0件なら decisions.json と decisions.md は作らない。常設ファイルは読み取り専用で、init 後に変更しても既存 R に再取り込みしない。
 
@@ -197,6 +197,20 @@ init の stdout は run.json のキー（取り込みがあれば `decisionSeque
 決定事項の変更は成果物を失効させず、記録後に `mr prompts` で作るプロンプトから効く。決定事項を変えた後に、作成済みで未実行のプロンプトがあれば `mr prompts` を実行し直す。修正担当への受け渡しは「委譲の共通指示」に従う。
 
 ## ゲート `mr gate`（Step 7）
+
+`mr gate I` は結果が決まった全分岐で `${XDG_DATA_HOME:-$HOME/.local/share}/multi-review/runs.jsonl` に JSON を1行追記する。XDG_DATA_HOME が未設定・空文字・相対パスなら `$HOME/.local/share` を使う。HOME が空文字、または絶対パスで決められない場合は解決不能として statsError にする。結果を決めてから統計を追記し、`statsPath` または `statsError` を加えた `gate.json` を1回だけ保存する。追記後に gate.json の保存に失敗した場合は統計の行が残る。同じ I の再実行でも追記し、読む側は最後の行を使う。`MR_NO_STATS=1` で記録と保存先の探索を止める。
+
+| 統計の項目 | 内容 |
+| --- | --- |
+| `reviewId`・`cwd`・`mode`・`profile`・`iteration`・`recordedAt` | R のディレクトリ名、run.json の対象・モード・プロファイル、I の番号、記録時刻（UTC ISO 8601） |
+| `collected` | `total`・`near`・`outside`・`unknown` は指摘総数と近傍の三値別件数。`bySource` は source 別件数。位置単位でなく指摘単位 |
+| `ledger` | `unresolved`・`fixed`・`on_hold`・`rejected` の件数と、fixedIteration が I の番号と一致する `fixedThisIteration` |
+| `fixDiff` | `additions`・`deletions` はハンク本文の追加・削除行数。ファイル見出しは除く。`empty` は fix.diff が空かどうか。バイナリ変更などは追加・削除の行数がともに0でも空とは限らない |
+| `rules` | `status`・`candidates`。候補数は生出力の JSON の summary.violations または Markdown 末尾の件数から取得し、取得不能なら null |
+| `gate` | `status`・`next`・`reason`・`verdict`・`verdictReason`・`oversized`。verdict 関連の未提供値は null |
+| `decisions` | `policy`・`triage`・`withSources` の件数。出所が複数あっても1決定は1件 |
+
+台帳は必須とし、決定事項がなければ0件とする。それ以外の成果物がなければその集計項目は null、有効な空配列は0件とする。fix.diff は近傍判定と同じ読み方で集計する。壊れた集計入力や保存先の解決・作成・書き込み失敗では追記せず、stdout と gate.json に英語の `statsError` を入れる。書き込めたバイト数が足りないときはエラーとし、部分行が残る場合がある。統計の失敗ではゲートの終了コードと next を変えない。成功時は `statsPath` に追記先を返す。古い I の再実行では現存する台帳・決定事項を使い、成果物の鮮度は判定しない。run.json 不正・不正な I・既存ロックの競合など、handler に到達しない失敗では記録しない。
 
 - 実行: `mr gate I`。JSON の `status`・`verdict`・`overruleEligible`・`grounds` を読む。遷移は SKILL.md Step 7 を参照する。jev-guard の rules・rereview・ledger render は600秒で打ち切り、rules・rereview の超過は未実施とする。形式条件成立は反証完了を意味せず、終了は呼び出し元が決める。
 - 結末の記録: `jev-guard record --id <verdictId> --outcome accepted`。`needed` を覆すときは `jev-guard record --id <verdictId> --outcome overruled --note '詳細は <gate-overrule.md の絶対パス>'`。`--note` には反証本文を入れず、パスはシェルの単一引用符で安全に渡す（パス内の単一引用符は `'"'"'` として渡す）。

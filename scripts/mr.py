@@ -5,6 +5,7 @@ import ast
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import fcntl
 from fractions import Fraction
@@ -91,6 +92,7 @@ DOWNSTREAM = {'inventory': (INVENTORY_FILE, INVENTORY_JSON_FILE),
 SECTION_RISK_THRESHOLD = .5
 DIFF_OPTIONS = ('--no-ext-diff', '--no-textconv', '--no-color',
                 '--src-prefix=a/', '--dst-prefix=b/')
+DIFF_HUNK = re.compile(r'@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@.*')
 JOB_MODELS = {
     'default': {'claude': {'general': ('claude-opus-5-5', 'medium'),
                            'specialist': ('claude-opus-5-5', 'high')},
@@ -101,6 +103,7 @@ JOB_MODELS = {
     # Model copied from ~/.claude/skills/ja-review/SKILL.md, 2026-11-10.
     'ja-review': {'agy': {'general': ('gemini-3.8-flash-high', None)}},
 }
+RULES_STATUSES = {name: name for name in ('clear', 'candidates', 'error', 'not_performed')}
 STATES = ('unresolved', 'fixed', 'on_hold', 'rejected')
 LABELS = ('未解決', '修正済み', '保留', '却下')
 FIELDS = {'id', 'severity', 'source', 'file', 'line', 'problem', 'fixSummary',
@@ -447,7 +450,7 @@ def validate_decisions(value, ledger, run):
 
 def load_decisions(root, ledger, run):
     path = root / DECISIONS_FILE
-    value = read_json(path) if path.exists() else {'reviewId': ledger['reviewId'], 'decisions': []}
+    value = read_json(path) if path.exists() or path.is_symlink() else {'reviewId': ledger['reviewId'], 'decisions': []}
     return validate_decisions(value, ledger, run)
 
 
@@ -531,18 +534,25 @@ def add_decision(raw, value, ledger, run, source=None):
     return item['id']
 
 
+def xdg_home(variable, fallback):
+    path = Path(os.environ.get(variable) or '')
+    if path.is_absolute():
+        return path
+    # Python 3.12+ の Path.home() は空の HOME で / を返すため、先に除外する。
+    if os.environ.get('HOME') == '':
+        return None
+    try:
+        home = Path.home()
+    except RuntimeError:
+        return None
+    return home / fallback if home.is_absolute() else None
+
+
 def standing_decisions(cwd, value, ledger, run, disabled):
     result = {'count': 0, 'sources': []}
     if disabled:
         return result
-    config = Path(os.environ.get('XDG_CONFIG_HOME') or '')
-    if not config.is_absolute():
-        try:
-            home = Path.home()
-        except RuntimeError:
-            config = None
-        else:
-            config = home / '.config' if home.is_absolute() else None
+    config = xdg_home('XDG_CONFIG_HOME', '.config')
     paths = (config / 'multi-review' / DECISIONS_FILE if config else None,
              cwd / '.multi-review' / DECISIONS_FILE)
     for source, path in zip(DECISION_SOURCES, paths):
@@ -1098,19 +1108,22 @@ def diff_header_path(raw, prefix):
     return name[2:] if name.startswith(prefix) else name
 
 
-def changed_lines(patch, *, additions_only=False):
-    """Track hunk counts so body lines cannot become file headers."""
-    changed, binary = {}, set()
+def diff_lines(patch):
+    """Yield (path, line, kind) with the new filename (old for a deleted file).
+
+    kind is '+', '-', 'header', or 'binary'. line is the new-side line number
+    (at least 1), including for '-'; header and binary use 0.
+    Track hunk counts so body lines cannot become file headers.
+    """
     path = old_path = None
     line, old_left, new_left = 0, 0, 0
     for raw in patch.split('\n'):
         if old_left or new_left:
             if raw.startswith('+'):
-                changed[path].add(max(1, line))
+                yield path, max(1, line), '+'
                 line, new_left = line + 1, new_left - 1
             elif raw.startswith('-'):
-                if not additions_only:
-                    changed[path].add(max(1, line))
+                yield path, max(1, line), '-'
                 old_left -= 1
             elif raw.startswith(' '):
                 line, old_left, new_left = line + 1, old_left - 1, new_left - 1
@@ -1140,7 +1153,7 @@ def changed_lines(patch, *, additions_only=False):
             path = diff_header_path(raw, 'b/')
             if path == '/dev/null':
                 path = old_path
-            changed.setdefault(path, set())
+            yield path, 0, 'header'
         elif raw.startswith(('Binary files ', 'GIT binary patch')):
             if raw.startswith('Binary files '):
                 match = re.fullmatch(r'Binary files ("(?:[^"\\]|\\.)*"|\S+) and ("(?:[^"\\]|\\.)*"|\S+) differ', raw)
@@ -1151,13 +1164,24 @@ def changed_lines(patch, *, additions_only=False):
                     elif new == '/dev/null' and old.startswith('a/'):
                         path = old[2:]
             require(path is not None, 'cannot locate binary diff')
-            binary.add(path)
+            yield path, 0, 'binary'
         elif raw.startswith('@@ '):
-            match = re.fullmatch(r'@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@.*', raw)
+            match = DIFF_HUNK.fullmatch(raw)
             require(match is not None and path is not None, 'invalid diff hunk')
             old_left = int(match[1]) if match[1] is not None else 1
             line = int(match[2])
             new_left = int(match[3]) if match[3] is not None else 1
+
+
+def changed_lines(patch, *, additions_only=False):
+    changed, binary = {}, set()
+    for path, line, kind in diff_lines(patch):
+        if kind == 'binary':
+            binary.add(path)
+        elif kind == 'header':
+            changed.setdefault(path, set())
+        elif kind == '+' or (kind == '-' and not additions_only):
+            changed[path].add(line)
     return changed, binary
 
 
@@ -1623,7 +1647,8 @@ def collect(args, root, run):
         previous = iteration_dir(directory.parent, iteration - 1)
         try:
             valid_diff(previous)
-            changes, binary = changed_lines((previous / FIX_DIFF_FILE).read_text(encoding='utf-8', errors='replace'))
+            # read_text の改行変換で単独の CR が行区切りになるのを避ける。
+            changes, binary = changed_lines((previous / FIX_DIFF_FILE).read_bytes().decode('utf-8', errors='replace'))
             previous_valid = True
         except EXPECTED_ERRORS:
             # A failed regeneration cannot supply reliable proximity information.
@@ -1738,8 +1763,9 @@ def rules(args, root, run):
                 'stale delegation task')
         result = guard_command(['jev-guard', 'rules', '--diff', str(directory / FIX_DIFF_FILE),
                                 '--task', str(directory / 'fix-task.md')], run['cwd'], directory, 'rules')
-        output = {'status': 'clear' if result.returncode == 0 else 'candidates' if result.returncode == EXIT_CANDIDATES
-                  else 'error', **process_fields(result)}
+        output = {'status': RULES_STATUSES['clear'] if result.returncode == 0 else
+                  RULES_STATUSES['candidates'] if result.returncode == EXIT_CANDIDATES else
+                  RULES_STATUSES['error'], **process_fields(result)}
     except EXPECTED_ERRORS as error:
         output = not_performed(str(error))
     save_json(directory / 'rules.json', output)
@@ -1812,6 +1838,102 @@ def evaluate_verdict(verdict):
             'grounds': grounds, 'next': NEXT['caller_decision']}
 
 
+def diff_stats(patch):
+    counts = Counter(kind for _, _, kind in diff_lines(patch))
+    return {'additions': counts['+'], 'deletions': counts['-'], 'empty': not patch}
+
+
+def rules_candidates(output):
+    try:
+        value = parse_json(output)
+    except EXPECTED_ERRORS:
+        # rules は非 JSON 出力も保存するため jev-guard の末尾要約を読む。形式変更時は None。
+        match = re.search(r'^違反候補 (\d+) 件 / \d+ ファイル、判定不能 \d+ 件\s*\Z', output, re.M)
+        return int(match[1]) if match else None
+    summary = value.get('summary') if isinstance(value, dict) else None
+    count = summary.get('violations') if isinstance(summary, dict) else None
+    return count if type(count) is int and count >= 0 else None
+
+
+def run_stats(root, directory, run, output):
+    iteration = iteration_number(directory)
+    result = dict(reviewId=root.name, cwd=run['cwd'], mode=run['mode'], profile=run['profile'],
+                  iteration=iteration, recordedAt=datetime.now(timezone.utc).isoformat(),
+                  collected=None, fixDiff=None, rules=None)
+    path = root / LEDGER_FILE
+    try:
+        ledger = load_ledger(root)
+        path = root / DECISIONS_FILE
+        decisions = load_decisions(root, ledger, run)
+    except EXPECTED_ERRORS as error:
+        raise Failure(display_path(str(path)) + ': ' + str(error)) from error
+    values = {}
+    for key, path in [('collected', directory / 'collected.json'), ('rules', directory / 'rules.json')]:
+        # 壊れたリンクも、不存在として黙って落とさず読み取り失敗にする。
+        values[key] = None
+        try:
+            if path.exists() or path.is_symlink():
+                values[key] = read_json(path)
+                require(isinstance(values[key], dict), 'invalid stats artifact: ' + path.name)
+        except EXPECTED_ERRORS as error:
+            raise Failure(display_path(str(path)) + ': ' + str(error)) from error
+    collected = values['collected']
+    if collected is not None:
+        findings = collected.get('findings')
+        require(isinstance(findings, list) and all(isinstance(i, dict) and nonempty(i.get('source')) and
+                'nearPreviousFix' in i and (i['nearPreviousFix'] is None or type(i['nearPreviousFix']) is bool)
+                for i in findings), 'invalid collected findings')
+        result['collected'] = dict(total=len(findings), near=sum(i['nearPreviousFix'] is True for i in findings),
+                                  outside=sum(i['nearPreviousFix'] is False for i in findings),
+                                  unknown=sum(i['nearPreviousFix'] is None for i in findings),
+                                  bySource=dict(Counter(i['source'] for i in findings)))
+    result['ledger'] = {state: sum(i['status'] == state for i in ledger['findings']) for state in STATES}
+    result['ledger']['fixedThisIteration'] = sum(i.get('fixedIteration') == iteration for i in ledger['findings'])
+    result['decisions'] = {kind: sum(i['type'] == kind for i in decisions['decisions']) for kind in DECISION_TYPES}
+    result['decisions']['withSources'] = sum(bool(i.get('sources')) for i in decisions['decisions'])
+    rules = values['rules']
+    if rules is not None:
+        require(isinstance(rules.get('status'), str) and rules['status'] in
+                RULES_STATUSES and
+                ('stdout' not in rules or isinstance(rules['stdout'], str)), 'invalid rules stats')
+        result['rules'] = dict(status=rules['status'], candidates=rules_candidates(rules.get('stdout', '')))
+    path = directory / FIX_DIFF_FILE
+    if path.exists() or path.is_symlink():
+        try:
+            # read_text の改行変換で単独の CR が行区切りになるのを避ける。
+            result['fixDiff'] = diff_stats(path.read_bytes().decode('utf-8', errors='replace'))
+        except EXPECTED_ERRORS as error:
+            raise Failure(display_path(str(path)) + ': ' + str(error)) from error
+    verdict = output.get('verdict', {})
+    require('oversized' not in verdict or type(verdict['oversized']) is bool, 'invalid verdict oversized')
+    result['gate'] = {key: output.get(key) for key in ('status', 'next', 'reason')}
+    result['gate'].update(verdict=verdict.get('verdict'), verdictReason=verdict.get('reason'),
+                          oversized=verdict.get('oversized'))
+    return result
+
+
+def save_gate(root, directory, run, output):
+    if os.environ.get('MR_NO_STATS') != '1':
+        try:
+            record = run_stats(root, directory, run, output)
+            data_home = xdg_home('XDG_DATA_HOME', '.local/share')
+            require(data_home is not None, 'cannot resolve an absolute home directory for stats')
+            path = data_home / 'multi-review/runs.jsonl'
+            data = (json.dumps(record, separators=(',', ':')) + '\n').encode('utf-8')
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # 並行するレビューの行が混ざらないよう、置換やロックを使わず O_APPEND で1回書く。
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                require(os.write(fd, data) == len(data), 'short stats write')
+            finally:
+                os.close(fd)
+            output['statsPath'] = str(path)
+        except EXPECTED_ERRORS as error:
+            output['statsError'] = str(error)
+    save_json(directory / 'gate.json', output)
+    return output
+
+
 def gate(args, root, run):
     directory = args.directory.resolve()
     (directory / 'gate.json').unlink(missing_ok=True)
@@ -1819,8 +1941,7 @@ def gate(args, root, run):
         state = valid_diff(directory)
     except EXPECTED_ERRORS as error:
         output = not_performed(str(error), next=NEXT['abort'])
-        save_json(directory / 'gate.json', output)
-        return output
+        return save_gate(root, directory, run, output)
     try:
         ledger = load_ledger(root)
         if state['mode'] == 'tree' and state['empty']:
@@ -1848,8 +1969,7 @@ def gate(args, root, run):
                 output = evaluate_verdict(verdict)
     except EXPECTED_ERRORS as error:
         output = not_performed(str(error), next=NEXT['rereview'])
-    save_json(directory / 'gate.json', output)
-    return output
+    return save_gate(root, directory, run, output)
 
 
 def inventory_entry(name, node):
