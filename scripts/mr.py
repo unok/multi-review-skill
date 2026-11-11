@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Mechanical operations for multi-review. Decisions stay with the caller."""
 import argparse
+import ast
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from decimal import Decimal, InvalidOperation
 import fcntl
+from fractions import Fraction
 import hashlib
+import io
 import json
 import math
 import os
@@ -16,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import tokenize
 
 SKILL = Path(__file__).resolve().parents[1]
 TREE_ID = r'(?:[0-9a-f]{40}|[0-9a-f]{64})'
@@ -23,9 +29,25 @@ MAX_OPTIONAL_SPECIALISTS = 4
 DEFAULT_SPECIALISTS = ('pattern-consistency', 'naming-symmetry')
 MAX_SPECIALISTS = len(DEFAULT_SPECIALISTS) + MAX_OPTIONAL_SPECIALISTS
 MAX_ITERATIONS = 5
+INVENTORY_MAX_BYTES = 32768
+INVENTORY_VALUE_CHARS = 120
+INVENTORY_SIGNATURE_CHARS = 240
+INVENTORY_LOCATION_LINES = 24
+ASCII_CONTROL_END = 0x20
+ASCII_DELETE = 0x7F
+# 見出しだけで枠を使い切らず、3分類のうち1分類分は項目に残す。
+INVENTORY_HEADER_SHARE = Fraction(2, 3)
+INVENTORY_FILE = 'inventory.md'
+INVENTORY_JSON_FILE = 'inventory.json'
+INVENTORY_METHODS = {'Python': 'ast', 'TypeScript': 'TypeScript compiler API',
+                     'Go': 'go/parser + go/ast'}
+INVENTORY_LANGUAGES = {'.py': 'Python', '.go': 'Go',
+                       **dict.fromkeys(('.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'), 'TypeScript')}
 DIFF_BUDGET = 200000
 REVIEW_TIMEOUT = 600
 GUARD_TIMEOUT = 600
+INVENTORY_MAX_EXPONENT = 10000
+INVENTORY_TIMEOUT = 30
 JA_TIMEOUT = 1800
 JA_BATCH_LIMIT = 100000
 NEAR_FIX_LINES = 5
@@ -44,6 +66,7 @@ SNAPSHOT_MODE_FILE = 'snapshot.mode'
 LEDGER_MD_FILE = 'ledger.md'
 STATUS_AWAITING = 'awaiting_instruction'
 NO_LINE_MARK = '［行なし］'
+NO_VALUE_MARK = '［初期値なし］'
 FILE_HEADER = '=== FILE: '
 # Exclusion rules copied from ja-review/SKILL.md, 2026-11-10 (see JOB_MODELS).
 JA_EXCLUDED_DIRS = ('dist', 'build')
@@ -53,7 +76,9 @@ SPAN_SEPARATOR = ', '
 REVIEWERS = ('claude', 'codex', 'ja-review')
 SEVERITIES = {'high': '高', 'medium': '中', 'low': '低'}
 NEXT = {name: name for name in ('finish', 'limit', 'rereview', 'abort', 'caller_decision', 'awaiting_instruction')}
-DOWNSTREAM = {'prompts': ('prompts.json', 'review.json', 'collected.json', 'collected.md',
+INVALIDATE_BEFORE_LOAD = {'inventory'}
+DOWNSTREAM = {'inventory': (INVENTORY_FILE, INVENTORY_JSON_FILE),
+              'prompts': ('prompts.json', 'review.json', 'collected.json', 'collected.md',
                           'target.diff', 'target.json', 'ja-review'),
               'review': ('review.json', 'collected.json', 'collected.md'),
               'collect': ('collected.json', 'collected.md')}
@@ -82,6 +107,7 @@ class Failure(Exception):
 
 
 EXPECTED_ERRORS = (Failure, OSError, ValueError, subprocess.TimeoutExpired)
+INVENTORY_PARSE_ERRORS = (*EXPECTED_ERRORS, SyntaxError, RecursionError)
 
 
 def require(condition, message):
@@ -477,21 +503,15 @@ def snapshot(args, root, run):
             return {'mode': 'tree'}
     files, _, _ = iteration_files(directory, run, iteration)
     excluded = []
-    for item in load_ledger(root)['findings']:
-        if item['status'] == 'unresolved':
-            names = [item['file']]
-            for position in other_locations(item['problem'])[1]:
-                try:
-                    names.append(location(position)[0])
-                except Failure as problem:
-                    excluded.append(str(problem))
-            for name in names:
-                try:
-                    safe_relative(cwd, name)
-                except Failure as problem:
-                    excluded.append(str(problem))
-                else:
-                    files.extend(expand_path(cwd, cwd / name))
+    positions, errors = finding_locations(load_ledger(root))
+    excluded.extend(error['reason'] for error in errors)
+    for name, _ in positions:
+        try:
+            safe_relative(cwd, name)
+        except Failure as problem:
+            excluded.append(str(problem))
+        else:
+            files.extend(expand_path(cwd, cwd / name))
     copied = []
     for name in sorted(set(files)):
         source = safe_relative(cwd, name)
@@ -531,6 +551,21 @@ def other_locations(text):
         else:
             positions[-1] += token
     return match[1], positions
+
+
+def finding_locations(ledger):
+    positions, errors = [], []
+    for item in ledger['findings']:
+        if item['status'] != 'unresolved':
+            continue
+        positions.append((item['file'], item['line']))
+        for position in other_locations(item['problem'])[1]:
+            position = position.strip()
+            try:
+                positions.append(location(position))
+            except Failure as error:
+                errors.append({'file': position, 'reason': str(error)})
+    return positions, errors
 
 
 def display_path(name):
@@ -1598,6 +1633,487 @@ def gate(args, root, run):
     return output
 
 
+def inventory_entry(name, node):
+    return {'name': name, 'line': node.lineno,
+            'endLine': node.end_lineno or node.lineno}
+
+
+class PythonInventory(ast.NodeVisitor):
+    def __init__(self, source):
+        self.source_lines = source.encode('utf-8').splitlines(keepends=True)
+        self.scope = []
+        self.result = {'variables': [], 'declarations': [], 'literals': []}
+        self.docstrings = set()
+
+    def expression(self, node):
+        # AST の列位置は UTF-8 のバイト単位。全文の行分割は初期化時の一度だけにする。
+        lines = self.source_lines[node.lineno - 1:node.end_lineno]
+        if len(lines) == 1:
+            segment = lines[0][node.col_offset:node.end_col_offset]
+        else:
+            segment = b''.join([lines[0][node.col_offset:], *lines[1:-1], lines[-1][:node.end_col_offset]])
+        return segment.decode('utf-8') or ast.unparse(node)
+
+    def visit_Module(self, node):
+        self.body(node.body)
+
+    def body(self, statements):
+        if statements and isinstance(statements[0], ast.Expr) and isinstance(statements[0].value, ast.Constant):
+            if isinstance(statements[0].value.value, str):
+                self.docstrings.add(id(statements[0].value))
+        for statement in statements:
+            self.visit(statement)
+
+    def declaration(self, node, signature):
+        name = '.'.join([*self.scope, node.name])
+        entry = inventory_entry(name, node)
+        entry['signature'] = signature
+        self.result['declarations'].append(entry)
+        self.scope.append(node.name)
+        self.body(node.body)
+        self.scope.pop()
+
+    def visit_FunctionDef(self, node):
+        header = ast.FunctionDef(name=node.name, args=node.args, body=[ast.Pass()],
+                                 decorator_list=[], returns=node.returns, type_comment=None)
+        header.lineno = node.lineno
+        if hasattr(node, 'type_params'):
+            header.type_params = node.type_params
+        signature = ast.unparse(header).rsplit('\n', 1)[0]
+        if isinstance(node, ast.AsyncFunctionDef):
+            signature = 'async ' + signature
+        for default in [*node.args.defaults, *node.args.kw_defaults]:
+            if default is not None:
+                self.visit(default)
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        self.declaration(node, signature)
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_ClassDef(self, node):
+        bases = [self.expression(base) for base in node.bases]
+        bases.extend(ast.unparse(keyword) for keyword in node.keywords)
+        parameters = getattr(node, 'type_params', [])
+        signature = 'class ' + node.name + ('[' + ', '.join(map(ast.unparse, parameters)) + ']' if parameters else '')
+        signature += '(' + ', '.join(bases) + ')' if bases else ''
+        for expression in [*node.bases, *node.decorator_list, *(keyword.value for keyword in node.keywords)]:
+            self.visit(expression)
+        self.declaration(node, signature)
+
+    def assignment(self, node, targets, value):
+        if not self.scope:
+            pending = list(reversed(targets))
+            while pending:
+                part = pending.pop()
+                if isinstance(part, ast.Name):
+                    self.result['variables'].append(dict(inventory_entry(part.id, node),
+                        value=self.expression(value) if value is not None else NO_VALUE_MARK))
+                elif isinstance(part, (ast.Tuple, ast.List)):
+                    pending.extend(reversed(part.elts))
+                elif isinstance(part, ast.Starred):
+                    pending.append(part.value)
+        for target in targets:
+            self.visit(target)
+        if value is not None:
+            self.visit(value)
+
+    def visit_Assign(self, node):
+        self.assignment(node, node.targets, node.value)
+
+    def visit_AnnAssign(self, node):
+        self.assignment(node, [node.target], node.value)
+
+    def visit_JoinedStr(self, node):
+        if all(isinstance(value, ast.Constant) for value in node.values):
+            self.literal(''.join(value.value for value in node.values), node.lineno)
+            return
+        for value in node.values:
+            if isinstance(value, ast.FormattedValue):
+                self.visit(value)
+
+    def visit_FormattedValue(self, node):
+        self.visit(node.value)
+        if node.format_spec:
+            for value in node.format_spec.values:
+                if isinstance(value, ast.FormattedValue):
+                    self.visit(value)
+
+    def visit_TypeAlias(self, node):
+        self.result['declarations'].append(dict(inventory_entry(
+            '.'.join([*self.scope, node.name.id]), node), signature=self.expression(node)))
+
+    def visit_UnaryOp(self, node):
+        if isinstance(node.op, (ast.USub, ast.UAdd)) and isinstance(node.operand, ast.Constant) and \
+                type(node.operand.value) in (int, float):
+            value = node.operand.value * (-1 if isinstance(node.op, ast.USub) else 1)
+            raw = ('-' if isinstance(node.op, ast.USub) else '') + self.expression(node.operand)
+            self.literal(value, node.lineno, raw)
+        else:
+            self.generic_visit(node)
+
+    def literal(self, value, line, raw=None):
+        kind = {str: 'string', int: 'number', float: 'number'}.get(type(value))
+        if kind:
+            self.result['literals'].append({'kind': kind, 'value': (raw if raw is not None else str(value)), 'line': line})
+
+    def visit_Constant(self, node):
+        if id(node) not in self.docstrings:
+            raw = self.expression(node) if type(node.value) in (int, float) else None
+            self.literal(node.value, node.lineno, raw)
+
+
+def python_inventory(data):
+    encoding, _ = tokenize.detect_encoding(io.BytesIO(data).readline)
+    try:
+        source = data.decode(encoding)
+    except LookupError as error:
+        # 宣言されたコーデックがテキスト用でない場合だけ解析失敗へ変換する。
+        raise Failure(str(error)) from error
+    visitor = PythonInventory(source)
+    visitor.visit(ast.parse(source))
+    return visitor.result
+
+
+def validate_inventory(value):
+    require(isinstance(value, dict) and set(value) == {'variables', 'declarations', 'literals'},
+            'invalid inventory response')
+    for kind, entries in value.items():
+        require(isinstance(entries, list), 'invalid inventory entries')
+        for entry in entries:
+            require(isinstance(entry, dict) and positive_int(entry.get('line')), 'invalid inventory line')
+            if kind == 'literals':
+                require(entry.get('kind') in ('string', 'quoted-string', 'number', 'bigint') and
+                        isinstance(entry.get('value'), str), 'invalid inventory literal')
+            else:
+                require(nonempty(entry.get('name')) and
+                        isinstance(entry.get('value' if kind == 'variables' else 'signature'), str) and
+                        positive_int(entry.get('endLine')) and entry['endLine'] >= entry['line'],
+                        'invalid inventory declaration')
+    return value
+
+
+def inventory_number(raw):
+    raw = raw.replace('_', '').lower()
+    decimal_integer = re.fullmatch(r'[+-]?[0-9]+n?', raw)
+    if raw.endswith('n'):
+        return 'bigint', int(raw[:-1], 0) if 'x' in raw or 'o' in raw or 'b' in raw else (int(Decimal(raw[:-1])) if decimal_integer else int(raw[:-1]))
+    if 'p' in raw and 'x' in raw:
+        significand, exponent = raw.split('p')
+        exponent = int(exponent)
+        require(abs(exponent) <= INVENTORY_MAX_EXPONENT, 'numeric exponent exceeds inventory limit')
+        decimals = len(significand.split('.')[1]) if '.' in significand else 0
+        numerator = int(significand.replace('.', ''), 16)
+        return 'float', Fraction(numerator, 16 ** decimals) * Fraction(2) ** exponent
+    if any(base in raw for base in ('0x', '0o', '0b')):
+        return 'integer', int(raw, 0)
+    if '.' in raw or 'e' in raw:
+        require('e' not in raw or abs(int(raw.split('e')[1])) <= INVENTORY_MAX_EXPONENT,
+                'numeric exponent exceeds inventory limit')
+        return 'float', Fraction(Decimal(raw))
+    # Go の旧式の8進表記も扱う。
+    unsigned = raw.lstrip('+-')
+    if len(unsigned) > 1 and unsigned.startswith('0') and all(char in '01234567' for char in unsigned):
+        return 'integer', int(raw, 8)
+    return 'integer', int(Decimal(raw)) if decimal_integer else int(raw)
+
+
+def inventory_duplicates(literals):
+    grouped = {}
+    for literal in literals:
+        kind, value = literal['kind'], literal['value']
+        if kind in ('string', 'quoted-string'):
+            if not value.strip():
+                continue
+            key = kind, value
+            display = json.dumps(value, ensure_ascii=False) if kind == 'string' else value
+        else:
+            try:
+                number_kind, number = inventory_number(value)
+            except (ValueError, ZeroDivisionError, OverflowError, InvalidOperation) as error:
+                raise Failure('invalid numeric literal: ' + value) from error
+            require((kind == 'bigint') == (number_kind == 'bigint'), 'invalid bigint literal')
+            if number in (-1, 0, 1):
+                continue
+            key = ('bigint' if kind == 'bigint' else number_kind), number
+            display = value
+        if key not in grouped:
+            grouped[key] = {'value': display, 'lines': []}
+        grouped[key]['lines'].append(literal['line'])
+    return [entry for entry in grouped.values() if len(entry['lines']) >= 2]
+
+
+def inventory_display(value, limit):
+    value = display_path(value)
+    if len(value) > limit:
+        value = value[:limit - 1] + '…'
+    return value
+
+
+def inventory_code_block(rows):
+    # 内容のバッククォート列より長くし、ソース中の記号や改行を保つ。
+    longest = max((len(run) for row in rows for run in re.findall(r'`+', row)), default=0)
+    fence = '`' * max(len('```'), longest + 1)
+    return [fence, *rows, fence]
+
+
+def inventory_markdown(parsed, result, max_bytes):
+    labels = ('モジュール変数', '関数・メソッド・型', '重複リテラル')
+    selected = {}
+    candidates = [[], [], []]
+    entry_counts = {}
+    total = 0
+    for name, analysis in parsed.items():
+        points = analysis['positions']
+
+        def distance(entry):
+            return min((max(entry['line'] - point, point - entry['endLine'], 0)
+                        for point in points if point is not None), default=math.inf)
+
+        groups = (analysis['variables'], analysis['declarations'], inventory_duplicates(analysis['literals']))
+        entry_counts[name] = tuple(map(len, groups))
+        for index, entries in enumerate(groups):
+            for entry in entries:
+                if index == 2:
+                    counts = Counter(entry['lines'])
+                    locations = [f'L{line}' + (f'×{count}' if count > 1 else '')
+                                 for line, count in sorted(counts.items())]
+                    shown = locations[:INVENTORY_LOCATION_LINES]
+                    suffix = f' …（出現行を{len(locations) - len(shown)}行省略）' if len(shown) < len(locations) else ''
+                    value = inventory_display(entry['value'], INVENTORY_VALUE_CHARS)
+                    shortened = value != display_path(entry['value']) or len(shown) < len(locations)
+                    text = (value +
+                            f" — {len(entry['lines'])}回: " + ', '.join(shown) + suffix)
+                    rank = (-len(entry['lines']), name, min(entry['lines']), entry['value'])
+                else:
+                    field, limit = ('value', INVENTORY_VALUE_CHARS) if index == 0 else ('signature', INVENTORY_SIGNATURE_CHARS)
+                    display_name = inventory_display(entry['name'], INVENTORY_SIGNATURE_CHARS)
+                    value = inventory_display(entry[field], limit)
+                    shortened = display_name != display_path(entry['name']) or value != display_path(entry[field])
+                    text = display_name + (' = ' if index == 0 else ': ')
+                    text += value + f" — L{entry['line']}"
+                    rank = (distance(entry if index == 1 else dict(entry, endLine=entry['line'])), name, entry['line'], entry['name'])
+                # 囲みの伸長分も含めて、候補追加時のバイト数を定数時間で計算する。
+                fence = max((len(run) + 1 for run in re.findall(r'`+', text)), default=len('```'))
+                candidates[index].append((rank, name, text, shortened, len(text.encode('utf-8')) + 1, fence))
+                total += 1
+    for group in candidates:
+        group.sort()
+
+    headers = {}
+    header_shortened = {}
+    for name in parsed:
+        # 引用で空白・制御文字を保存し、ファイル見出しが改行で壊れるのを防ぐ。
+        quoted = display_path(name)
+        if quoted == name and any(char.isspace() or ord(char) < ASCII_CONTROL_END or
+                                  ord(char) == ASCII_DELETE for char in name):
+            quoted = json.dumps(name, ensure_ascii=False)
+        shown = inventory_display(quoted, INVENTORY_SIGNATURE_CHARS)
+        header_shortened[name] = shown != quoted
+        language = parsed[name]['language']
+        headers[name] = '## ' + shown + ' — ' + language + ' / ' + INVENTORY_METHODS[language]
+
+    prefix = ['# 修正前の既存一覧',
+              f"対象{result['targetFiles']}ファイル、解析成功{result['parsedFiles']}ファイル、解析不能{len(result['unparsed'])}件" +
+              ('（対象外の不正位置を含む）' if result['targetFiles'] < result['parsedFiles'] + len(result['unparsed']) else '') + '。現在の作業ツリーから生成。']
+
+    for label, entries in (('解析不能', result['unparsed']), ('対象外', result['unsupported'])):
+        for entry in entries:
+            prefix.append(label + ': ' + inventory_display(entry['file'], INVENTORY_SIGNATURE_CHARS) +
+                          ' — ' + inventory_display(entry['reason'], INVENTORY_VALUE_CHARS))
+
+    def note(kept, files, shortened):
+        omitted_files = len(parsed) - files
+        truncated = kept < total or omitted_files > 0 or shortened
+        return ((f'省略: 項目{total - kept}件、ファイル{omitted_files}件' +
+                 ('（長い表示も省略）' if shortened else '') + '。') if truncated else '省略なし。', bool(truncated))
+
+    def render():
+        kept = sum(len(rows) for sections in selected.values() for rows in sections)
+        shortened = any(row[3] for sections in selected.values() for rows in sections for row in rows) or any(
+            header_shortened[name] for name in selected)
+        annotation, truncated = note(kept, len(selected), shortened)
+        lines = [*prefix, annotation]
+        for name, sections in sorted(selected.items()):
+            lines.append(headers[name])
+            for index, (label, rows) in enumerate(zip(labels, sections)):
+                lines.append('### ' + label)
+                if rows:
+                    lines.extend(inventory_code_block([row[2] for row in sorted(rows)]))
+                elif entry_counts[name][index] == 0:
+                    lines.append('なし')
+                omitted = entry_counts[name][index] - len(rows)
+                if omitted:
+                    lines.append(f'上限により{omitted}件省略。')
+        return '\n'.join(lines) + '\n', truncated
+
+    for name in parsed:
+        selected[name] = [[], [], []]
+    for index, group in enumerate(candidates):
+        for row in group:
+            selected[row[1]][index].append(row)
+    complete, truncated = render()
+    if len(complete.encode('utf-8')) <= max_bytes:
+        return complete, truncated
+    selected.clear()
+
+    def section_size(name, index, count=0, row_bytes=0, fence=len('```')):
+        size = row_bytes + 2 * (fence + 1) if count else (len('なし\n'.encode()) if entry_counts[name][index] == 0 else 0)
+        omitted = entry_counts[name][index] - count
+        if omitted:
+            size += len(f'上限により{omitted}件省略。\n'.encode())
+        return size
+
+    empty_sizes = {name: len((header + '\n').encode()) + sum(
+        len(('### ' + label + '\n').encode()) + section_size(name, index)
+        for index, label in enumerate(labels)) for name, header in headers.items()}
+    kept, shortened, content_bytes = 0, 0, 0
+    section_totals = {}
+    prefix_bytes = len(('\n'.join(prefix) + '\n').encode())
+
+    def size(content, count, files, short):
+        return prefix_bytes + len((note(count, files, short)[0] + '\n').encode()) + content
+
+    def select(name, index=None, row=None, budget=max_bytes, quota=math.inf):
+        nonlocal kept, shortened, content_bytes
+        created = name not in selected
+        delta = empty_sizes[name] if created else 0
+        short = shortened + (header_shortened[name] if created else 0)
+        count = kept
+        if row is not None:
+            rows = [] if created else selected[name][index]
+            row_bytes, fence = (0, len('```')) if created else section_totals[name][index]
+            next_bytes, next_fence = row_bytes + row[4], max(fence, row[5])
+            delta += section_size(name, index, len(rows) + 1, next_bytes, next_fence) - section_size(
+                name, index, len(rows), row_bytes, fence)
+            short += row[3]
+            count += 1
+        before = size(content_bytes, kept, len(selected), shortened)
+        after = size(content_bytes + delta, count, len(selected) + created, short)
+        cost = max(0, after - before)
+        if after > budget or cost > quota:
+            return None
+        if created:
+            selected[name] = [[], [], []]
+            section_totals[name] = [(0, len('```')) for _ in labels]
+        if row is not None:
+            selected[name][index].append(row)
+            section_totals[name][index] = next_bytes, next_fence
+        content_bytes += delta
+        kept, shortened = count, short
+        return cost
+
+    for group in candidates:
+        if group:
+            name = group[0][1]
+            if name not in selected:
+                select(name, budget=max_bytes * INVENTORY_HEADER_SHARE)
+    remaining = max(0, max_bytes - size(content_bytes, kept, len(selected), shortened))
+    # 近い宣言だけで埋めず、重複リテラルにも容量を残す。
+    pending = [[], [], []]
+    for index, group in enumerate(candidates):
+        used = 0
+        for offset, row in enumerate(group):
+            cost = select(row[1], index, row, quota=remaining // len(labels) - used)
+            if cost is None:
+                pending[index].extend(group[offset:])
+                break
+            else:
+                used += cost
+    for offset in range(max(map(len, pending), default=0)):
+        for index, group in enumerate(pending):
+            if offset < len(group):
+                row = group[offset]
+                if select(row[1], index, row) is None:
+                    group.clear()
+    for name in parsed:
+        if name not in selected:
+            select(name)
+    text, truncated = render()
+    if len(text.encode('utf-8')) > max_bytes:
+        text, truncated = '省略\n', True
+        if len(text.encode('utf-8')) > max_bytes:
+            text = '~'  # 1 byte の上限でも省略を示す。
+    return text, truncated
+
+
+def inventory(args, root, run):
+    directory = args.directory.resolve()
+    iteration_number(directory)
+    require(args.max_bytes > 0, 'limits must be positive')
+    ledger = load_ledger(root)
+    cwd = Path(run['cwd'])
+    positions, errors = finding_locations(ledger)
+    files = {}
+    for name, line in positions:
+        try:
+            name = str(safe_relative(cwd, name).relative_to(cwd))
+            files.setdefault(name, set()).add(line)
+        except EXPECTED_ERRORS as error:
+            errors.append({'file': name, 'reason': str(error)})
+    errors = [dict(file=name, reason=reason) for name, reason in
+              dict.fromkeys((entry['file'], entry['reason']) for entry in errors)]
+    result = {'targetFiles': 0, 'parsedFiles': 0, 'methods': {}, 'unparsed': errors,
+              'unsupported': [], 'truncated': False}
+    parsed = {}
+    with tempfile.TemporaryDirectory() as temporary:
+        temporary = Path(temporary)
+        go_binary, go_error = None, None
+        for name, points in sorted(files.items()):
+            language = INVENTORY_LANGUAGES.get(Path(name).suffix.lower())
+            if language is None:
+                result['unsupported'].append({'file': name, 'reason': 'unsupported language'})
+                continue
+            result['targetFiles'] += 1
+            result['methods'][language] = INVENTORY_METHODS[language]
+            try:
+                path = safe_relative(cwd, name)
+                require(not path.is_symlink(), 'symbolic link is not parsed')
+                require(path.is_file(), 'not a regular file or file missing')
+                data = path.read_bytes()
+                if language == 'Python':
+                    analysis = python_inventory(data)
+                else:
+                    request = json.dumps({'file': str(path), 'root': str(cwd), 'source': data.decode('utf-8-sig')}).encode()
+                    if language == 'TypeScript':
+                        node = shutil.which('node')
+                        require(node is not None, 'node not installed')
+                        command = [node, str(SKILL / 'scripts/inventory_ts.cjs')]
+                    else:
+                        if go_binary is None and go_error is None:
+                            try:
+                                go = shutil.which('go')
+                                require(go is not None, 'go not installed')
+                                go_binary = temporary / 'inventory-go'
+                                # 標準ライブラリだけの単独ファイルを GOPATH モードでビルドし、自動取得・外部解決・利用者の設定を止める。
+                                env = dict(os.environ, GOTOOLCHAIN='local', GOWORK='off', GO111MODULE='off',
+                                           GOENV='off', GOFLAGS='', GOPROXY='off', GOSUMDB='off')
+                                run_command([go, 'build', '-o', str(go_binary), str(SKILL / 'scripts/inventory_go.go')],
+                                            temporary, env=env, timeout=INVENTORY_TIMEOUT)
+                                require(go_binary.is_file(), 'go build produced no executable')
+                            except EXPECTED_ERRORS as error:
+                                go_error, go_binary = str(error), None
+                        require(go_error is None, go_error)
+                        command = [str(go_binary)]
+                    response = run_command(command, cwd, data=request, timeout=INVENTORY_TIMEOUT)
+                    analysis = parse_json(response.stdout.decode('utf-8'))
+                analysis = validate_inventory(analysis)
+                # 不正な数値リテラルをこのファイルの解析不能として扱うため、ここで集計を試す。
+                inventory_duplicates(analysis['literals'])
+                parsed[name] = dict(analysis, language=language, positions=points)
+                result['parsedFiles'] += 1
+            except INVENTORY_PARSE_ERRORS as error:
+                result['unparsed'].append({'file': name, 'reason': str(error)})
+    text, result['truncated'] = inventory_markdown(parsed, result, args.max_bytes)
+    try:
+        save_json(directory / INVENTORY_JSON_FILE, result)
+        write_atomic(directory / INVENTORY_FILE, text)
+    except EXPECTED_ERRORS:
+        invalidate(directory, 'inventory')
+        raise
+    return result
+
+
 class ProfileAction(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None):
         previous = getattr(namespace, '_profile_seen', None)
@@ -1617,6 +2133,7 @@ COMMANDS = {
     'review': (review, 'iteration', always_zero),
     'collect': (collect, 'iteration', always_zero),
     'snapshot': (snapshot, 'iteration', always_zero),
+    'inventory': (inventory, 'iteration', always_zero),
     'task': (task, 'iteration', always_zero),
     'fixdiff': (fixdiff, 'iteration', always_zero),
     'ledger': (ledger_action, 'root', always_zero),
@@ -1650,6 +2167,8 @@ def parser():
     prompts_parser.add_argument('--roles')
     prompts_parser.add_argument('--reconsider', default='')
     prompts_parser.add_argument('--ja-review', action=argparse.BooleanOptionalAction, default=None)
+    inventory_parser = parsers['inventory']
+    inventory_parser.add_argument('--max-bytes', type=int, default=INVENTORY_MAX_BYTES)
     fixdiff_parser = parsers['fixdiff']
     fixdiff_parser.add_argument('--after-check', action='store_true')
     ledger_parser = parsers['ledger']
@@ -1687,6 +2206,9 @@ def main():
             args.target = target_root(args, root)
             root.mkdir(parents=True, exist_ok=True)
         with run_lock(root):
+            # run.json が壊れていても旧出力を使わせないため、指定されたコマンドの出力を読み込み前に失効させる。
+            if args.command in INVALIDATE_BEFORE_LOAD:
+                invalidate(args.directory.resolve(), args.command)
             run = None if args.command == 'init' else load_run(root)
             result = handler(args, root, run)
         print(json.dumps(result))

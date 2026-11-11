@@ -48,9 +48,9 @@ class CLIExamples(unittest.TestCase):
     def read_json(self, path):
         return json.loads(path.read_text(encoding='utf-8'))
 
-    def call(self, *args, code=0):
+    def call(self, *args, code=0, timeout=None):
         result = subprocess.run([sys.executable, str(CLI), *map(str, args)],
-                                env=self.env, capture_output=True, text=True)
+                                env=self.env, capture_output=True, text=True, timeout=timeout)
         self.assertEqual(result.returncode, code, result.stdout + result.stderr)
         if code == 1:
             self.assertTrue(result.stderr.strip(), 'failure needs a diagnostic')
@@ -2058,6 +2058,14 @@ else:
             with self.subTest(key=key):
                 self.assertEqual(int(re.search(pattern, docs)[1]), run[key])
         self.assertEqual(int(re.search(r'(\d+) bytes 以下の引数バッチ', docs)[1]), mr.JA_BATCH_LIMIT)
+        self.assertEqual(int(re.search(r'`--max-bytes` の既定は(\d+) bytes', docs)[1]), mr.INVENTORY_MAX_BYTES)
+        self.assertEqual(int(re.search(r'値は(\d+)文字', docs)[1]), mr.INVENTORY_VALUE_CHARS)
+        self.assertEqual(int(re.search(r'シグネチャ・名前は(\d+)文字', docs)[1]), mr.INVENTORY_SIGNATURE_CHARS)
+        self.assertEqual(int(re.search(r'出現行は(\d+)行', docs)[1]), mr.INVENTORY_LOCATION_LINES)
+        self.assertEqual(int(re.search(r'専用の(\d+)秒の時間制限', docs)[1]), mr.INVENTORY_TIMEOUT)
+        self.assertEqual(int(re.search(r'指数の絶対値は(\d+)まで', docs)[1]), mr.INVENTORY_MAX_EXPONENT)
+        match = re.search(r'全体の(\d+)分の(\d+)まで', docs)
+        self.assertEqual(mr.Fraction(int(match[2]), int(match[1])), mr.INVENTORY_HEADER_SHARE)
         self.assertEqual(re.search(r'`--roles` 省略時は `([^`]+)`', docs)[1].split(','), run['roles'])
         skill = (CLI.parent.parent / 'SKILL.md').read_text(encoding='utf-8')
         for pattern, value in [(r'同時実行は最大(\d+)ジョブ', mr.MAX_PARALLEL),
@@ -2903,3 +2911,950 @@ print('問題なし')
                 marker = (self.run if command == 'ledger' else self.repo) / 'guard-child'
                 pid = marker.read_text()
                 self.assert_process_stopped(pid)
+
+    def inventory_text(self, *options, timeout=None):
+        result = self.call('inventory', self.iter, *options, timeout=timeout)
+        return result, (self.iter / 'inventory.md').read_text(encoding='utf-8')
+
+    def inventory_runtime(self, language):
+        executable = shutil.which(language)
+        self.assertIsNotNone(executable, language + ' is required for inventory tests')
+        (self.bin / language).symlink_to(executable)
+        if language == 'node':
+            package = Path(os.environ.get('MR_TEST_TYPESCRIPT', CLI.parent.parent / 'node_modules/typescript'))
+            self.assertTrue((package / 'package.json').is_file(),
+                            'Set MR_TEST_TYPESCRIPT to the typescript package directory')
+            modules = self.repo / 'node_modules'
+            modules.mkdir(exist_ok=True)
+            (modules / 'typescript').symlink_to(package.resolve(), target_is_directory=True)
+            self.assertIn(int(self.read_json(package / 'package.json')['version'].split('.')[0]), (5, 6))
+            package7 = os.environ.get('MR_TEST_TYPESCRIPT7')
+            self.assertTrue(package7 and (Path(package7) / 'package.json').is_file(),
+                            'Set MR_TEST_TYPESCRIPT7 to the TypeScript 7 package directory')
+            self.assertEqual(int(self.read_json(Path(package7) / 'package.json')['version'].split('.')[0]), 7)
+            return package, Path(package7)
+
+    def test_inventory_typescript_versions_produce_same_analysis(self):
+        packages = self.inventory_runtime('node')
+        source = self.repo / 'versions.ts'
+        content = ('const LIMIT = 30; let empty;\n'
+                   'const C = class { send() { return "repeat"; } };\n'
+                   'const obj = { Member: class { send() { return "repeat"; } } };\n'
+                   'function run(x = 30) { return x; }\n'
+                   'const 名前 = "日本語"; function 関数(x = "日本語") {}\n'
+                   'namespace A { export function run() {} var scoped = 3; }\n'
+                   'namespace B { export function run() {} }\n'
+                   'const wrapped = (() => 42); const Wrapped = (class { run() {} });\n'
+                   'const object = { wrapped: (() => 42), Wrapped: (class { run() {} }) };\n'
+                   'const asserted = ((() => 42) as () => number)!;\n'
+                   'const checked = (() => 42) satisfies () => number;\n'
+                   'const typed = <() => number>(() => 42);\n'
+                   'const named = function inner() {};\n'
+                   'export default function () {}\n')
+        source.write_text(content)
+        self.add(file=source.name)
+        baseline = None
+        for package in packages:
+            with self.subTest(package=str(package)):
+                link = self.repo / 'node_modules/typescript'
+                link.unlink()
+                link.symlink_to(Path(package).resolve(), target_is_directory=True)
+                result, text = self.inventory_text()
+                self.assertEqual(result['unparsed'], [])
+                for expected in ('LIMIT = 30', 'empty = ' + mr.NO_VALUE_MARK, 'C.send:', 'Member.send:',
+                                 'run: function run(x = 30)', '"repeat" — 2回', '30 — 2回',
+                                 '名前 = "日本語"', '関数: function 関数(x = "日本語")',
+                                 '"日本語" — 2回', 'A.run:', 'B.run:', 'wrapped: () =>',
+                                 'Wrapped.run:', 'asserted: () =>', 'checked: () =>', 'typed: () =>',
+                                 'named: function inner()',
+                                 'default: export default function ()'):
+                    self.assertIn(expected, text)
+                self.assertNotIn('\nscoped =', text)
+                if baseline is None:
+                    baseline = result, text
+                self.assertEqual((result, text), baseline)
+
+    def test_inventory_python_source_segments_preserve_bytes_and_multiline_values(self):
+        source = 'TEXT = "日本語"; VALUE = (0x2a +\r\n    0b11)\r\nEMPTY: int\r\n'
+        (self.repo / 'segments.py').write_bytes(source.encode('utf-8'))
+        self.add(file='segments.py')
+        result, text = self.inventory_text()
+        self.assertEqual(result['unparsed'], [])
+        self.assertIn('TEXT = "日本語"', text)
+        self.assertIn('VALUE = 0x2a +\n    0b11 — L1', text)
+        self.assertIn('EMPTY = ' + mr.NO_VALUE_MARK, text)
+
+    def test_inventory_variable_processing_scales_with_input(self):
+        elapsed = []
+        for count in (2000, 20000):
+            (self.repo / 'large.py').write_text(''.join(f'VALUE_{i} = {i + 3}\n' for i in range(count)))
+            self.add(file='large.py', line=count)
+            started = time.monotonic()
+            result, text = self.inventory_text()
+            elapsed.append(time.monotonic() - started)
+            self.assertEqual(result['parsedFiles'], 1)
+            self.assertEqual(result['unparsed'], [])
+            self.assertTrue(result['truncated'])
+            self.assertIn(f'VALUE_{count - 1} = {count + 2}', text)
+        # 入力10倍に対し、項目ごとの全文走査による二乗の増加を検出する。
+        self.assertLess(elapsed[1] / elapsed[0], 30)
+
+    def test_inventory_empty_and_status_filter(self):
+        result, text = self.inventory_text()
+        self.assertEqual(result['targetFiles'], 0)
+        self.assertEqual(result['parsedFiles'], 0)
+        self.assertFalse(result['truncated'])
+        self.assertIn('対象0ファイル', text)
+        self.assertEqual(self.read_json(self.iter / 'inventory.json'), result)
+        self.call('inventory', self.run, code=1)
+        self.assertIn('iteration must be', self.last_stderr)
+        for status in ('fixed', 'on_hold', 'rejected'):
+            self.add(file=status + '.py', problem='不備（他: ' + status + '_other.py:1）')
+        self.call('ledger', self.run, 'fix', 'F1', '--iteration', 1, '--summary', 'done')
+        self.call('ledger', self.run, 'hold', 'F2', '--reason', 'later')
+        self.call('ledger', self.run, 'reject', 'F3', '--reason', 'invalid')
+        self.add(file='unresolved.py', problem='不備（他: unresolved_other.py:1）')
+        result, _ = self.inventory_text()
+        self.assertEqual(result['targetFiles'], 2)
+        self.assertEqual({entry['file'] for entry in result['unparsed']}, {'unresolved.py', 'unresolved_other.py'})
+
+    def test_inventory_python_ast_and_literal_identity(self):
+        source = '''"""doc text"""
+LIMIT = 30
+ALIAS: int = LIMIT
+LEFT, RIGHT = (3, 4)
+if True:
+    CONDITIONAL = "request failed"
+class Client(Base, flag="x"):
+    field = 20
+    @route("path")
+    async def send(self, x: int = 30, /, *, y="request failed") -> str:
+        """doc text"""
+        def nested():
+            return "request failed", 'request\\x20failed', -42, 42, -42
+        return nested()
+@route("path")
+def f():
+    return ("x", 0, 0, 1, 1, -1, -1, "", "", " ", " ", True, True, False, False, None, None, 30.0, 30.0)
+'''
+        (self.repo / 'a.py').write_text(source)
+        self.add(file='a.py', line=9, problem='不備（他: a.py:12, "a,b.py":-）')
+        (self.repo / 'a,b.py').write_text('')
+        self.add(file='a.py')
+        result, text = self.inventory_text()
+        self.assertEqual((result['targetFiles'], result['parsedFiles']), (2, 2))
+        self.assertEqual(result['methods'], {'Python': 'ast'})
+        for expected in ('LIMIT = 30', 'ALIAS = LIMIT', 'LEFT = (3, 4)', 'RIGHT = (3, 4)',
+                         'CONDITIONAL =', 'Client.send', 'Client.send.nested', 'async def send',
+                         '"request failed" — 4回', '-42 — 2回', '30.0 — 2回', f'L{source.splitlines().index("def f():") + 2}×2',
+                         '"path" — 2回', '"x" — 2回', "Client: class Client(Base, flag='x')"):
+            self.assertIn(expected, text)
+        self.assertNotIn('field =', text)
+        self.assertNotIn('doc text', text)
+        self.assertNotIn('True —', text)
+        self.assertNotIn('42 — 3回', text)
+        for value in ('1', '-1', '0', 'True', 'False', 'None', '""', '" "', '"\\t"'):
+            self.assertNotIn('\n' + value + ' —', text)
+        (self.repo / 'a,b.py').write_text('Z = 3\nA = 4\n')
+        self.add(file='./a.py', line=9)
+        result, text = self.inventory_text()
+        self.assertEqual(result['targetFiles'], 2)
+        self.assertLess(text.index('Z ='), text.index('A ='))
+        (self.repo / 'a.py').write_text('X: int\na["repeat"] = 3\nb["repeat"] = 4\nlookup[tuple(part for part in values)] = 3\n(A, [B, *REST]) = values\n')
+        result, text = self.inventory_text()
+        self.assertIn('X = ' + mr.NO_VALUE_MARK + ' — L1', text)
+        self.assertNotIn('\npart =', text)
+        for name in ('A', 'B', 'REST'):
+            self.assertIn('\n' + name + ' = values', text)
+        self.assertIn('\n"repeat" — 2回', text)
+
+    def test_inventory_paths_and_partial_parse_failure(self):
+        (self.repo / 'good.py').write_text('X = 3\n')
+        (self.repo / 'bad.py').write_text('def broken(:\n')
+        (self.repo / 'note.md').write_text('not source')
+        (self.repo / 'folder.py').mkdir()
+        (self.repo / 'linked.py').symlink_to(self.repo / 'good.py')
+        outside = self.root / 'outside'
+        outside.mkdir()
+        (self.repo / 'escape').symlink_to(outside, target_is_directory=True)
+        self.add(file='good.py', problem='不備（他: bad.py:1, missing.py:1, note.md:1, '
+                 'linked.py:1, folder.py:1, ../unsafe.py:1, escape/x.py:1, malformed）')
+        self.add(file='good.py', problem='不備（他: ../unsafe.py:1, malformed）')
+        result, text = self.inventory_text()
+        self.assertEqual(result['parsedFiles'], 1)
+        self.assertEqual(result['targetFiles'], 5)
+        self.assertEqual(len(result['unparsed']), 7)
+        self.assertEqual(result['unsupported'][0]['file'], 'note.md')
+        self.assertEqual(result['unsupported'][0]['reason'], 'unsupported language')
+        self.assertIn('X = 3', text)
+        self.assertIn('解析不能7件（対象外の不正位置を含む）', text)
+        self.assertNotIn('## note.md', text)
+        for entry in result['unparsed'] + result['unsupported']:
+            self.assertIn(entry['file'] + ' — ' + entry['reason'], text)
+        self.assertLess(text.index('note.md —'), text.index('## good.py'))
+        _, limited = self.inventory_text('--max-bytes', 200)
+        self.assertLessEqual(len(limited.encode()), 200)
+        reasons = {entry['file']: entry['reason'] for entry in result['unparsed']}
+        for name, reason in {'bad.py': 'invalid syntax', 'missing.py': 'not a regular file',
+                             'linked.py': 'symbolic link', 'folder.py': 'not a regular file',
+                             '../unsafe.py': 'unsafe relative file', 'escape/x.py': 'file parent escapes cwd',
+                             'malformed': 'invalid location'}.items():
+            self.assertIn(reason, reasons[name])
+
+    def test_inventory_python_encodings_annotations_and_templates(self):
+        source = ('# coding: latin-1\r\nNAME = "caf\xe9"\r\n'
+                  'def f(x: "annotation", y: "annotation"):\r\n'
+                  '    return f"plain", "plain", f"fragment{30}", f"fragment{30}", "caf\xe9", f"{x:{31}}", f"{x:{31}}", f"{x:>10}", f"{x:>10}", f"{x:.2f}", f"{x:.2f}"')
+        (self.repo / 'encoded.py').write_bytes(source.encode('latin-1'))
+        self.add(file='encoded.py')
+        result, text = self.inventory_text()
+        self.assertEqual(result['parsedFiles'], 1)
+        self.assertIn('café', text)
+        self.assertIn('30 — 2回', text)
+        self.assertNotIn('"annotation" —', text)
+        self.assertNotIn('"fragment" —', text)
+        self.assertIn('31 — 2回', text)
+        self.assertNotIn('">10" —', text)
+        self.assertNotIn('".2f" —', text)
+        self.assertIn('\n"plain" — 2回', text)
+        if hasattr(mr.ast, 'TypeAlias'):
+            (self.repo / 'encoded.py').write_text('type Choice = Literal["type-only", "type-only"]\nclass Box[T]: pass\n')
+            result, text = self.inventory_text()
+            self.assertEqual(result['unparsed'], [])
+            self.assertIn('Choice: type Choice = Literal["type-only", "type-only"] — L1', text)
+            self.assertNotIn('\n"type-only" —', text)
+            self.assertIn('Box: class Box[T]', text)
+
+    def test_inventory_typescript_real_compiler_and_project_resolution(self):
+        packages = self.inventory_runtime('node')
+        (self.repo / 'a.tsx').write_text('''export const LIMIT = 30;
+export let first = "request failed", second = 'request failed';
+export const run = async (x: number = 30): Promise<number> => x;
+export class Client { send(x: string): string { return "request failed"; } }
+export interface Options { value: "type-only"; other: "type-only"; }
+export type Result = string | number;
+export enum State { Ready = 3, Done = 4 }
+function outer() { var innerVar = 3; function inner() { return -(42); } return -(0x2a); }
+foo(function () { return "cb"; }, () => "cb");
+try {} catch (caught) {}
+export default class { m() { return "x"; } }
+foo(class { anonymous() {} });
+const node = <div>jsx text</div>;
+const tpl = `plain`; const tpl2 = 'plain';
+const C = (class { constructor() {} get value() { return 3; } set value(x: number) {} handler = () => 42; });
+const obj = { send: () => 42, Member: class { send() {} } };
+class Derived extends mixin("runtime") {}
+const instance = mixin("runtime")<string>;
+for (let loop = 0; loop < 2; loop++) {}
+{ const block = 3; let local = 4; var moduleVar = 5; }
+import thing from "module-only"; export {thing} from "module-only";
+import alias = require("module-only");
+const X = class Y { m() {} };
+type Imported = import("module-only").Thing;
+class Decorated {
+  @Get("decorator") ["computed"](@Arg("decorator") {a = "binding"} = {}) {
+    return ["computed", "binding"];
+  }
+}
+''')
+        self.add(file='a.tsx')
+        for compiler_package in packages:
+            with self.subTest(package=str(compiler_package)):
+                link = self.repo / 'node_modules/typescript'
+                link.unlink()
+                link.symlink_to(compiler_package.resolve(), target_is_directory=True)
+                result, text = self.inventory_text()
+                self.assertEqual(result['unparsed'], [])
+                self.assertEqual(result['methods'], {'TypeScript': 'TypeScript compiler API'})
+                for expected in ('LIMIT = 30', 'run: async (x: number = 30): Promise<number> =>', 'Client.send', 'Options', 'Result', 'State',
+                                 'outer.inner', '"request failed" — 3回', '-42 — 2回', '"plain" — 2回'):
+                    self.assertIn(expected, text)
+                self.assertNotIn('"type-only" —', text)
+                for expected in ('Y.m: m()', 'C: class', 'C.constructor: constructor()', 'C.value: get value()',
+                                 'C.value: set value(x: number)', 'C.handler: () =>', 'send: () =>',
+                                 'Member.send: send()', 'moduleVar = 5', '"runtime" — 2回',
+                                 '"decorator" — 2回', '"computed" — 2回', '"binding" — 2回',
+                                 '"cb" — 2回', 'default.m:', '\nanonymous: anonymous()'):
+                    self.assertIn(expected, text)
+                for excluded in ('\ninnerVar =', '\ncaught =', '\nnull:', '\nundefined:', '\n: ', '\nloop =', '\nblock =', '\nlocal =', '"module-only" —'):
+                    self.assertNotIn(excluded, text)
+        package = self.repo / 'packages/app'
+        package.mkdir(parents=True)
+        shutil.move(str(self.repo / 'node_modules'), package / 'node_modules')
+        shutil.move(str(self.repo / 'a.tsx'), package / 'nested.tsx')
+        self.call('ledger', self.run, 'update', 'F1', '--input', self.inventory_update(file='packages/app/nested.tsx'))
+        self.assertEqual(self.inventory_text()[0]['parsedFiles'], 1)
+        # cwd の外のパッケージにフォールバックしない。
+        shutil.move(str(package / 'node_modules'), self.root / 'node_modules')
+        result, _ = self.inventory_text()
+        self.assertEqual(result['parsedFiles'], 0)
+        self.assertEqual(result['unparsed'][0]['file'], 'packages/app/nested.tsx')
+        self.assertIn('typescript not found within project root', result['unparsed'][0]['reason'])
+        # 空のパッケージがあっても、Node がルート外のものにフォールバックしない。
+        empty = self.repo / 'node_modules/typescript'
+        empty.mkdir(parents=True)
+        (empty / 'package.json').write_text('{}')
+        result, _ = self.inventory_text()
+        self.assertEqual(result['parsedFiles'], 0)
+        self.assertEqual(result['unparsed'][0]['file'], 'packages/app/nested.tsx')
+        self.assertIn('outside selected typescript package', result['unparsed'][0]['reason'])
+        shutil.rmtree(self.root / 'node_modules')
+        (empty / 'package.json').write_text('{"main":"index.cjs"}')
+        (empty / 'index.cjs').write_text('module.exports = {};')
+        result, _ = self.inventory_text()
+        self.assertEqual(result['unparsed'][0]['file'], 'packages/app/nested.tsx')
+        self.assertIn("Cannot find module 'typescript/unstable/ast'", result['unparsed'][0]['reason'])
+        (empty / 'index.cjs').write_text('throw "parser failed";')
+        result, _ = self.inventory_text()
+        self.assertIn('parser failed', result['unparsed'][0]['reason'])
+
+    def inventory_update(self, **fields):
+        path = self.root / 'update.json'
+        self.write_json(path, fields)
+        return path
+
+    def test_inventory_javascript_extensions_and_syntax_errors(self):
+        packages = self.inventory_runtime('node')
+        for package in packages:
+            with self.subTest(package=package):
+                link = self.repo / 'node_modules/typescript'
+                link.unlink()
+                link.symlink_to(Path(package).resolve(), target_is_directory=True)
+                for extension in ('js', 'jsx', 'mjs', 'cjs', 'ts', 'tsx', 'TS'):
+                    name = 'source.' + extension
+                    (self.repo / name).write_text('const f = (x = "message") => "message";' +
+                                                  ('<div />;' if extension in ('jsx', 'tsx') else ''))
+                    if package == packages[0]:
+                        self.add(file=name)
+                (self.repo / 'broken.ts').write_text('const value = ;')
+                if package == packages[0]:
+                    self.add(file='broken.ts')
+                result, text = self.inventory_text()
+                self.assertEqual(result['parsedFiles'], 7)
+                self.assertEqual(len(result['unparsed']), 1)
+                self.assertEqual(text.count('"message" — 2回'), 7)
+                self.assertEqual(result['unparsed'][0]['file'], 'broken.ts')
+                self.assertIn('Expression expected', result['unparsed'][0]['reason'])
+                (self.repo / 'source.js').write_text('var values = [08, 8, 09, 9, 052, 42]; const {x = "repeat"} = () => "repeat";')
+                result, text = self.inventory_text()
+                self.assertEqual(result['parsedFiles'], 7)
+                self.assertIn('"repeat" — 2回', text)
+                for value in ('08', '09', '052'):
+                    self.assertIn('\n' + value + ' — 2回', text)
+
+    def test_inventory_go_real_parser_and_no_module_resolution(self):
+        self.inventory_runtime('go')
+        goenv = self.root / 'goenv'
+        goenv.write_text('GOFLAGS=-mod=vendor\n')
+        self.env.update(GOENV=str(goenv), GOTOOLCHAIN='go99.0', GOFLAGS='-mod=vendor',
+                        GOPROXY='https://invalid', GOSUMDB='invalid', GOWORK='/missing/go.work',
+                        GO111MODULE='on')
+        (self.repo / 'a.go').write_text('''package demo
+import "missing.invalid/package"
+const ( Limit = 30; Next = iota; Another )
+var first, second = "request failed", `request failed`
+type Client[T any] struct { value T }
+func (c *Client[T]) Send(x int) string { return "request failed" }
+func Retry[T any](x T) T { _ = -(42); _ = -(0x2a); _ = +(42); _ = 42; return x }
+func (Client[T]) Value() {}
+func (c Client[T]) Named() {}
+var a, b = pair()
+var callback = func() { _ = "inside"; _ = "inside" }
+//line generated.go:900
+func f(x int) int
+func crossing() {
+//line generated.go:1
+    _ = 33; _ = 33
+}
+''')
+        (self.repo / 'broken.go').write_text('package demo\nfunc (')
+        self.add(file='a.go', problem='不備（他: broken.go:2）')
+        result, text = self.inventory_text()
+        self.assertEqual(result['parsedFiles'], 1)
+        self.assertEqual(result['methods'], {'Go': 'go/parser + go/ast'})
+        self.assertEqual(len(result['unparsed']), 1)
+        self.assertEqual(result['unparsed'][0]['file'], 'broken.go')
+        self.assertIn('expected', result['unparsed'][0]['reason'])
+        self.assertNotIn('対象外の不正位置', text)
+        for expected in ('Limit = 30', 'Next = iota', 'Client.Send', 'Retry',
+                         'Another = ［直前の定数式を省略継承］ — L3',
+                         'Client.Value: func (Client[T]) Value()', 'Client.Named: func (c Client[T]) Named()',
+                         'a = pair() — L10', 'b = pair() — L10', '"inside" — 2回',
+                         '"request failed" — 3回', '-42 — 2回', '\n42 — 2回', 'f: func f(x int) int — L13',
+                         'crossing: func crossing() — L14', '33 — 2回: L16×2'):
+            self.assertIn(expected, text)
+
+    def test_inventory_missing_and_invalid_external_parsers(self):
+        for name in ('a.ts', 'a.go'):
+            (self.repo / name).write_text('anything')
+            self.add(file=name)
+        result, _ = self.inventory_text()
+        self.assertEqual(result['unparsed'], [{'file': 'a.go', 'reason': 'go not installed'},
+                                              {'file': 'a.ts', 'reason': 'node not installed'}])
+        counter = self.root / 'build-count'
+        count_build = 'from pathlib import Path\nPath(' + repr(str(counter)) + ').open("a").write("build\\n")\n'
+        (self.repo / 'second.go').write_text('package demo')
+        self.add(file='second.go')
+        empty = {'variables': [], 'declarations': [], 'literals': []}
+        for body, reason in (('print(' + repr(json.dumps(empty)) + ')', None),
+                             ("print('not json')", 'Expecting value'),
+                             ("print('{}')", 'invalid inventory response'),
+                             ("raise SystemExit('parser failed')", 'parser failed')):
+            with self.subTest(body=body):
+                self.fake('node', body)
+                counter.unlink(missing_ok=True)
+                self.fake('go', count_build + 'import sys\nfrom pathlib import Path\n'
+                          'output = Path(sys.argv[sys.argv.index("-o") + 1])\n'
+                          'output.write_text(' + repr('#!' + sys.executable + '\n' + body) + ')\n'
+                          'output.chmod(0o755)')
+                result, _ = self.inventory_text()
+                self.assertEqual(counter.read_text().splitlines(), ['build'])
+                self.assertEqual(result['parsedFiles'], 3 if reason is None else 0)
+                self.assertEqual([entry['file'] for entry in result['unparsed']],
+                                 [] if reason is None else ['a.go', 'a.ts', 'second.go'])
+                for entry in result['unparsed']:
+                    self.assertIn(reason, entry['reason'])
+        launcher = 'import sys\nsys.path.insert(0,sys.argv.pop(1))\nimport mr\nmr.INVENTORY_TIMEOUT=.1\nsys.exit(mr.main())'
+        for body, reason in (('raise SystemExit("build failed")', 'build failed'),
+                             ('pass', 'go build produced no executable'),
+                             ('import time\ntime.sleep(30)', 'timed out')):
+            with self.subTest(reason=reason):
+                counter.unlink(missing_ok=True)
+                self.fake('go', count_build + body)
+                output = subprocess.run([sys.executable, '-c', launcher, str(CLI.parent),
+                                         'inventory', str(self.iter)], env=self.env,
+                                        capture_output=True, text=True)
+                self.assertEqual(output.returncode, 0, output.stderr)
+                result = json.loads(output.stdout)
+                self.assertEqual(self.read_json(self.iter / 'inventory.json'), result)
+                failures = [entry for entry in result['unparsed'] if entry['file'].endswith('.go')]
+                self.assertEqual(counter.read_text().splitlines(), ['build'])
+                self.assertEqual(len(failures), 2)
+                self.assertEqual(failures[0]['reason'], failures[1]['reason'])
+                self.assertIn(reason, failures[0]['reason'])
+
+    def test_inventory_timeout_and_stale_output(self):
+        (self.repo / 'a.ts').write_text('const a = 3;')
+        self.add(file='a.ts')
+        self.fake('node', 'import time\ntime.sleep(30)')
+        (self.iter / 'inventory.md').write_text('STALE')
+        launcher = 'import sys\nsys.path.insert(0,sys.argv.pop(1))\nimport mr\nmr.INVENTORY_TIMEOUT=.1\nsys.exit(mr.main())'
+        output = subprocess.run([sys.executable, '-c', launcher, str(CLI.parent),
+                                 'inventory', str(self.iter)], env=self.env, capture_output=True, text=True)
+        self.assertEqual(output.returncode, 0, output.stderr)
+        result = json.loads(output.stdout)
+        text = (self.iter / 'inventory.md').read_text()
+        self.assertIn('timed out', result['unparsed'][0]['reason'])
+        self.assertEqual(result['unparsed'][0]['file'], 'a.ts')
+        self.assertEqual(self.read_json(self.iter / 'inventory.json'), result)
+        self.assertNotIn('STALE', text)
+        (self.run / 'findings.json').write_text('{}')
+        self.call('inventory', self.iter, code=1)
+        self.assertFalse((self.iter / 'inventory.md').exists())
+        self.assertFalse((self.iter / 'inventory.json').exists())
+
+    def test_inventory_limits_and_priorities(self):
+        source = 'FAR = "' + '長' * 200 + '"\n'
+        source += 'def far(' + ', '.join('argument' + str(i) for i in range(30)) + '):\n    return "' + 'rare' * 30 + '", "' + 'rare' * 30 + '"\n'
+        source += '\n' * 30 + 'def near():\n    return "common", "common", "common"\n'
+        (self.repo / 'a.py').write_text(source)
+        self.add(file='a.py', line=35)
+        result, text = self.inventory_text('--max-bytes', 500)
+        self.assertLessEqual(len(text.encode('utf-8')), 500)
+        self.assertTrue(result['truncated'])
+        self.assertIn('省略: 項目', text)
+        self.assertNotIn('長い表示も省略', text)
+        self.assertIn('near', text)
+        self.assertIn('common', text)
+        self.assertNotIn('rare', text)
+        self.assertNotIn('\nfar:', text)
+        self.assertNotIn('\nFAR =', text)
+        for budget in (1, 6, 7, 40, 200, 1000):
+            with self.subTest(budget=budget):
+                result, text = self.inventory_text('--max-bytes', budget)
+                self.assertLessEqual(len(text.encode('utf-8')), budget)
+                if budget in (1, 6, 7, 40):
+                    self.assertEqual(text, '~' if budget < 7 else '省略\n')
+                elif budget == 200:
+                    self.assertTrue(text.startswith('# 修正前の既存一覧\n'))
+                    self.assertIn('省略: 項目5件、ファイル1件。', text)
+                    self.assertNotIn('## a.py', text)
+        (self.repo / 'a.py').write_text('def near(' + 'argument' * 20 + '): pass\n' +
+                                      '\n' * 10 + 'def far(): pass\n' +
+                                      'VALUES = (' + repr('long' * 30) + ',) * 0\n' +
+                                      'VALUES = (' + ', '.join([repr('long' * 30)] * 3 + ['"small"'] * 2) + ')\n')
+        self.call('ledger', self.run, 'update', 'F1', '--input', self.inventory_update(line=1))
+        for budget in (400, 500, 600, 700):
+            with self.subTest(budget=budget):
+                _, text = self.inventory_text('--max-bytes', budget)
+                if '\nfar:' in text:
+                    self.assertIn('\nnear:', text)
+                if '\n"small" —' in text:
+                    self.assertIn('\n"' + 'long' * 29, text)
+        for value in (0, -1):
+            self.call('inventory', self.iter, '--max-bytes', value, code=1)
+            self.assertIn('limits must be positive', self.last_stderr)
+        self.call('inventory', self.iter, '--max-bytes', 'nan', code=2)
+
+    def test_inventory_atomic_output_and_no_extra_invalidation(self):
+        (self.repo / 'a.py').write_text('X = 3')
+        self.add(file='a.py')
+        self.inventory_text()
+        saved = (self.iter / 'inventory.md').read_bytes()
+        self.call('prompts', self.iter, '--roles', '')
+        self.assertEqual((self.iter / 'inventory.md').read_bytes(), saved)
+        self.add(file='a.py')
+        self.assertEqual((self.iter / 'inventory.md').read_bytes(), saved)
+        for filename in (mr.INVENTORY_FILE, mr.INVENTORY_JSON_FILE):
+            with self.subTest(filename=filename):
+                self.inventory_text()
+                self.fail_replacement(self.iter / filename, 'inventory', self.iter)
+                self.assertFalse((self.iter / mr.INVENTORY_FILE).exists())
+                self.assertFalse((self.iter / mr.INVENTORY_JSON_FILE).exists())
+        target = self.root / 'untouched'
+        target.write_text('untouched')
+        (self.iter / 'inventory.md').symlink_to(target)
+        self.inventory_text()
+        self.assertEqual(target.read_text(), 'untouched')
+
+    def test_inventory_exact_numeric_values_and_exclusions(self):
+        (self.repo / 'numbers.py').write_text('''VALUES = (+42, 0x2a, 42.0, 4.2e1, - 42, -0x2a,
+    0, 0.0, -0, 1, 1.0, -1, -1.0, True, True, False, False, None, None, "", "", " ", " ", "\\t", "\\t",
+    9007199254740992, 9007199254740993, 1e400, 1e400, 23j, 23j, b"bytes-only", b"bytes-only")
+''')
+        self.add(file='numbers.py')
+        result, text = self.inventory_text()
+        self.assertEqual(result['unparsed'], [])
+        for value in ('42 — 2回', '42.0 — 2回', '-42 — 2回', '1e400 — 2回'):
+            self.assertIn('\n' + value, text)
+        self.assertNotIn('9007199254740992 — 2回', text)
+        self.assertNotIn('1.0 —', text)
+        self.assertNotIn('\n0 —', text)
+        for value in ('23j', 'b"bytes-only"', '-1', 'True', 'False', 'None', '""', '" "', '"\\t"'):
+            self.assertNotIn('\n' + value + ' —', text)
+
+        empty = {'variables': [], 'declarations': [], 'literals': []}
+        for suffix in ('ts', 'go'):
+            name = 'extreme.' + suffix
+            (self.repo / name).write_text('')
+            self.add(file=name)
+        exponent_error = 'numeric exponent exceeds inventory limit'
+        for raw, kind, reason in (('9' * 4300, 'number', None),
+                                  ('9' * 4301, 'number', None),
+                                  ('9' * 4301 + 'n', 'bigint', None),
+                                  ('9' * 4301 + '.0', 'number', None),
+                                  ('0.' + '9' * 4301, 'number', None),
+                                  (f'1e{mr.INVENTORY_MAX_EXPONENT}', 'number', None),
+                                  (f'1e-{mr.INVENTORY_MAX_EXPONENT}', 'number', None),
+                                  (f'0x1p{mr.INVENTORY_MAX_EXPONENT}', 'number', None),
+                                  (f'0x1p-{mr.INVENTORY_MAX_EXPONENT}', 'number', None),
+                                  (f'1e{mr.INVENTORY_MAX_EXPONENT + 1}', 'number', exponent_error),
+                                  (f'1e-{mr.INVENTORY_MAX_EXPONENT + 1}', 'number', exponent_error),
+                                  (f'0x1p{mr.INVENTORY_MAX_EXPONENT + 1}', 'number', exponent_error),
+                                  ('1e99999999', 'number', exponent_error),
+                                  ('0x1p999999999', 'number', exponent_error),
+                                  ('0x1p-999999999', 'number', exponent_error)):
+            with self.subTest(kind=kind, length=len(raw), reason=reason):
+                response = {**empty, 'literals': [{'kind': kind, 'value': raw, 'line': 1}] * 2}
+                body = 'print(' + repr(json.dumps(response)) + ')'
+                self.fake('node', body)
+                self.fake('go', 'import sys\nfrom pathlib import Path\n'
+                          'output = Path(sys.argv[sys.argv.index("-o") + 1])\n'
+                          'output.write_text(' + repr('#!' + sys.executable + '\n' + body) + ')\n'
+                          'output.chmod(0o755)')
+                result, text = self.inventory_text(timeout=mr.INVENTORY_TIMEOUT)
+                if reason is None:
+                    self.assertEqual(result['unparsed'], [])
+                    self.assertEqual(result['parsedFiles'], 3)
+                    shown = raw if len(raw) <= mr.INVENTORY_VALUE_CHARS else raw[:mr.INVENTORY_VALUE_CHARS - 1] + '…'
+                    self.assertEqual(text.count(shown + ' — 2回'), 2)
+                else:
+                    self.assertEqual([entry['file'] for entry in result['unparsed']],
+                                     ['extreme.go', 'extreme.ts'])
+                    for entry in result['unparsed']:
+                        self.assertIn(reason, entry['reason'])
+
+    def test_inventory_bad_bytes_and_special_files_do_not_block(self):
+        fixtures = {'bad.py': b'\xff', 'bad.ts': b'\xff', 'bad.go': b'\xff', 'null.py': b'X = "\0"',
+                    'bom.py': b'\xef\xbb\xbfX = 3\r\n', 'empty.py': b'', 'note': b'plain'}
+        for name, content in fixtures.items():
+            (self.repo / name).write_bytes(content)
+            self.add(file=name)
+        os.mkfifo(self.repo / 'pipe.py')
+        self.add(file='pipe.py')
+        (self.repo / 'denied.py').write_text('X = 3')
+        self.add(file='denied.py')
+        launcher = """import sys
+from pathlib import Path
+from unittest.mock import patch
+sys.path.insert(0, sys.argv.pop(1))
+import mr
+original = Path.read_bytes
+def read_bytes(path):
+    if path.name == 'denied.py':
+        raise PermissionError('Permission denied')
+    return original(path)
+with patch.object(Path, 'read_bytes', read_bytes):
+    sys.exit(mr.main())
+"""
+        output = subprocess.run([sys.executable, '-c', launcher, str(CLI.parent),
+                                 'inventory', str(self.iter)], env=self.env, capture_output=True, text=True)
+        self.assertEqual(output.returncode, 0, output.stderr)
+        result = json.loads(output.stdout)
+        text = (self.iter / mr.INVENTORY_FILE).read_text()
+        self.assertEqual(result['parsedFiles'], 2)
+        self.assertEqual(len(result['unparsed']), 6)
+        self.assertEqual(len(result['unsupported']), 1)
+        self.assertIn('bom.py', text)
+        reasons = {entry['file']: entry['reason'] for entry in result['unparsed']}
+        for name, reason in {'bad.py': 'encoding', 'null.py': 'null bytes',
+                             'pipe.py': 'not a regular file'}.items():
+            self.assertIn(reason, reasons[name])
+        self.assertIn('Permission denied', reasons['denied.py'])
+        for name in ('bad.ts', 'bad.go'):
+            self.assertIn('utf-8', reasons[name])
+        (self.repo / 'bad.py').write_bytes(b'# coding: bogus\nX = 3')
+        (self.repo / 'null.py').write_text('X = ' + '+'.join(['2'] * 10000))
+        result, _ = self.inventory_text()
+        reasons = {entry['file']: entry['reason'] for entry in result['unparsed']}
+        self.assertIn('unknown encoding', reasons['bad.py'])
+        (self.repo / 'bad.py').write_bytes(b'# coding: rot_13\nX = 3')
+        result, _ = self.inventory_text()
+        reasons = {entry['file']: entry['reason'] for entry in result['unparsed']}
+        self.assertIn('not a text encoding', reasons['bad.py'])
+        self.assertIn('recursion', reasons['null.py'].lower())
+
+    def test_inventory_truncation_order_lines_and_exact_byte_boundary(self):
+        (self.repo / 'priority.py').write_text(
+            'def far(' + ', '.join('argument' + str(i) + ': str' for i in range(20)) + '):\n    pass\n' + '\n' * 100 + 'def near():\n    pass\n' +
+            '\n'.join('VALUE = "repeated"' for _ in range(30)))
+        self.add(file='priority.py', line=104)
+        result, text = self.inventory_text()
+        self.assertTrue(result['truncated'])
+        self.assertIn('出現行を6行省略', text)
+        self.assertLess(text.index('near:'), text.index('far:'))
+        self.assertEqual(self.inventory_text()[1], text)
+        signature = next(row for row in text.splitlines() if row.startswith('far: ')).split(' — L')[0][len('far: '):]
+        self.assertEqual(len(signature), mr.INVENTORY_SIGNATURE_CHARS)
+        self.assertTrue(signature.endswith('…'))
+        result, limited = self.inventory_text('--max-bytes', 650)
+        self.assertIn('near:', limited)
+        self.assertNotIn('far:', limited)
+        self.assertLessEqual(len(limited.encode()), 650)
+        (self.repo / 'priority.py').write_text('VALUE = "ellipsis…"')
+        result, text = self.inventory_text()
+        self.assertFalse(result['truncated'])
+        size = len(text.encode())
+        self.assertEqual(self.inventory_text('--max-bytes', size)[1], text)
+        result, shorter = self.inventory_text('--max-bytes', size - 1)
+        self.assertTrue(result['truncated'])
+        self.assertLessEqual(len(shorter.encode()), size - 1)
+        name = 'N' * (mr.INVENTORY_SIGNATURE_CHARS + 1)
+        (self.repo / 'priority.py').write_text(name + ' = "' + 'v' * 121 + '"\n' +
+                                             'def f():\n    return "' + 'd' * 121 + '", "' + 'd' * 121 + '"\n')
+        result, text = self.inventory_text()
+        self.assertTrue(result['truncated'])
+        self.assertIn('\n' + name[:239] + '… = "' + 'v' * 118 + '… — L1', text)
+        self.assertIn('\n"' + 'd' * 118 + '… — 2回', text)
+        self.assertIn('省略: 項目0件、ファイル0件（長い表示も省略）。', text)
+        (self.repo / 'priority.py').write_text('VALUE = "' + 'v' * 121 + '"')
+        result, text = self.inventory_text()
+        self.assertTrue(result['truncated'])
+        self.assertIn('省略: 項目0件、ファイル0件（長い表示も省略）。', text)
+        signature = 'def ' + 'f' * (mr.INVENTORY_SIGNATURE_CHARS - 6) + '():'
+        self.assertEqual(len(signature), mr.INVENTORY_SIGNATURE_CHARS + 1)
+        (self.repo / 'priority.py').write_text(signature + '\n    pass\n')
+        result, text = self.inventory_text()
+        self.assertTrue(result['truncated'])
+        self.assertIn(': ' + signature[:-2] + '… — L1', text)
+        (self.repo / 'priority.py').write_text('FAR = "' + '長' * 200 + '"\ndef far0():\n    pass\n\ndef near(' +
+                                             'argument' * 8 + ': str):\n    pass\n')
+        self.call('ledger', self.run, 'update', 'F1', '--input', self.inventory_update(line=5))
+        result, text = self.inventory_text('--max-bytes', 560)
+        self.assertTrue(result['truncated'])
+        self.assertLess(text.index('near:'), text.index('far0:'))
+        (self.repo / 'priority.py').write_text('Z = A = 3\ndef z(): pass\ndef a(): pass\n')
+        self.call('ledger', self.run, 'update', 'F1', '--input', self.inventory_update(line=None))
+        (self.repo / 'a.py').write_text('Z = A = 3')
+        self.add(file='a.py', line=None)
+        result, text = self.inventory_text()
+        self.assertLess(text.index('## a.py'), text.index('## priority.py'))
+        for block in self.inventory_blocks(text):
+            if 'A = 3' in block:
+                self.assertLess(block.index('A ='), block.index('Z ='))
+        self.assertLess(text.index('z: def z()'), text.index('a: def a()'))
+        (self.repo / 'a.ts').write_text('')
+        self.add(file='a.ts')
+        surrogate = '\udcff' * 50
+        empty = {'variables': [], 'declarations': [], 'literals': []}
+        for kind, entries in (
+                ('variables', [{'name': surrogate, 'value': '3', 'line': 1, 'endLine': 1}]),
+                ('variables', [{'name': 'VALUE', 'value': surrogate, 'line': 1, 'endLine': 1}]),
+                ('declarations', [{'name': surrogate, 'signature': 'class C', 'line': 1, 'endLine': 1}]),
+                ('declarations', [{'name': 'C', 'signature': surrogate, 'line': 1, 'endLine': 1}]),
+                ('literals', [{'kind': 'string', 'value': surrogate, 'line': 1}] * 2)):
+            with self.subTest(kind=kind, entries=entries):
+                response = {**empty, kind: entries}
+                self.fake('node', 'print(' + repr(json.dumps(response)) + ')')
+                result, text = self.inventory_text()
+                self.assertTrue(result['truncated'])
+                self.assertIn('省略: 項目0件、ファイル0件（長い表示も省略）。', text)
+                self.assertIn('…', text)
+
+    def test_inventory_unparsed_shapes_and_run_state(self):
+        (self.repo / 'a.ts').write_text('const a = 3;')
+        self.add(file='a.ts')
+        empty = {'variables': [], 'declarations': [], 'literals': []}
+        responses = [({**empty, 'declarations': [{'name': '', 'signature': 'def f()', 'line': 1, 'endLine': 1}]}, 'invalid inventory declaration'),
+                     ({**empty, 'literals': [{'kind': 'string', 'value': 3, 'line': 1}]}, 'invalid inventory literal'),
+                     ({**empty, 'variables': [{'name': 'a', 'line': 1, 'endLine': 1}]}, 'invalid inventory declaration'),
+                     ([], 'invalid inventory response'),
+                     ({**empty, 'extra': []}, 'invalid inventory response'),
+                     ({'variables': [], 'literals': []}, 'invalid inventory response'),
+                     ({**empty, 'literals': [None]}, 'invalid inventory line'),
+                     ({**empty, 'literals': [{'kind': 'unknown', 'value': '3', 'line': 1}]}, 'invalid inventory literal'),
+                     ({**empty, 'literals': [{'kind': 'number', 'value': '3', 'line': 0}]}, 'invalid inventory line'),
+                     ({**empty, 'literals': [{'kind': 'number', 'value': 'not a number', 'line': 1}]}, 'invalid numeric literal'),
+                     ({**empty, 'literals': [{'kind': 'number', 'value': '.', 'line': 1}]}, 'invalid numeric literal: .'),
+                     ({**empty, 'literals': [{'kind': 'number', 'value': '42n', 'line': 1}]}, 'invalid bigint literal'),
+                     ({**empty, 'literals': [{'kind': 'number', 'value': '1n', 'line': 1}]}, 'invalid bigint literal'),
+                     ({**empty, 'literals': [{'kind': 'bigint', 'value': '1', 'line': 1}]}, 'invalid bigint literal'),
+                     ({**empty, 'declarations': [{'name': 'f', 'line': 1, 'endLine': 1}]}, 'invalid inventory declaration'),
+                     ({**empty, 'variables': [{'name': 'a', 'value': '3', 'line': 1, 'endLine': 0}]}, 'invalid inventory declaration')]
+        for response, reason in responses:
+            with self.subTest(response=response):
+                self.fake('node', 'print(' + repr(json.dumps(response)) + ')')
+                result, _ = self.inventory_text()
+                self.assertEqual(result['unparsed'], [{'file': 'a.ts', 'reason': reason +
+                    (': not a number' if reason == 'invalid numeric literal' else '')}])
+        (self.run / 'run.json').write_text('{}')
+        self.call('inventory', self.iter, code=1)
+        self.assertFalse((self.iter / 'inventory.md').exists())
+        self.assertFalse((self.iter / 'inventory.json').exists())
+
+    def test_inventory_typescript_literals_and_nearest_package(self):
+        packages = self.inventory_runtime('node')
+        package = self.repo / 'nested/app'
+        package.mkdir(parents=True)
+        (package / 'sample.ts').write_text('''const [left, right] = [2, 3];
+const {value: renamed} = {value: 2};
+let unset: number;
+function use(x: "type-only", y: "type-only") {
+  const regex = [/regexOnly/g, /regexOnly/g];
+  return [`head${30}`, `head${30}`, 42n, 0x2an, +(42), 0x2a,
+    -(42n), -(0x2an), "escaped\\x20value", 'escaped value',
+    0, 0, -1, -1, 1, 1, true, true, false, false, null, null, undefined, undefined, "", "", " ", " ", "\t", "\t"];
+}
+''')
+        self.add(file='nested/app/sample.ts')
+        for compiler_package in packages:
+            with self.subTest(package=str(compiler_package)):
+                link = self.repo / 'node_modules/typescript'
+                link.unlink()
+                link.symlink_to(compiler_package.resolve(), target_is_directory=True)
+                result, text = self.inventory_text()
+                self.assertEqual(result['unparsed'], [])
+                for value in ('left =', 'right =', 'renamed =', 'unset = ' + mr.NO_VALUE_MARK, '\n42n — 2回',
+                              '\n-42n — 2回', '\n42 — 2回', '"escaped value" — 2回', '30 — 2回'):
+                    self.assertIn(value, text)
+                self.assertNotIn('regexOnly', text.split('### 重複リテラル')[1])
+                self.assertNotIn('"head" —', text)
+                self.assertNotIn('"type-only" —', text)
+                for value in ('0', '-1', '1', 'true', 'false', 'null', 'undefined', '""', '" "', '"\\t"'):
+                    self.assertNotIn('\n' + value + ' —', text)
+        # 近いパッケージが壊れていても、親のパッケージで暗黙に代替しない。
+        modules = package / 'node_modules/typescript'
+        modules.mkdir(parents=True)
+        (modules / 'package.json').write_text('{"main":"missing.js"}')
+        result, _ = self.inventory_text()
+        self.assertEqual(result['parsedFiles'], 0)
+        self.assertEqual(result['unparsed'][0]['file'], 'nested/app/sample.ts')
+        self.assertIn('Cannot find module', result['unparsed'][0]['reason'])
+
+    def test_inventory_go_type_literals_and_nested_types(self):
+        self.inventory_runtime('go')
+        (self.repo / 'types.go').write_text('''package demo
+var first [30]int
+var second [30]int
+func work(a [30]int) { type Local struct { Name string }; _ = Local{} }
+var left = 0x1.8p+2
+var right = 6.0
+var octal = 052
+var decimal = 42
+var binary = []string{"\\xff", "\\xff", "\\xfe", "\\xfd"}
+var values = []any{'界', '界', 23i, 23i, +(42), 0, 0, -1, -1, 1, 1, true, true, false, false, nil, nil, "", "", " ", " ", "\t", "\t"}
+''')
+        self.add(file='types.go')
+        result, text = self.inventory_text()
+        self.assertEqual(result['unparsed'], [])
+        self.assertNotIn('\n23i —', text)
+        self.assertNotIn("\n'界' —", text)
+        self.assertNotIn('30 —', text)
+        self.assertIn('work.Local', text)
+        self.assertIn('0x1.8p+2 — 2回', text)
+        self.assertIn('\n052 — 3回', text)
+        self.assertNotIn(' — 4回', text)
+        self.assertIn('\n"\\xff" — 2回', text)
+        self.assertIn('first = ' + mr.NO_VALUE_MARK + ' — L2', text)
+        for value in ('0', '-1', '1', 'true', 'false', 'nil', '""', '" "', '"\\t"'):
+            self.assertNotIn('\n' + value + ' —', text)
+
+    def test_inventory_source_is_not_executed_and_source_notation_is_preserved(self):
+        name = 'quote[1]#`.py'
+        source = 'raise RuntimeError("must not execute")\n'
+        source += 'MESSAGE = "<script>*unsafe*</script>"\n'
+        source += 'OTHER = "<script>*unsafe*</script>"\n'
+        (self.repo / name).write_text(source)
+        self.add(file=name)
+        result, text = self.inventory_text()
+        self.assertEqual(result['parsedFiles'], 1)
+        self.assertIn('<script>*unsafe*</script>', text)
+        self.assertIn(name, text)
+        self.assertNotIn(r'quote\[1\]\#\`', text)
+        non_utf8 = os.fsdecode(b'non-utf8-\xff.py')
+        (self.repo / non_utf8).write_text('VALUE = 3')
+        self.add(file=non_utf8)
+        result, text = self.inventory_text()
+        self.assertEqual(result['parsedFiles'], 2)
+        self.assertIn('## ' + json.dumps(non_utf8) + ' — Python', text)
+        filenames = ('a  b.PY', 'tab\tname.py', 'line\nname.py', '日本 語.py',
+                     'ctrl\x01name.py', 'del\x7fname.py')
+        for filename in filenames:
+            (self.repo / filename).write_text('VALUE = 3')
+            self.add(file=filename)
+        result, text = self.inventory_text()
+        self.assertEqual(result['parsedFiles'], 2 + len(filenames))
+        for filename in filenames:
+            self.assertIn('## ' + json.dumps(filename, ensure_ascii=False) + ' — Python', text)
+        long_name = 'n' * mr.INVENTORY_SIGNATURE_CHARS + '.py'
+        (self.repo / long_name).write_text('')
+        self.add(file=long_name)
+        result, text = self.inventory_text()
+        self.assertIn('## ' + long_name[:mr.INVENTORY_SIGNATURE_CHARS - 1] + '… — Python', text)
+        self.assertIn('長い表示も省略', text)
+        self.inventory_runtime('node')
+        self.inventory_runtime('go')
+        marker = self.root / 'executed'
+        (self.repo / 'source.TS').write_text('require("node:fs").writeFileSync(' + json.dumps(str(marker)) + ', "bad");')
+        (self.repo / 'source.go').write_text('package main\nimport "os"\nfunc init() { os.WriteFile(' +
+                                            json.dumps(str(marker)) + ', []byte("bad"), 0600) }\nfunc main() {}')
+        self.add(file='source.TS')
+        self.add(file='source.go')
+        result, _ = self.inventory_text()
+        self.assertEqual(result['parsedFiles'], 5 + len(filenames))
+        self.assertEqual(result['unparsed'], [])
+        self.assertFalse(marker.exists())
+
+    def test_inventory_many_files_keep_high_frequency_literals(self):
+        for index in range(12):
+            name = 'file' + str(index).zfill(2) + '.py'
+            (self.repo / name).write_text('')
+            self.add(file=name)
+        (self.repo / 'file00.py').write_text('VALUE = 3')
+        (self.repo / 'file01.py').write_text('def work(): pass')
+        (self.repo / 'file11.py').write_text('VALUE = ["frequent", "frequent", "frequent"]')
+        result, text = self.inventory_text('--max-bytes', 700)
+        self.assertTrue(result['truncated'])
+        self.assertIn('file11.py', text)
+        self.assertIn('"frequent" — 3回', text)
+        self.assertLessEqual(len(text.encode()), 700)
+        shown = len(re.findall(r'^## ', text, re.M))
+        self.assertEqual(shown, 3)
+        self.assertIn('ファイル9件。', text)
+
+    def inventory_blocks(self, text):
+        blocks, fence, content = [], None, []
+        for line in text.splitlines():
+            if fence is None:
+                if re.fullmatch(r'`{3,}', line):
+                    fence = line
+                    content = []
+            elif re.fullmatch(r' {0,3}`{' + str(len(fence)) + r',}[ \t]*', line):
+                blocks.append('\n'.join(content))
+                fence = None
+            else:
+                content.append(line)
+        self.assertIsNone(fence, 'inventory code block was not closed')
+        return blocks
+
+    def test_inventory_source_symbols_and_backticks_are_not_escaped(self):
+        source = '''EXPECTED_ERRORS = ["a  b", "```", "````````", "# heading"]
+TEXT = """line one
+````````
+### source heading
+line two"""
+def read_lines(x: list[str]) -> str | None:
+    return "```", "````````", "# heading"
+'''
+        (self.repo / 'symbols.py').write_text(source)
+        self.add(file='symbols.py')
+        result, text = self.inventory_text()
+        self.assertFalse(result['truncated'])
+        blocks = self.inventory_blocks(text)
+        for expected in ('EXPECTED_ERRORS = ["a  b", "```", "````````", "# heading"]',
+                         'read_lines: def read_lines(x: list[str]) -> str | None:',
+                         '### source heading', '"```" — 2回'):
+            self.assertTrue(any(expected in block for block in blocks), expected)
+        for escaped in (r'EXPECTED\_ERRORS', r'list\[str\]', r'\|', r'\>', r'\`'):
+            self.assertNotIn(escaped, text)
+        size = len(text.encode())
+        self.assertEqual(self.inventory_text('--max-bytes', size)[1], text)
+        result, shorter = self.inventory_text('--max-bytes', size - 1)
+        self.assertTrue(result['truncated'])
+        self.assertLessEqual(len(shorter.encode()), size - 1)
+        self.inventory_blocks(shorter)
+
+    def test_inventory_typescript_signature_keeps_source_symbols(self):
+        packages = self.inventory_runtime('node')
+        (self.repo / 'symbols.ts').write_text('''export const EXPECTED_ERRORS = ["value"];
+export type DiffLine = { text: string };
+export const read_lines = (rows: DiffLine[]): string | undefined => undefined;
+''')
+        self.add(file='symbols.ts')
+        for compiler_package in packages:
+            with self.subTest(package=str(compiler_package)):
+                link = self.repo / 'node_modules/typescript'
+                link.unlink()
+                link.symlink_to(compiler_package.resolve(), target_is_directory=True)
+                result, text = self.inventory_text()
+                self.assertEqual(result['unparsed'], [])
+                blocks = self.inventory_blocks(text)
+                signature = 'read_lines: (rows: DiffLine[]): string | undefined =>'
+                self.assertTrue(any(signature in block for block in blocks), text)
+                self.assertIn('EXPECTED_ERRORS', text)
+                for escaped in (r'EXPECTED\_ERRORS', r'DiffLine\[\]', r'\|', r'\>'):
+                    self.assertNotIn(escaped, text)
+
+    def test_inventory_empty_and_omitted_categories_are_distinct(self):
+        (self.repo / 'categories.py').write_text('def read_lines():\n    pass\n')
+        self.add(file='categories.py')
+        result, complete = self.inventory_text()
+        self.assertFalse(result['truncated'])
+        self.assertIn('### モジュール変数\nなし\n', complete)
+        self.assertIn('### 重複リテラル\nなし\n', complete)
+        self.assertNotIn('なし／省略', complete)
+        (self.repo / 'categories.py').write_text(
+            'LONG_VALUE = "' + '長' * 200 + '"\n' +
+            'def read_lines():\n    return "duplicate", "duplicate"\n')
+        result, limited = self.inventory_text('--max-bytes', 700)
+        self.assertTrue(result['truncated'])
+        self.assertIn('### モジュール変数\n上限により1件省略。\n', limited)
+        self.assertIn('read_lines:', limited)
+        self.assertIn('"duplicate" — 2回', limited)
+        self.assertNotIn('なし／省略', limited)
+        self.assertLessEqual(len(limited.encode()), 700)
+        self.inventory_blocks(limited)
+
+    def test_inventory_partial_category_reports_omitted_count(self):
+        (self.repo / 'functions.py').write_text('def near():\n    pass\n' + '\n' * 10 +
+            '\n'.join('def far' + str(index) + '(' + ', '.join('argument' + str(i) for i in range(20)) +
+                      '):\n    pass' for index in range(3)))
+        self.add(file='functions.py', line=1)
+        result, text = self.inventory_text('--max-bytes', 500)
+        self.assertTrue(result['truncated'])
+        self.assertIn('near:', text)
+        self.assertIn('上限により3件省略。', text)
+        self.assertIn('### モジュール変数\nなし\n', text)
+        self.assertIn('### 重複リテラル\nなし\n', text)
+        self.assertLessEqual(len(text.encode()), 500)
+        self.inventory_blocks(text)

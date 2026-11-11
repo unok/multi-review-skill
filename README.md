@@ -7,10 +7,15 @@ Claude Code と Codex の両方から使うスキル。claude（総合＝Opus 5.
 ## 必要なもの
 
 - Python 3.9 以上（標準ライブラリのみ）と POSIX 環境の git・diff
+- node・対象プロジェクトの typescript パッケージ・go は任意。なければ既存の一覧の該当言語を飛ばし、解析不能の理由を記録する
 - Claude Code または Codex（実行主体）
 - レビュアー CLI（認証済みであること）: [codex](https://github.com/openai/codex) と claude
 
 一部の CLI がなくても動く。未インストールのレビュアーは欠席として最終レポートに記録される。
+
+TypeScript の解析は `createSourceFile` を持つコンパイラ API 版（TypeScript 5.x・6.x）と、7.x のネイティブ API 版に対応する。対象ソースは実行しないが、対象プロジェクトの typescript パッケージは実行するため、利用者が入れた依存を信頼する前提で使う。
+
+テスト実行には node・typescript・go が必要。TypeScript 5.x・6.x は `MR_TEST_TYPESCRIPT`（未設定なら直下の `node_modules/typescript`）、7.x は `MR_TEST_TYPESCRIPT7` に既存のパッケージディレクトリを指定し、`MR_TEST_TYPESCRIPT=/path/to/typescript5 MR_TEST_TYPESCRIPT7=/path/to/typescript7 python3 -m unittest` で実行する。どちらかが見つからなければ、設定方法を表示してテストを失敗させる。
 
 ## インストール
 
@@ -36,8 +41,10 @@ Claude Code では `/multi-review` または「複眼レビューして」、Cod
 - `SKILL.md` — 制御フロー（分岐・状態管理・終了条件）
 - `references/execution.md` — CLI の引数・成果物・終了コードと、呼び出し元の照合・判断
 - `references/roles.md` — 役割カタログ（総合 / セキュリティ / バグハント / アーキテクチャなど13役割）
-- `scripts/mr.py` — 差分・プロンプト・並列実行・台帳・rules・ゲートの機械的処理
-- `tests/` — `python3 -m unittest` で実行するテスト（外部レビュアーとゲートは偽 CLI）
+- `scripts/mr.py` — 差分・プロンプト・並列実行・台帳・既存の一覧の生成・rules・ゲートの機械的処理
+- `scripts/inventory_ts.cjs` — TypeScript コンパイラ API による既存の一覧の解析
+- `scripts/inventory_go.go` — Go の構文解析による既存の一覧の解析
+- `tests/` — `python3 -m unittest` で実行するテスト（外部レビュアーとゲートは偽 CLI、inventory は実物の node・typescript・go を使用）
 - `CONTEXT.md` — 用語集
 
 ## ライセンス
