@@ -40,6 +40,8 @@ git ではリポジトリルート、非 git では `--cwd` を共通 cwd にす
 `prompts` は未コミット変更モードで HEAD との差分・untracked 本文・ファイル一覧を含め、HEAD 不在では全対象本文を使う。ベース差分モードは merge-base と作業ツリーを比較し、累積の未コミット変更・untracked 本文を含める。パス指定は対象パスを示し、HEAD がある git の再レビューでは指定パス内の累積未コミット差分と untracked 本文に、過去の修正 diff に含まれる範囲外の変更行・ファイル一覧を加える。HEAD 不在の再レビューは指定範囲と staged・unstaged・untracked の全対象本文を合わせる。リンクは参照先のパスだけを示し、本文を読まない。非 UTF-8 のパスは、git 差分では Git の引用表記、それ以外の文書では JSON 文字列のエスケープ表記を使い、ファイル操作と台帳では元の値を保つ。全レビュアーに同じ範囲を渡し、git 差分の未変更行は指摘対象に含めない。
 役割本文は `references/roles.md`、共通報告形式は SKILL.md の正本を毎回読む。再レビュー時の却下・保留一覧と直前イテレーションの修正概要は台帳から生成し、前提が変わった項目は呼び出し元が `--reconsider` で除外する。
 
+ja-review の範囲計算は既存成果物の失効より前に行う。失敗時に既存成果物を残す保証は範囲計算の失敗に限り、その後のジョブ生成や CLI の存在確認の失敗には及ばない。不正な diff は、再レビュー用に作り直した修正差分なら `reconstructed re-review diff`、git の差分なら `git diff` を前に付けた診断を出して終了1にする。ja-review が無効または excluded のときは範囲計算を行わない。
+
 ## レビュアー実行と収集（Step 4）
 
 `mr review I` は Claude Code の Bash では `run_in_background: true` で起動し、完了通知後に終了コードを確認する。Codex では `exec_command` の短い `yield_time_ms` で起動し、返された `session_id` を `write_stdin` に渡して終了まで待つ。完了後に `mr collect I` を実行する。
@@ -180,7 +182,7 @@ multi-review は呼び出し元が実施するので実行しない。
 
 `mr init` は、利用者共通の `${XDG_CONFIG_HOME:-$HOME/.config}/multi-review/decisions.json` → 対象ルートの `.multi-review/decisions.json` の順に常設入力を取り込む。git はリポジトリルート、非 git は解決済みの `--cwd` を対象ルートとする。XDG_CONFIG_HOME が未設定・空文字・相対パスなら無視し、`$HOME/.config` を使う。HOME が空文字、または絶対パスで決められない場合は利用者共通の常設ファイルを不存在として扱い、プロジェクトの常設ファイルは通常どおり読む。どちらのファイルも任意で、有効なリンクは読み、壊れたリンクはエラーにする。形式は add と同じ単体オブジェクトまたは配列だが、許すフィールドは `type`・`body`・`reason` だけで、`findingIds` は空配列でも受け付けない。`--no-standing-decisions` なら探索・読み取りを行わない。プロジェクトの常設ファイルは作業ツリー専用で、コミットして共有する使い方は想定しない。Step 8 で `.multi-review/` を `.git/info/exclude` に入れると、このファイルも無視対象になる。共有が必要な決定は利用者共通のファイルに置く。未追跡の常設ファイルをレビュー対象にしたくなければ `.git/info/exclude` か `.gitignore` に入れる。追跡済みなら `--path` で対象を絞る。
 
-取り込みは add と同じ検証・採番・重複防止・上限を使い、全件を検証してから保存する。不正入力はファイルパスと要素位置（配列は0始まりの `[n]`、単体は `[0]`）を診断して終了1。JSON の解析失敗はファイルと解析エラーを示す。init の保存失敗時も生成途中の状態ファイルを巻き戻し、R とロックは残す。取り込み0件なら decisions.json と decisions.md は作らない。常設ファイルは読み取り専用で、init 後に変更しても既存 R に再取り込みしない。
+取り込みは add と同じ検証・採番・重複防止・上限を使い、全件を検証してから保存する。不正入力はファイルパスと要素位置（配列は0始まりの `[n]`、単体は `[0]`）を診断して終了1。JSON の解析失敗はファイルと解析エラーを示す。init の保存失敗時も生成途中の状態ファイルを巻き戻し、R とロックは残す。取り込み0件なら decisions.json と decisions.md は作らない。R 内の decisions.json がリンクなら add・remove・render・prompts は拒否し、統計は記録せず statsError に理由を残す。init は decisions.json または decisions.md が残っていれば初期化済みとして拒否する。常設ファイルは読み取り専用で、init 後に変更しても既存 R に再取り込みしない。
 
 常設由来は `sources: ["user"]` または `["project"]` を持ち、両方に同じ決定があれば1件にまとめて `["user", "project"]` を保持する。出所は receipt に含めず、実行中の同じ入力の add も既存 ID を返す。出所なしは実行中の決定（旧データを含む）とし、add の入力で出所を指定できない。remove は R の決定と receipt だけを削除し、常設ファイルは変えない。削除後の手動再追加は新しい ID・出所なしとなり、別の R の init では常設入力を再び取り込む。
 

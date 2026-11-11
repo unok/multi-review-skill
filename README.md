@@ -36,6 +36,8 @@ Claude Code では `/multi-review` または「複眼レビューして」、Cod
 
 1イテレーションは、レビュアー並列起動 → 選別（修正方針サマリを表示）→ 修正サブエージェントへの委譲 → diff 照合と品質チェック → 再レビューの順に進む。上限は5イテレーションで、到達時は残存指摘を報告して停止する。
 
+`mr gate` は `${XDG_DATA_HOME:-$HOME/.local/share}/multi-review/runs.jsonl` に統計を追記する。`MR_NO_STATS=1` で記録を止められる。利用者共通の常設の決定事項は `${XDG_CONFIG_HOME:-$HOME/.config}/multi-review/decisions.json` に置く。保存先の解決と形式は [実行仕様](references/execution.md) を参照する。
+
 ## 構成
 
 - `SKILL.md` — 制御フロー（分岐・状態管理・終了条件）
