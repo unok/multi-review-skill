@@ -142,6 +142,420 @@ with patch.object(subprocess.Popen, 'communicate', communicate):
         self.write_json(source, self.finding(**overrides))
         return self.call('ledger', self.run, 'add', '--input', source)
 
+    def decision(self, **overrides):
+        return dict({'type': 'policy', 'body': '表示文言は各解析器が出す',
+                     'reason': '表示契約を維持する'}, **overrides)
+
+    def add_decisions(self, value):
+        source = self.root / 'decisions-input.json'
+        self.write_json(source, value)
+        return self.call('decisions', self.run, 'add', '--input', source)
+
+    def test_decisions_add_remove_and_receipts_across_iterations(self):
+        self.add()
+        self.add(problem='別の指摘')
+        ledger = (self.run / 'findings.json').read_bytes()
+        item = self.decision(findingIds=['F2', 'F1', 'F1'])
+        self.assertEqual(self.add_decisions([item, item]), {'ids': ['D1', 'D1']})
+        saved = self.read_json(self.run / 'decisions.json')
+        self.assertEqual(saved, {'reviewId': self.run.name, 'decisions': [dict(
+            item, id='D1', iteration=1, findingIds=['F1', 'F2'])]})
+        self.assertEqual((self.run / 'findings.json').read_bytes(), ledger)
+        self.call('prompts', self.run / 'iter-2')
+        item['findingIds'] = ['F1', 'F2']
+        self.assertEqual(self.add_decisions(item)['ids'], ['D1'])
+        self.assertEqual(self.read_json(self.run / 'decisions.json')['decisions'][0]['iteration'], 1)
+        source = self.root / 'reordered.json'
+        source.write_text(json.dumps(dict(reversed(list(item.items())))))
+        self.assertEqual(self.call('decisions', self.run, 'add', '--input', source)['ids'], ['D1'])
+        self.assertEqual(self.call('decisions', self.run, 'remove', 'D1', 'D1')['ids'], ['D1'])
+        self.assertIn('決定事項なし', (self.run / 'decisions.md').read_text())
+        self.assertEqual(self.add_decisions(item)['ids'], ['D2'])
+        self.assertEqual(self.read_json(self.run / 'decisions.json')['decisions'][0]['iteration'], 2)
+        self.assertEqual(self.add_decisions(self.decision())['ids'], ['D3'])
+        self.assertEqual(self.call('decisions', self.run, 'remove', 'D3', 'D2')['ids'], ['D2', 'D3'])
+
+    def test_decisions_empty_legacy_state_and_render(self):
+        self.assertEqual(self.call('decisions', self.run, 'render'), {'ids': []})
+        self.assertIn('決定事項なし', (self.run / 'decisions.md').read_text())
+        self.assertEqual(self.add_decisions([])['ids'], [])
+        item = self.decision()
+        self.assertEqual(self.add_decisions(item)['ids'], ['D1'])
+        self.assertEqual(self.add_decisions(dict(item, findingIds=[]))['ids'], ['D1'])
+        self.fake('jev-guard', "raise SystemExit('decision render must not use jev-guard')")
+        (self.run / 'decisions.md').unlink()
+        self.call('decisions', self.run, 'render')
+        self.assertIn(item['body'], (self.run / 'decisions.md').read_text())
+
+    def test_decisions_invalid_inputs_are_all_or_nothing(self):
+        self.add_decisions(self.decision())
+        paths = [self.run / name for name in ('run.json', 'findings.json', 'decisions.json', 'decisions.md')]
+        saved = [p.read_bytes() for p in paths]
+        valid = self.decision()
+        bad = [(v, 'invalid decision input fields') for v in
+               (None, True, 1, 'text', [], {}, dict(valid, id='D9'),
+                dict(valid, iteration=2), dict(valid, extra=0))]
+        bad.extend((dict(valid, type=v), 'invalid decision strings') for v in ('other', []))
+        bad.extend((dict(valid, findingIds=v), 'invalid decision findingIds')
+                   for v in (None, 'F1', [{}], ['F99']))
+        for key in ('type', 'body', 'reason'):
+            bad.append(({k: v for k, v in valid.items() if k != key}, 'invalid decision input fields'))
+            bad.extend((dict(valid, **{key: v}), 'invalid decision strings') for v in ('', ' \n', 1))
+        source = self.root / 'bad-decisions.json'
+        for value, reason in bad:
+            with self.subTest(value=value):
+                self.write_json(source, [dict(valid, body='未登録の決定'), value])
+                self.call('decisions', self.run, 'add', '--input', source, code=1)
+                self.assertIn(reason, self.last_stderr)
+                self.assertEqual([p.read_bytes() for p in paths], saved)
+        for text, reason in [('', 'Expecting value'), ('{', 'Expecting property name'),
+                             ('{"type":"policy","type":"triage"}', 'duplicate JSON key'),
+                             ('NaN', 'invalid JSON number')]:
+            with self.subTest(text=text):
+                source.write_text(text)
+                self.call('decisions', self.run, 'add', '--input', source, code=1)
+                self.assertIn(reason, self.last_stderr)
+                self.assertEqual([p.read_bytes() for p in paths], saved)
+        for argv, reason in [(('add',), '--input required for add'),
+                             (('add', '--input', self.root / 'missing'), 'No such file'),
+                             (('add', 'D1'), 'IDs are only for remove'),
+                             (('remove',), 'decision IDs required'),
+                             (('remove', 'D1', 'D99'), 'unknown decision ID'),
+                             (('remove', 'D99'), 'unknown decision ID'),
+                             (('remove', 'D1', '--input', source), '--input is only for add'),
+                             (('render', 'D1'), 'IDs are only for remove'),
+                             (('render', '--input', source), '--input is only for add')]:
+            with self.subTest(argv=argv):
+                self.call('decisions', self.run, *argv, code=1)
+                self.assertIn(reason, self.last_stderr)
+                self.assertEqual([p.read_bytes() for p in paths], saved)
+
+    def test_decisions_sequence_does_not_reuse_removed_ids(self):
+        for n in range(10):
+            self.add(problem=f'指摘{n}')
+        items = [dict(self.decision(), body=f'方針{n}', findingIds=['F10', 'F2', 'F2']) for n in range(10)]
+        self.assertEqual(self.add_decisions(items)['ids'], [f'D{n}' for n in range(1, 11)])
+        self.assertEqual(self.add_decisions(list(reversed(items)))['ids'], [f'D{n}' for n in range(10, 0, -1)])
+        text = (self.run / 'decisions.md').read_text()
+        self.assertEqual(self.read_json(self.run / 'decisions.json')['decisions'][0]['findingIds'], ['F2', 'F10'])
+        self.assertIn('関連: F2, F10', text)
+        self.assertLess(text.index('D9（'), text.index('D10（'))
+        self.call('decisions', self.run, 'remove', 'D10')
+        self.assertEqual(self.add_decisions(items[-1])['ids'], ['D11'])
+        for finding_id in ['F1²', 'F1a', 'BUG-1']:
+            self.add(id=finding_id, problem=finding_id)
+        item = self.decision(findingIds=['F10', 'F1²', 'BUG-1', 'F2', 'F1a'])
+        self.assertEqual(self.add_decisions(item)['ids'], ['D12'])
+        self.assertEqual(self.read_json(self.run / 'decisions.json')['decisions'][-1]['findingIds'],
+                         ['BUG-1', 'F1a', 'F1²', 'F2', 'F10'])
+        self.assertIn('関連: BUG-1, F1a, F1², F2, F10', (self.run / 'decisions.md').read_text())
+        self.assertEqual(self.add_decisions(dict(item, findingIds=list(reversed(item['findingIds']))))['ids'], ['D12'])
+
+    def test_decisions_prompts_use_shared_section_before_target(self):
+        self.changed_repository()
+        self.add_decisions([self.decision(), dict(self.decision(), type='triage', body='具体例のない改名')])
+        original = (self.run / 'run.json').read_bytes()
+        for profile in mr.JOB_MODELS:
+            if profile == 'ja-review':
+                continue
+            run = self.read_json(self.run / 'run.json')
+            run['profile'] = profile
+            # 専門役割6個の上限を超えない構成で、全役割を確かめる。
+            for roles in [list(mr.DEFAULT_SPECIALISTS), *[[role] for role in mr.role_texts() if role != 'general']]:
+                run['roles'] = roles
+                self.write_json(self.run / 'run.json', run)
+                jobs = self.call('prompts', self.iter)['reviewers']
+                for job in jobs:
+                    text = Path(job['prompt']).read_text()
+                    self.assertIn('D1（', text)
+                    self.assertNotIn('D2（', text)
+                    self.assertNotIn('### 再報告しない基準', text)
+                    self.assertLess(text.index(mr.report_format()), text.index('## 決定事項'))
+                    self.assertLess(text.index('## 決定事項'), text.index('レビュー対象（'))
+                    self.assertIn('入力・手順・結果', text)
+                    self.assertIn('「問題:」', text)
+                    self.assertNotIn('<!-- mr decisions render', text)
+        (self.run / 'run.json').write_bytes(original)
+        self.add()
+        self.add_decisions(self.decision(type='triage', body='再評価対象の基準', findingIds=['F1']))
+        self.add_decisions(self.decision(body='再評価対象に関連する方針', findingIds=['F1']))
+        self.call('ledger', self.run, 'reject', 'F1', '--reason', '検討済み')
+        second = self.run / 'iter-2'
+        jobs = self.call('prompts', second)['reviewers']
+        for job in jobs:
+            text = Path(job['prompt']).read_text()
+            self.assertIn('再評価対象の基準', text)
+            self.assertIn('具体例のない改名', text)
+            self.assertIn('検討済みのため再報告不要', text)
+        self.call('prompts', second, '--reconsider', 'F1')
+        for job in self.read_json(second / 'prompts.json')['reviewers']:
+            text = Path(job['prompt']).read_text()
+            self.assertNotIn('理由: 検討済み', text)
+            self.assertNotIn('再評価対象の基準', text)
+            self.assertIn('具体例のない改名', text)
+            self.assertIn('D1（', text)
+            self.assertIn('再評価対象に関連する方針', text)
+        text = (self.run / 'decisions.md').read_text()
+        self.assertTrue(text.startswith('<!-- mr decisions render で生成。編集は mr decisions add / remove で行う -->'))
+        self.assertNotIn('指摘は出さない', text)
+        self.assertLess(text.index('### 方針'), text.index('### 再報告しない基準'))
+
+    def test_decisions_triage_only_is_omitted_from_first_prompts(self):
+        self.add_decisions(dict(self.decision(), type='triage'))
+        jobs = self.call('prompts', self.iter)['reviewers']
+        self.assertTrue(all('## 決定事項' not in Path(j['prompt']).read_text() for j in jobs))
+        text = (self.run / 'decisions.md').read_text()
+        self.assertIn('### 再報告しない基準', text)
+        self.assertNotIn('### 方針', text)
+        jobs = self.call('prompts', self.run / 'iter-2')['reviewers']
+        self.assertTrue(all('D1（' in Path(j['prompt']).read_text() for j in jobs))
+
+    def test_decisions_changes_preserve_existing_artifacts(self):
+        self.call('prompts', self.iter)
+        self.call('review', self.iter)
+        self.call('collect', self.iter)
+        for name in ('task.json', 'fix-task.md', 'rules.json', 'gate.json', 'fixdiff.json', 'inventory.md'):
+            (self.iter / name).write_text('existing artifact')
+        saved = {p: p.read_bytes() for p in self.iter.rglob('*') if p.is_file()}
+        for action in ('add', 'repeat', 'render', 'remove'):
+            if action in ('add', 'repeat'):
+                self.add_decisions(self.decision())
+            elif action == 'render':
+                self.call('decisions', self.run, 'render')
+            else:
+                self.call('decisions', self.run, 'remove', 'D1')
+            self.assertEqual({p: p.read_bytes() for p in self.iter.rglob('*') if p.is_file()}, saved)
+
+    def test_decisions_byte_limit_and_manual_overflow(self):
+        self.add_decisions(self.decision())
+        jobs = self.call('prompts', self.iter)['reviewers']
+        text = Path(jobs[0]['prompt']).read_text()
+        size = len(text[text.index('## 決定事項'):text.index('レビュー対象（')].rstrip('\n').encode()) + 1
+        self.call('decisions', self.run, 'remove', 'D1')
+        item = dict(self.decision(), body=self.decision()['body'] + 'x' * (mr.DECISIONS_MAX_BYTES - size))
+        self.assertEqual(self.add_decisions(item)['ids'], ['D2'])
+        jobs = self.call('prompts', self.iter)['reviewers']
+        text = Path(jobs[0]['prompt']).read_text()
+        self.assertEqual(len(text[text.index('## 決定事項'):text.index('レビュー対象（')].rstrip('\n').encode()) + 1, mr.DECISIONS_MAX_BYTES)
+        self.assertEqual(self.add_decisions(item)['ids'], ['D2'])
+        self.call('decisions', self.run, 'remove', 'D2')
+        paths = [self.run / n for n in ('run.json', 'decisions.json', 'decisions.md')]
+        saved = [p.read_bytes() for p in paths]
+        source = self.root / 'overflow.json'
+        self.write_json(source, dict(item, body=item['body'] + 'x'))
+        self.call('decisions', self.run, 'add', '--input', source, code=1)
+        self.assertIn('merge or reduce decisions in decisions.json', self.last_stderr)
+        self.assertIn(str(mr.DECISIONS_MAX_BYTES), self.last_stderr)
+        self.assertEqual([p.read_bytes() for p in paths], saved)
+        self.write_json(source, dict(item, body=item['body'][:-1]))
+        self.call('decisions', self.run, 'add', '--input', source)
+        jobs = self.call('prompts', self.iter)['reviewers']
+        text = Path(jobs[0]['prompt']).read_text()
+        self.assertEqual(len(text[text.index('## 決定事項'):text.index('レビュー対象（')].rstrip('\n').encode()) + 1, mr.DECISIONS_MAX_BYTES - 1)
+        value = self.read_json(self.run / 'decisions.json')
+        value['decisions'][0]['reason'] += '日本語'
+        self.write_json(self.run / 'decisions.json', value)
+        original = (self.run / 'decisions.md').read_bytes()
+        for argv in [('decisions', self.run, 'render'), ('prompts', self.iter)]:
+            with self.subTest(argv=argv):
+                self.call(*argv, code=1)
+                self.assertIn('decisions section is', self.last_stderr)
+                self.assertIn(str(mr.DECISIONS_MAX_BYTES), self.last_stderr)
+                self.assertEqual((self.run / 'decisions.md').read_bytes(), original)
+
+    def test_decisions_save_failures_and_lock(self):
+        source = self.root / 'decision.json'
+        self.write_json(source, self.decision())
+        for target in ('decisions.json', 'run.json'):
+            self.fail_replacement(self.run / target, 'decisions', self.run, 'add', '--input', source)
+            self.assertFalse((self.run / 'decisions.json').exists())
+            self.assertNotIn('decisionSequence', self.read_json(self.run / 'run.json'))
+        self.add_decisions(self.decision())
+        original = [(self.run / n).read_bytes() for n in ('decisions.json', 'run.json', 'decisions.md', 'findings.json')]
+        for name in ('decisions.json', 'run.json'):
+            self.fail_replacement(self.run / name, 'decisions', self.run, 'remove', 'D1')
+            self.assertEqual([(self.run / n).read_bytes() for n in ('decisions.json', 'run.json', 'decisions.md', 'findings.json')], original)
+        with (self.run / '.mr.lock').open('a') as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX)
+            for argv in [('render',), ('add', '--input', source), ('remove', 'D1')]:
+                with self.subTest(argv=argv):
+                    self.call('decisions', self.run, *argv, code=1)
+                    self.assertIn('another command', self.last_stderr)
+                    self.assertEqual([(self.run / n).read_bytes() for n in ('decisions.json', 'run.json', 'decisions.md', 'findings.json')], original)
+        self.write_json(source, dict(self.decision(), body='次の決定'))
+        self.fail_replacement(self.run / 'decisions.md', 'decisions', self.run, 'add', '--input', source)
+        self.assertFalse((self.run / 'decisions.md').exists())
+        self.call('decisions', self.run, 'render')
+        self.assertIn('次の決定', (self.run / 'decisions.md').read_text())
+        self.assertEqual(self.call('decisions', self.run, 'add', '--input', source)['ids'], ['D2'])
+        self.assertIn('次の決定', (self.run / 'decisions.md').read_text())
+
+    def test_decisions_ja_batches_share_header_and_budget(self):
+        self.repository()
+        (self.repo / 'ja.txt').write_text(('日本語' * 50 + '\n') * 1000)
+        self.ja_initialize()
+        self.add_decisions([self.decision(), dict(self.decision(), type='triage', body='再報告しない文言')])
+        for directory, triage in [(self.iter, False), (self.run / 'iter-2', True)]:
+            jobs = [j for j in self.call('prompts', directory)['reviewers'] if j['cli'] == 'agy']
+            self.assertGreater(len(jobs), 1)
+            for job in jobs:
+                path = Path(job['prompt'])
+                text = path.read_text()
+                self.assertEqual('D2（' in text, triage)
+                self.assertLess(text.index('校閲して\n'), text.index('## 決定事項'))
+                self.assertLess(text.index('D1（'), text.index('=== FILE:'))
+                self.assertIn('「理由:」', text)
+                self.assertNotIn('「問題:」', text)
+                self.assertLessEqual(path.stat().st_size, mr.JA_BATCH_LIMIT)
+            self.assertIn('1000: ', ''.join(Path(j['prompt']).read_text() for j in jobs))
+
+        reason = 'D1 の前提が崩れる。入力: 日本語。手順: 表示する。結果: 欠落する。'
+        self.fake('agy', "print(" + repr('### low ja.txt:1\n- 分類: 表記\n- 原文: 日本語\n- 修正案: 直す\n- 理由: ' + reason) + ")")
+        self.call('review', self.run / 'iter-2')
+        findings = self.call('collect', self.run / 'iter-2')['findings']
+        self.assertTrue(any(reason in item['problem'] for item in findings))
+
+    def test_decisions_ja_exact_line_budget_and_header_overflow(self):
+        self.repository()
+        (self.repo / 'ja.txt').write_text('語\n')
+        self.ja_initialize()
+        self.add_decisions(self.decision())
+        jobs = self.call('prompts', self.iter)['reviewers']
+        path = Path(next(j['prompt'] for j in jobs if j['cli'] == 'agy'))
+        overhead = path.stat().st_size
+        (self.repo / 'ja.txt').write_text('語' + 'x' * (mr.JA_BATCH_LIMIT - overhead) + '\n')
+        self.call('prompts', self.iter)
+        self.assertEqual(path.stat().st_size, mr.JA_BATCH_LIMIT)
+        (self.repo / 'ja.txt').write_text('語' + 'x' * (mr.JA_BATCH_LIMIT - overhead + 1) + '\n')
+        self.call('prompts', self.iter, code=1)
+        self.assertIn('single ja line exceeds batch limit', self.last_stderr)
+        run = self.read_json(self.run / 'run.json')
+        template = Path(run['jaSkill']) / 'references/prompt.md'
+        template.write_text('x' * (mr.JA_BATCH_LIMIT - 2))
+        self.call('prompts', self.iter, code=1)
+        self.assertIn('ja template with decisions exceeds batch limit', self.last_stderr)
+
+    def test_decisions_corrupt_state_is_not_treated_as_empty(self):
+        self.add_decisions(self.decision())
+        path = self.run / 'decisions.json'
+        value = self.read_json(path)
+        item = value['decisions'][0]
+        self.call('prompts', self.iter)
+        prompts = (self.iter / 'prompts.json').read_bytes()
+        markdown = (self.run / 'decisions.md').read_bytes()
+        invalid = [(v, 'invalid decisions fields or identity') for v in
+                   ([], dict(value, extra=1), dict(value, reviewId='different'), dict(value, decisions={}))]
+        invalid.append((dict(value, decisions=[item, item]), 'invalid or duplicate decision ID'))
+        for changes, reason in [({'id': 'D0'}, 'invalid or duplicate decision ID'),
+                                ({'id': 'D2'}, 'invalid decision sequence'),
+                                ({'id': []}, 'invalid or duplicate decision ID'),
+                                ({'iteration': True}, 'invalid decision iteration'),
+                                ({'iteration': 0}, 'invalid decision iteration'),
+                                ({'iteration': 2}, 'invalid decision iteration'),
+                                ({'type': 'unknown'}, 'invalid decision strings'),
+                                ({'body': ''}, 'invalid decision strings'),
+                                ({'reason': None}, 'invalid decision strings'),
+                                ({'findingIds': ['F99']}, 'invalid decision findingIds'),
+                                ({'findingIds': [False]}, 'invalid decision findingIds'),
+                                ({'findingIds': {}}, 'invalid decision findingIds'),
+                                ({'extra': 1}, 'invalid decision fields')]:
+            invalid.append((dict(value, decisions=[dict(item, **changes)]), reason))
+        invalid.append((dict(value, decisions=[{k: v for k, v in item.items() if k != 'body'}]),
+                        'invalid decision fields'))
+        for broken, reason in invalid:
+            with self.subTest(broken=broken):
+                self.write_json(path, broken)
+                for argv in [('decisions', self.run, 'render'), ('prompts', self.iter)]:
+                    with self.subTest(argv=argv):
+                        self.call(*argv, code=1)
+                        self.assertIn(reason, self.last_stderr)
+                        self.assertEqual((self.iter / 'prompts.json').read_bytes(), prompts)
+                        self.assertEqual((self.run / 'decisions.md').read_bytes(), markdown)
+        for text, reason in [('', 'Expecting value'), ('{', 'Expecting property name'),
+                             ('{"reviewId":1,"reviewId":2}', 'duplicate JSON key')]:
+            with self.subTest(text=text):
+                path.write_text(text)
+                self.call('decisions', self.run, 'render', code=1)
+                self.assertIn(reason, self.last_stderr)
+                self.assertEqual((self.run / 'decisions.md').read_bytes(), markdown)
+        self.write_json(path, value)
+        run_path = self.run / 'run.json'
+        run = self.read_json(run_path)
+        for changes, reason in [({'decisionSequence': True}, 'invalid run state'),
+                                ({'decisionSequence': -1}, 'invalid run state'),
+                                ({'decisionSequence': 0}, 'invalid decision sequence'),
+                                ({'decisionImports': []}, 'invalid run state'),
+                                ({'decisionImports': {'receipt': 'D99'}}, 'import receipt without decision'),
+                                ({'decisionImports': {'receipt': 1}}, 'invalid run state'),
+                                ({'decisionImports': {'': 'D1'}}, 'invalid run state'),
+                                ({'decisionImports': {'receipt': 'D0'}}, 'invalid run state'),
+                                ({'decisionImports': {'receipt': 'X1'}}, 'invalid run state')]:
+            with self.subTest(changes=changes):
+                self.write_json(run_path, dict(run, **changes))
+                self.call('decisions', self.run, 'render', code=1)
+                self.assertIn(reason, self.last_stderr)
+                self.assertEqual((self.run / 'decisions.md').read_bytes(), markdown)
+        self.write_json(run_path, run)
+        path.unlink()
+        self.call('decisions', self.run, 'render', code=1)
+        self.assertIn('import receipt without decision', self.last_stderr)
+
+    def test_decisions_interrupted_save_restores_json_and_receipts(self):
+        source = self.root / 'decision.json'
+        self.write_json(source, self.decision())
+        save = mr.save_json
+        def interrupted_save(path, value):
+            if path == self.run / 'run.json':
+                raise KeyboardInterrupt
+            return save(path, value)
+        for exists in (False, True):
+            if exists:
+                self.add_decisions(self.decision())
+            paths = [self.run / name for name in ('run.json', 'decisions.json', 'decisions.md')]
+            saved = [p.read_bytes() if p.exists() else None for p in paths]
+            self.write_json(source, self.decision(body='割り込み中の追加'))
+            with patch.object(sys, 'argv', ['mr', 'decisions', str(self.run), 'add', '--input', str(source)]), \
+                    patch.dict(os.environ, self.env), patch.object(mr, 'save_json', interrupted_save), \
+                    patch.object(mr.signal, 'signal'), redirect_stderr(io.StringIO()) as stderr:
+                self.assertEqual(mr.main(), 1)
+            self.assertIn('interrupted', stderr.getvalue())
+            self.assertEqual([p.read_bytes() if p.exists() else None for p in paths], saved)
+
+    def test_decisions_text_and_finding_statuses_are_preserved(self):
+        for status in ('unresolved', 'fixed', 'on_hold', 'rejected'):
+            fields = {'fixSummary': '修正', 'fixedIteration': 1} if status == 'fixed' else \
+                     {'reason': '判断'} if status in ('on_hold', 'rejected') else {}
+            self.add(status=status, **fields)
+        item = self.decision(body='"引用" と `code`\n次の行', reason='理由\n続き',
+                             findingIds=['F1', 'F2', 'F3', 'F4'])
+        self.add_decisions(item)
+        saved = self.read_json(self.run / 'decisions.json')['decisions'][0]
+        self.assertEqual(saved['body'], item['body'])
+        self.assertEqual(saved['reason'], item['reason'])
+        text = (self.run / 'decisions.md').read_text()
+        self.assertIn('D1（記録: iter-1、関連: F1, F2, F3, F4）', text)
+        self.assertIn('"引用" と `code`\n  次の行', text)
+        self.assertIn('理由: 理由\n  続き', text)
+        self.assertEqual(self.add_decisions(dict(item, reason='別の理由'))['ids'], ['D2'])
+
+    def test_decisions_triage_only_ja_and_no_japanese_target(self):
+        self.repository()
+        (self.repo / 'ja.txt').write_text('日本語\n')
+        self.ja_initialize()
+        self.add()
+        self.add_decisions(self.decision(type='triage', findingIds=['F1']))
+        for directory, included in [(self.iter, False), (self.run / 'iter-2', True)]:
+            jobs = [j for j in self.call('prompts', directory)['reviewers'] if j['cli'] == 'agy']
+            self.assertEqual(len(jobs), 1)
+            self.assertEqual('## 決定事項' in Path(jobs[0]['prompt']).read_text(), included)
+        jobs = [j for j in self.call('prompts', self.run / 'iter-2', '--reconsider', 'F1')['reviewers']
+                if j['cli'] == 'agy']
+        self.assertEqual(len(jobs), 1)
+        self.assertNotIn('## 決定事項', Path(jobs[0]['prompt']).read_text())
+        (self.repo / 'ja.txt').write_text('english only\n')
+        jobs = self.call('prompts', self.run / 'iter-2')['reviewers']
+        self.assertFalse(any(j['cli'] == 'agy' for j in jobs))
+
     def git(self, *args):
         return subprocess.run(['git', *args], cwd=self.repo, env=self.env,
                               capture_output=True, check=True).stdout
@@ -2058,6 +2472,7 @@ else:
             with self.subTest(key=key):
                 self.assertEqual(int(re.search(pattern, docs)[1]), run[key])
         self.assertEqual(int(re.search(r'(\d+) bytes 以下の引数バッチ', docs)[1]), mr.JA_BATCH_LIMIT)
+        self.assertEqual(int(re.search(r'節全体の上限は(\d+) bytes', docs)[1]), mr.DECISIONS_MAX_BYTES)
         self.assertEqual(int(re.search(r'`--max-bytes` の既定は(\d+) bytes', docs)[1]), mr.INVENTORY_MAX_BYTES)
         self.assertEqual(int(re.search(r'値は(\d+)文字', docs)[1]), mr.INVENTORY_VALUE_CHARS)
         self.assertEqual(int(re.search(r'シグネチャ・名前は(\d+)文字', docs)[1]), mr.INVENTORY_SIGNATURE_CHARS)

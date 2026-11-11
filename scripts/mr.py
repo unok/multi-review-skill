@@ -64,6 +64,10 @@ FIXDIFF_FILE = 'fixdiff.json'
 FIX_DIFF_FILE = 'fix.diff'
 SNAPSHOT_MODE_FILE = 'snapshot.mode'
 LEDGER_MD_FILE = 'ledger.md'
+DECISIONS_FILE = 'decisions.json'
+DECISIONS_MD_FILE = 'decisions.md'
+DECISIONS_MAX_BYTES = 8192
+DECISION_TYPES = {'policy': '方針', 'triage': '再報告しない基準'}
 STATUS_AWAITING = 'awaiting_instruction'
 NO_LINE_MARK = '［行なし］'
 NO_VALUE_MARK = '［初期値なし］'
@@ -164,6 +168,10 @@ def load_run(root):
             all(nonempty(k) and nonempty(v) for k, v in run.get('imports', {}).items()),
             'invalid run state')
     role_list(','.join(run['roles']))
+    require(type(run.get('decisionSequence', 0)) is int and run.get('decisionSequence', 0) >= 0 and
+            isinstance(run.get('decisionImports', {}), dict) and
+            all(nonempty(k) and isinstance(v, str) and re.fullmatch(r'D[1-9]\d*', v)
+                for k, v in run.get('decisionImports', {}).items()), 'invalid run state')
     return run
 
 
@@ -402,6 +410,132 @@ def ledger_action(args, root, run):
     if args.action != 'render':
         save_ledger_and_run(root, ledger, run)
     render(root, ledger)
+    return {'ids': ids}
+
+
+def validate_decisions(value, ledger, run):
+    require(isinstance(value, dict) and set(value) == {'reviewId', 'decisions'} and
+            value['reviewId'] == ledger['reviewId'] and isinstance(value['decisions'], list),
+            'invalid decisions fields or identity')
+    seen = set()
+    finding_ids = {item['id'] for item in ledger['findings']}
+    for item in value['decisions']:
+        require(isinstance(item, dict) and
+                {'id', 'type', 'body', 'reason', 'iteration'} <= set(item) <=
+                {'id', 'type', 'body', 'reason', 'iteration', 'findingIds'}, 'invalid decision fields')
+        require(nonempty(item['id']) and re.fullmatch(r'D[1-9]\d*', item['id']) and
+                item['id'] not in seen, 'invalid or duplicate decision ID')
+        seen.add(item['id'])
+        require(nonempty(item['type']) and item['type'] in DECISION_TYPES and
+                all(nonempty(item[key]) for key in ('body', 'reason')), 'invalid decision strings')
+        require(positive_int(item['iteration']) and item['iteration'] <= ledger['iteration'],
+                'invalid decision iteration')
+        links = item.get('findingIds', [])
+        require(isinstance(links, list) and all(nonempty(link) for link in links) and
+                len(set(links)) == len(links) and set(links) <= finding_ids, 'invalid decision findingIds')
+        require(int(item['id'][1:]) <= run.get('decisionSequence', 0), 'invalid decision sequence')
+    require(set(run.get('decisionImports', {}).values()) <= seen, 'import receipt without decision')
+    return value
+
+
+def load_decisions(root, ledger, run):
+    path = root / DECISIONS_FILE
+    value = read_json(path) if path.exists() else {'reviewId': ledger['reviewId'], 'decisions': []}
+    return validate_decisions(value, ledger, run)
+
+
+def decisions_markdown(value, iteration=None, field=None, reconsider=()):
+    sections = []
+    for kind, label in DECISION_TYPES.items():
+        if kind == 'triage' and iteration == 1:
+            continue
+        rows = []
+        for item in sorted(value['decisions'], key=lambda i: int(i['id'][1:])):
+            if item['type'] != kind or (kind == 'triage' and
+                                        set(item.get('findingIds', [])) & set(reconsider)):
+                continue
+            metadata = f"記録: iter-{item['iteration']}"
+            if item.get('findingIds'):
+                metadata += '、関連: ' + ', '.join(item['findingIds'])
+            body = item['body'].replace('\n', '\n  ')
+            reason = item['reason'].replace('\n', '\n  ')
+            rows.append(f"- {item['id']}（{metadata}）{body}\n  理由: {reason}")
+        if rows:
+            sections.append('### ' + label + f'（{kind}）\n' + '\n'.join(rows))
+    if not sections:
+        return ''
+    if field is not None:
+        sections.append('決定事項に反する指摘、基準に当たる指摘は出さない。ただし、決定の前提が崩れている具体例'
+                        f'（入力・手順・結果）を示せる場合は、その具体例と決定 ID を「{field}:」に書いて出してよい。')
+    return '\n\n'.join(['## 決定事項', *sections]) + '\n'
+
+
+def bounded_decisions_markdown(value, iteration=None, field='問題', reconsider=()):
+    text = decisions_markdown(value, field=field)
+    size = len(text.encode('utf-8'))
+    require(size <= DECISIONS_MAX_BYTES,
+            f'decisions section is {size} bytes (limit {DECISIONS_MAX_BYTES}); '
+            'merge or reduce decisions in decisions.json')
+    return decisions_markdown(value, iteration, field if iteration is not None else None, reconsider)
+
+
+def save_decisions_and_run(root, value, run):
+    path = root / DECISIONS_FILE
+    original = path.read_bytes() if path.exists() else None
+    save_json(path, value)
+    try:
+        save_json(root / RUN_FILE, run)
+    except BaseException:
+        if original is None:
+            path.unlink()
+        else:
+            write_atomic(path, original)
+        raise
+
+
+def decisions_action(args, root, run):
+    ledger = load_ledger(root)
+    value = load_decisions(root, ledger, run)
+    ids = []
+    require(not args.ids or args.action == 'remove', 'IDs are only for remove')
+    require(args.input is None or args.action == 'add', '--input is only for add')
+    if args.action == 'add':
+        require(args.input is not None, '--input required for add')
+        incoming = read_json(args.input)
+        incoming = incoming if isinstance(incoming, list) else [incoming]
+        for raw in incoming:
+            require(isinstance(raw, dict) and {'type', 'body', 'reason'} <= set(raw) <=
+                    {'type', 'body', 'reason', 'findingIds'}, 'invalid decision input fields')
+            item = dict(raw)
+            links = item.get('findingIds', [])
+            require(isinstance(links, list) and all(nonempty(link) for link in links) and
+                    set(links) <= {i['id'] for i in ledger['findings']}, 'invalid decision findingIds')
+            item['findingIds'] = sorted(set(links), key=lambda link: tuple(
+                (1, int(p)) if p.isdecimal() else (0, p) for p in re.split(r'(\d+)', link)))
+            receipt = digest(json.dumps(item, sort_keys=True).encode())
+            previous_id = run.get('decisionImports', {}).get(receipt)
+            if previous_id:
+                ids.append(previous_id)
+                continue
+            run['decisionSequence'] = run.get('decisionSequence', 0) + 1
+            item.update(id='D' + str(run['decisionSequence']), iteration=ledger['iteration'])
+            value['decisions'].append(item)
+            run.setdefault('decisionImports', {})[receipt] = item['id']
+            ids.append(item['id'])
+    elif args.action == 'remove':
+        require(args.ids, 'decision IDs required')
+        require(set(args.ids) <= {i['id'] for i in value['decisions']}, 'unknown decision ID')
+        ids = [i['id'] for i in value['decisions'] if i['id'] in args.ids]
+        value['decisions'] = [i for i in value['decisions'] if i['id'] not in args.ids]
+        run['decisionImports'] = {k: v for k, v in run.get('decisionImports', {}).items() if v not in args.ids}
+    validate_decisions(value, ledger, run)
+    text = bounded_decisions_markdown(value) or '決定事項なし\n'
+    if args.action != 'render':
+        save_decisions_and_run(root, value, run)
+    output = root / DECISIONS_MD_FILE
+    # 書き込み失敗時に保存済み JSON と異なる決定を渡さないよう、古い Markdown を削除する。
+    output.unlink(missing_ok=True)
+    write_atomic(output, '<!-- mr decisions render で生成。編集は mr decisions add / remove で行う -->\n' + text)
     return {'ids': ids}
 
 
@@ -1015,7 +1149,7 @@ def ja_file_chunks(name, text, lines, header):
     return chunks
 
 
-def ja_batches(directory, run, files, ranges):
+def ja_batches(directory, run, files, ranges, decisions=''):
     skill = Path(run['jaSkill'])
     if skill.is_file():
         skill = skill.parent
@@ -1024,6 +1158,8 @@ def ja_batches(directory, run, files, ranges):
         return []
     header = template.read_text(encoding='utf-8') + '\n'
     require(len(header.encode()) < JA_BATCH_LIMIT, 'ja template exceeds batch limit')
+    header += decisions
+    require(len(header.encode()) < JA_BATCH_LIMIT, 'ja template with decisions exceeds batch limit')
     batches, batch = [], header
     cwd = Path(run['cwd'])
     for name in files:
@@ -1090,7 +1226,7 @@ def prompt_target(directory, run, ledger, iteration, files, reconsider, fixes=()
     return target
 
 
-def review_jobs(directory, run, target):
+def review_jobs(directory, run, target, decisions=''):
     roles = role_texts()
     common = report_format()
     jobs = []
@@ -1104,7 +1240,8 @@ def review_jobs(directory, run, target):
             continue
         stem = 'claude' if cli == 'claude' and role == 'general' else 'role-' + role
         prompt = directory / (stem + '.prompt.md')
-        write_atomic(prompt, roles[role] + '\n\n' + common + '\n\n' + target)
+        write_atomic(prompt, roles[role] + '\n\n' + common + '\n\n' +
+                     (decisions + '\n' if decisions else '') + target)
         model_spec = JOB_MODELS[run['profile']][cli]['general' if role == 'general' else 'specialist']
         jobs.append(make_job(cli, cli + '-' + role, model_spec, prompt,
                              directory / (stem + '.md'), run['timeout']))
@@ -1129,11 +1266,13 @@ def prompts(args, root, run):
         run['roles'] = role_list(args.roles)
     reconsider = set(args.reconsider.split(',')) if args.reconsider else set()
     require(reconsider <= {i['id'] for i in ledger['findings']}, 'unknown reconsider ID')
+    value = load_decisions(root, ledger, run)
+    decisions = bounded_decisions_markdown(value, iteration, reconsider=reconsider)
     invalidate(directory, 'prompts')
     ja_review = run['jaReview'] if args.ja_review is None else args.ja_review
     files, extra_files, fixes = iteration_files(directory, run, iteration)
     target = prompt_target(directory, run, ledger, iteration, files, reconsider, fixes)
-    jobs = review_jobs(directory, run, target)
+    jobs = review_jobs(directory, run, target, decisions)
     if ja_review and 'ja-review' not in run['excluded']:
         cwd = Path(run['cwd'])
         ranges = {}
@@ -1149,7 +1288,8 @@ def prompts(args, root, run):
                 ranges.pop(name, None)
         elif extra_files:
             ranges = {name: extra_additions.get(name, set()) for name in extra_files}
-        jobs.extend(ja_batches(directory, run, files, ranges))
+        jobs.extend(ja_batches(directory, run, files, ranges,
+                               bounded_decisions_markdown(value, iteration, field='理由', reconsider=reconsider)))
     require(jobs, 'no reviewer selected')
     require(any(shutil.which(job['cli']) for job in jobs), 'no installed reviewer selected')
     ledger['iteration'] = iteration
@@ -2137,6 +2277,7 @@ COMMANDS = {
     'task': (task, 'iteration', always_zero),
     'fixdiff': (fixdiff, 'iteration', always_zero),
     'ledger': (ledger_action, 'root', always_zero),
+    'decisions': (decisions_action, 'root', always_zero),
     'rules': (rules, 'iteration', lambda result: EXIT_CANDIDATES if result.get('exitCode') == EXIT_CANDIDATES else 0),
     'gate': (gate, 'iteration', lambda result: EXIT_AWAITING if result.get('status') == STATUS_AWAITING else 0),
 }
@@ -2178,6 +2319,10 @@ def parser():
     ledger_parser.add_argument('--iteration', type=int)
     ledger_parser.add_argument('--summary')
     ledger_parser.add_argument('--reason')
+    decisions_parser = parsers['decisions']
+    decisions_parser.add_argument('action', choices=('add', 'remove', 'render'))
+    decisions_parser.add_argument('ids', nargs='*')
+    decisions_parser.add_argument('--input', type=Path)
     return p
 
 

@@ -41,7 +41,7 @@ Claude Code では `/multi-review` または「複眼レビューして」、Cod
 - `SKILL.md` — 制御フロー（分岐・状態管理・終了条件）
 - `references/execution.md` — CLI の引数・成果物・終了コードと、呼び出し元の照合・判断
 - `references/roles.md` — 役割カタログ（総合 / セキュリティ / バグハント / アーキテクチャなど13役割）
-- `scripts/mr.py` — 差分・プロンプト・並列実行・台帳・既存の一覧の生成・rules・ゲートの機械的処理
+- `scripts/mr.py` — 差分・プロンプト・並列実行・台帳・決定事項・既存の一覧の生成・rules・ゲートの機械的処理
 - `scripts/inventory_ts.cjs` — TypeScript コンパイラ API による既存の一覧の解析
 - `scripts/inventory_go.go` — Go の構文解析による既存の一覧の解析
 - `tests/` — `python3 -m unittest` で実行するテスト（外部レビュアーとゲートは偽 CLI、inventory は実物の node・typescript・go を使用）
