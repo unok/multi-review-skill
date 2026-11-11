@@ -68,6 +68,7 @@ DECISIONS_FILE = 'decisions.json'
 DECISIONS_MD_FILE = 'decisions.md'
 DECISIONS_MAX_BYTES = 8192
 DECISION_TYPES = {'policy': '方針', 'triage': '再報告しない基準'}
+DECISION_SOURCES = {'user': '利用者共通', 'project': 'プロジェクト'}
 STATUS_AWAITING = 'awaiting_instruction'
 NO_LINE_MARK = '［行なし］'
 NO_VALUE_MARK = '［初期値なし］'
@@ -422,7 +423,13 @@ def validate_decisions(value, ledger, run):
     for item in value['decisions']:
         require(isinstance(item, dict) and
                 {'id', 'type', 'body', 'reason', 'iteration'} <= set(item) <=
-                {'id', 'type', 'body', 'reason', 'iteration', 'findingIds'}, 'invalid decision fields')
+                {'id', 'type', 'body', 'reason', 'iteration', 'findingIds', 'sources'}, 'invalid decision fields')
+        if 'sources' in item:
+            sources = item['sources']
+            require(isinstance(sources, list) and sources and
+                    all(isinstance(source, str) and source in DECISION_SOURCES for source in sources) and
+                    sources == [source for source in DECISION_SOURCES if source in sources],
+                    'invalid decision sources')
         require(nonempty(item['id']) and re.fullmatch(r'D[1-9]\d*', item['id']) and
                 item['id'] not in seen, 'invalid or duplicate decision ID')
         seen.add(item['id'])
@@ -455,6 +462,8 @@ def decisions_markdown(value, iteration=None, field=None, reconsider=()):
                                         set(item.get('findingIds', [])) & set(reconsider)):
                 continue
             metadata = f"記録: iter-{item['iteration']}"
+            if item.get('sources'):
+                metadata += '、出所: ' + '・'.join(DECISION_SOURCES[s] for s in item['sources'])
             if item.get('findingIds'):
                 metadata += '、関連: ' + ', '.join(item['findingIds'])
             body = item['body'].replace('\n', '\n  ')
@@ -493,6 +502,71 @@ def save_decisions_and_run(root, value, run):
         raise
 
 
+def add_decision(raw, value, ledger, run, source=None):
+    allowed = {'type', 'body', 'reason'} | ({'findingIds'} if source is None else set())
+    require(isinstance(raw, dict) and {'type', 'body', 'reason'} <= set(raw) <= allowed,
+            'invalid decision input fields')
+    item = dict(raw)
+    require(nonempty(item['type']) and item['type'] in DECISION_TYPES and
+            all(nonempty(item[key]) for key in ('body', 'reason')), 'invalid decision strings')
+    links = item.get('findingIds', [])
+    require(isinstance(links, list) and all(nonempty(link) for link in links) and
+            set(links) <= {i['id'] for i in ledger['findings']}, 'invalid decision findingIds')
+    item['findingIds'] = sorted(set(links), key=lambda link: tuple(
+        (1, int(p)) if p.isdecimal() else (0, p) for p in re.split(r'(\d+)', link)))
+    receipt = digest(json.dumps(item, sort_keys=True).encode())
+    previous_id = run.get('decisionImports', {}).get(receipt)
+    if previous_id:
+        if source:
+            previous = next(i for i in value['decisions'] if i['id'] == previous_id)
+            previous['sources'] = [s for s in DECISION_SOURCES
+                                   if s in {*previous.get('sources', []), source}]
+        return previous_id
+    run['decisionSequence'] = run.get('decisionSequence', 0) + 1
+    item.update(id='D' + str(run['decisionSequence']), iteration=ledger['iteration'])
+    if source:
+        item['sources'] = [source]
+    value['decisions'].append(item)
+    run.setdefault('decisionImports', {})[receipt] = item['id']
+    return item['id']
+
+
+def standing_decisions(cwd, value, ledger, run, disabled):
+    result = {'count': 0, 'sources': []}
+    if disabled:
+        return result
+    config = Path(os.environ.get('XDG_CONFIG_HOME') or '')
+    if not config.is_absolute():
+        try:
+            home = Path.home()
+        except RuntimeError:
+            config = None
+        else:
+            config = home / '.config' if home.is_absolute() else None
+    paths = (config / 'multi-review' / DECISIONS_FILE if config else None,
+             cwd / '.multi-review' / DECISIONS_FILE)
+    for source, path in zip(DECISION_SOURCES, paths):
+        if path is None or (not path.exists() and not path.is_symlink()):
+            continue
+        try:
+            incoming = read_json(path)
+        except EXPECTED_ERRORS as error:
+            raise Failure(display_path(str(path)) + ': ' + str(error)) from error
+        ids = []
+        for index, raw in enumerate(incoming if isinstance(incoming, list) else [incoming]):
+            try:
+                decision_id = add_decision(raw, value, ledger, run, source)
+                bounded_decisions_markdown(value)
+            except EXPECTED_ERRORS as error:
+                raise Failure(display_path(str(path)) + f'[{index}]: ' + str(error)) from error
+            if decision_id not in ids:
+                ids.append(decision_id)
+        result['sources'].append({'source': source, 'path': str(path),
+                                  'ids': sorted(ids, key=lambda item: int(item[1:]))})
+    result['count'] = len({item for source in result['sources'] for item in source['ids']})
+    return result
+
+
 def decisions_action(args, root, run):
     ledger = load_ledger(root)
     value = load_decisions(root, ledger, run)
@@ -503,25 +577,7 @@ def decisions_action(args, root, run):
         require(args.input is not None, '--input required for add')
         incoming = read_json(args.input)
         incoming = incoming if isinstance(incoming, list) else [incoming]
-        for raw in incoming:
-            require(isinstance(raw, dict) and {'type', 'body', 'reason'} <= set(raw) <=
-                    {'type', 'body', 'reason', 'findingIds'}, 'invalid decision input fields')
-            item = dict(raw)
-            links = item.get('findingIds', [])
-            require(isinstance(links, list) and all(nonempty(link) for link in links) and
-                    set(links) <= {i['id'] for i in ledger['findings']}, 'invalid decision findingIds')
-            item['findingIds'] = sorted(set(links), key=lambda link: tuple(
-                (1, int(p)) if p.isdecimal() else (0, p) for p in re.split(r'(\d+)', link)))
-            receipt = digest(json.dumps(item, sort_keys=True).encode())
-            previous_id = run.get('decisionImports', {}).get(receipt)
-            if previous_id:
-                ids.append(previous_id)
-                continue
-            run['decisionSequence'] = run.get('decisionSequence', 0) + 1
-            item.update(id='D' + str(run['decisionSequence']), iteration=ledger['iteration'])
-            value['decisions'].append(item)
-            run.setdefault('decisionImports', {})[receipt] = item['id']
-            ids.append(item['id'])
+        ids = [add_decision(raw, value, ledger, run) for raw in incoming]
     elif args.action == 'remove':
         require(args.ids, 'decision IDs required')
         require(set(args.ids) <= {i['id'] for i in value['decisions']}, 'unknown decision ID')
@@ -532,11 +588,15 @@ def decisions_action(args, root, run):
     text = bounded_decisions_markdown(value) or '決定事項なし\n'
     if args.action != 'render':
         save_decisions_and_run(root, value, run)
+    render_decisions(root, text)
+    return {'ids': ids}
+
+
+def render_decisions(root, text):
     output = root / DECISIONS_MD_FILE
     # 書き込み失敗時に保存済み JSON と異なる決定を渡さないよう、古い Markdown を削除する。
     output.unlink(missing_ok=True)
-    write_atomic(output, '<!-- mr decisions render で生成。編集は mr decisions add / remove で行う -->\n' + text)
-    return {'ids': ids}
+    write_atomic(output, '<!-- mr が生成。編集は mr decisions add / remove で行う -->\n' + text)
 
 
 def safe_relative(cwd, name):
@@ -876,16 +936,35 @@ def init(args, root, run):
     run['baseSummary'] = args.base_summary or f'{mode}: {branch}, {scope}; {len(scope_files(run))} files'
     enabled = set(REVIEWERS) if args.ja_review else set(REVIEWERS) - {'ja-review'}
     require(enabled - excluded, 'all reviewers excluded')
+    ledger = {'reviewId': root.name, 'iteration': 1, 'findings': []}
+    value = {'reviewId': root.name, 'decisions': []}
+    imported = standing_decisions(cwd, value, ledger, run, args.no_standing_decisions)
+    names = [RUN_FILE, LEDGER_FILE, LEDGER_MD_FILE, 'ledger.render.md']
+    if imported['count']:
+        names.extend((DECISIONS_FILE, DECISIONS_MD_FILE))
+    originals = {root / name: (root / name).read_bytes() if (root / name).exists() else None
+                 for name in names}
+    directory = iteration_dir(root, 1)
+    existed = directory.exists()
     try:
         save_json(root / RUN_FILE, run)
-        save_json(root / LEDGER_FILE, {'reviewId': root.name, 'iteration': 1, 'findings': []})
-        render(root, load_ledger(root))
-        iteration_dir(root, 1).mkdir(exist_ok=True)
-    except EXPECTED_ERRORS:
-        for name in (RUN_FILE, LEDGER_FILE, LEDGER_MD_FILE):
-            (root / name).unlink(missing_ok=True)
+        save_json(root / LEDGER_FILE, ledger)
+        render(root, ledger)
+        if imported['count']:
+            validate_decisions(value, ledger, run)
+            save_json(root / DECISIONS_FILE, value)
+            render_decisions(root, bounded_decisions_markdown(value))
+        directory.mkdir(exist_ok=True)
+    except BaseException:
+        for path, original in originals.items():
+            if original is None:
+                path.unlink(missing_ok=True)
+            else:
+                write_atomic(path, original)
+        if not existed and directory.is_dir():
+            directory.rmdir()
         raise
-    return run
+    return dict(run, standingDecisions=imported)
 
 
 def report_format():
@@ -2300,6 +2379,7 @@ def parser():
     init_parser.add_argument('--exclude', choices=REVIEWERS, action='append', default=[])
     init_parser.add_argument('--only', choices=REVIEWERS, action='append', default=[])
     init_parser.add_argument('--ja-review', action='store_true')
+    init_parser.add_argument('--no-standing-decisions', action='store_true')
     init_parser.add_argument('--ja-skill', type=Path, default=Path('~/.claude/skills/ja-review'))
     init_parser.add_argument('--diff-budget', type=int, default=DIFF_BUDGET)
     init_parser.add_argument('--timeout', type=float, default=REVIEW_TIMEOUT)
