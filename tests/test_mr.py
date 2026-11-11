@@ -8,6 +8,7 @@ import re
 import fcntl
 import shutil
 import signal
+import stat
 import time
 from pathlib import Path
 import subprocess
@@ -26,15 +27,19 @@ class CLIExamples(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
+        self.root = Path(self.tmp.name).resolve()
         self.repo = self.root / 'repo'
         self.repo.mkdir()
         self.run = self.root / 'multi-review-test'
         self.run.mkdir()
         self.bin = self.root / 'bin'
         self.bin.mkdir()
+        # 非 git のテスト環境で、一時ディレクトリより上のリポジトリを見つけないようにする。
         self.env = dict(os.environ, PATH=str(self.bin), GIT_CONFIG_NOSYSTEM='1',
-                        GIT_CONFIG_GLOBAL=os.devnull, PYTHONDONTWRITEBYTECODE='1')
+                        GIT_CONFIG_GLOBAL=os.devnull, PYTHONDONTWRITEBYTECODE='1',
+                        GIT_CEILING_DIRECTORIES=str(self.root),
+                        HOME=str(self.root / 'home'), XDG_CONFIG_HOME=str(self.root / 'config'),
+                        XDG_DATA_HOME=str(self.root / 'data'), MR_NO_STATS='0')
         for name in ('git', 'diff', 'bash', 'tr'):
             (self.bin / name).symlink_to(shutil.which(name))
         self.fake('claude', "print('問題なし')\n")
@@ -50,7 +55,7 @@ class CLIExamples(unittest.TestCase):
 
     def call(self, *args, code=0, timeout=None):
         result = subprocess.run([sys.executable, str(CLI), *map(str, args)],
-                                env=self.env, capture_output=True, text=True, timeout=timeout)
+                                env=self.env, cwd=self.root, capture_output=True, text=True, timeout=timeout)
         self.assertEqual(result.returncode, code, result.stdout + result.stderr)
         if code == 1:
             self.assertTrue(result.stderr.strip(), 'failure needs a diagnostic')
@@ -150,6 +155,370 @@ with patch.object(subprocess.Popen, 'communicate', communicate):
         source = self.root / 'decisions-input.json'
         self.write_json(source, value)
         return self.call('decisions', self.run, 'add', '--input', source)
+
+    def test_standing_decisions_examples(self):
+        a, b = self.decision(), self.decision(type='triage')
+        size = len(mr.decisions_markdown({'decisions': [dict(a, id='D1', iteration=1,
+                         sources=['user'])]}, field='問題').encode())
+        exact = dict(a, body=a['body'] + 'x' * (mr.DECISIONS_MAX_BYTES - size))
+        overflow = dict(exact, body=exact['body'] + 'x')
+        half = dict(a, body='x' * 4000)
+        u, p, both = ['user'], ['project'], ['user', 'project']
+        cases = [
+            (None, None, [], None), ([], None, [], None),
+            (a, None, [(a, u)], None), (None, a, [(a, p)], None),
+            ([a, b], None, [(a, u), (b, u)], None),
+            (a, b, [(a, u), (b, p)], None), (a, a, [(a, both)], None),
+            ([a, a], [a, b], [(a, both), (b, p)], None),
+            ([b, a], [a, b], [(b, both), (a, both)], None),
+            (a, dict(a, reason='別の理由'), [(a, u), (dict(a, reason='別の理由'), p)], None),
+            (a, dict(reversed(list(a.items()))), [(a, both)], None),
+            (b, None, [(b, u)], None), (a, [b, {}], [], 'project[1]'),
+            ('{', a, [], 'user'), (a, dict(a, findingIds=[]), [], 'project[0]'),
+            (dict(a, extra=1), None, [], 'user[0]'), (exact, None, [(exact, u)], None),
+            (overflow, None, [], 'user[0]'),
+            (half, dict(half, reason='別の理由'), [], 'project[0]'),
+            ('{', 'directory', [], 'disabled')]
+        paths = [Path(self.env['XDG_CONFIG_HOME']) / 'multi-review/decisions.json',
+                 self.repo / '.multi-review/decisions.json']
+        for number, (user, project, expected, error) in enumerate(cases):
+            with self.subTest(case=number):
+                for path, value in zip(paths, (user, project)):
+                    if path.is_dir():
+                        path.rmdir()
+                    else:
+                        path.unlink(missing_ok=True)
+                    if value is not None:
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        if value == 'directory':
+                            path.mkdir()
+                        else:
+                            path.write_text(value if isinstance(value, str) else json.dumps(value))
+                root = self.root / f'example-{number}'
+                disabled = error == 'disabled'
+                result = self.call('init', root, '--cwd', self.repo, '--path', '.',
+                                   *(['--no-standing-decisions'] if disabled else []),
+                                   code=1 if error and not disabled else 0)
+                if error and not disabled:
+                    source, _, index = error.partition('[')
+                    self.assertIn(str(paths[0 if source == 'user' else 1]) +
+                                  ('[' + index if index else ''), self.last_stderr)
+                    self.assertEqual(set(x.name for x in root.iterdir()), {'.mr.lock'})
+                    continue
+                self.assertEqual(result['standingDecisions']['count'], len(expected))
+                self.assertEqual(result['standingDecisions']['sources'], [] if disabled else [
+                    {'source': source, 'path': str(path), 'ids': [f'D{i}' for i, (_, sources)
+                     in enumerate(expected, 1) if source in sources]}
+                    for source, path, value in zip(('user', 'project'), paths, (user, project))
+                    if value is not None])
+                self.assertEqual({k: v for k, v in result.items() if k != 'standingDecisions'},
+                                 self.read_json(root / 'run.json'))
+                if not expected:
+                    self.assertFalse((root / 'decisions.json').exists())
+                    self.assertFalse((root / 'decisions.md').exists())
+                    continue
+                self.assertEqual(result['decisionSequence'], len(expected))
+                self.assertEqual(self.read_json(root / 'decisions.json')['decisions'], [
+                    dict(item, id=f'D{i}', iteration=1, findingIds=[], sources=sources)
+                    for i, (item, sources) in enumerate(expected, 1)])
+                source = self.root / 'decisions-input.json'
+                self.write_json(source, [item for item, _ in expected])
+                before = self.read_json(root / 'decisions.json')
+                self.assertEqual(self.call('decisions', root, 'add', '--input', source)['ids'],
+                                 [f'D{i}' for i in range(1, len(expected) + 1)])
+                self.assertEqual(self.read_json(root / 'decisions.json'), before)
+                text = (root / 'decisions.md').read_text()
+                for i, (item, sources) in enumerate(expected, 1):
+                    self.assertIn(f"- D{i}（記録: iter-1、出所: " +
+                                  '・'.join(mr.DECISION_SOURCES[source] for source in sources) +
+                                  '）' + item['body'].replace('\n', '\n  '), text)
+                jobs = self.call('prompts', root / 'iter-1')['reviewers']
+                self.assertEqual('## 決定事項' in Path(jobs[0]['prompt']).read_text(),
+                                 any(item['type'] == 'policy' for item, _ in expected))
+
+    def test_standing_decisions_configuration_and_links(self):
+        fallback = Path(self.env['HOME']) / '.config/multi-review/decisions.json'
+        fallback.parent.mkdir(parents=True)
+        self.write_json(fallback, self.decision(body='HOME の決定'))
+        configured = Path(self.env['XDG_CONFIG_HOME']) / 'multi-review/decisions.json'
+        configured.parent.mkdir(parents=True)
+        configured.symlink_to(fallback)
+        for index, xdg in enumerate((None, '', str(configured.parents[1]), 'relative')):
+            with self.subTest(xdg=xdg):
+                if xdg is None:
+                    self.env.pop('XDG_CONFIG_HOME', None)
+                else:
+                    self.env['XDG_CONFIG_HOME'] = xdg
+                root = self.root / f'config-{index}'
+                result = self.call('init', root, '--cwd', self.repo, '--path', '.')
+                expected = configured if xdg and Path(xdg).is_absolute() else fallback
+                self.assertEqual(result['standingDecisions']['sources'][0]['path'], str(expected))
+                self.assertEqual(self.read_json(root / 'decisions.json')['decisions'][0]['body'], 'HOME の決定')
+        self.env['XDG_CONFIG_HOME'] = str(configured.parents[1])
+        configured.unlink()
+        root = self.root / 'configured-absent'
+        result = self.call('init', root, '--cwd', self.repo, '--path', '.')
+        self.assertEqual(result['standingDecisions'], {'count': 0, 'sources': []})
+        self.assertFalse((root / 'decisions.json').exists())
+        configured.symlink_to(self.root / 'missing')
+        self.call('init', self.root / 'broken-link', '--cwd', self.repo, '--path', '.', code=1)
+        self.assertIn(str(configured), self.last_stderr)
+        self.assertEqual({p.name for p in (self.root / 'broken-link').iterdir()}, {'.mr.lock'})
+        project = self.repo / '.multi-review/decisions.json'
+        project.parent.mkdir()
+        configured.unlink()
+        project.symlink_to(fallback)
+        root = self.root / 'project-link'
+        result = self.call('init', root, '--cwd', self.repo, '--path', '.')
+        self.assertEqual(result['standingDecisions']['sources'],
+                         [{'source': 'project', 'path': str(project), 'ids': ['D1']}])
+        self.assertEqual(self.read_json(root / 'decisions.json')['decisions'][0]['body'], 'HOME の決定')
+        project.unlink()
+        project.symlink_to(self.root / 'missing')
+        root = self.root / 'project-broken-link'
+        self.call('init', root, '--cwd', self.repo, '--path', '.', code=1)
+        self.assertIn(str(project), self.last_stderr)
+        self.assertEqual({p.name for p in root.iterdir()}, {'.mr.lock'})
+        project.unlink()
+        launcher = """import pwd,runpy,sys
+from unittest.mock import patch
+sys.argv = sys.argv[1:]
+with patch.object(pwd, 'getpwuid', side_effect=KeyError('no home')):
+    runpy.run_path(sys.argv[0], run_name='__main__')
+"""
+        for home in ('relative', '', None):
+            for has_project in (False, True):
+                with self.subTest(home=home, project=has_project):
+                    if has_project:
+                        self.write_json(project, self.decision())
+                    else:
+                        project.unlink(missing_ok=True)
+                    env = dict(self.env, XDG_CONFIG_HOME='')
+                    if home is None:
+                        env.pop('HOME', None)
+                    else:
+                        env['HOME'] = home
+                    root = self.root / f'home-{home}-{has_project}'
+                    result = subprocess.run([sys.executable, '-c', launcher, str(CLI), 'init',
+                                             str(root), '--cwd', str(self.repo), '--path', '.',
+                                             '--ja-skill', str(self.root / 'ja-skill')],
+                                            cwd=self.repo, env=env, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(json.loads(result.stdout)['standingDecisions'],
+                                     {'count': 1, 'sources': [{'source': 'project', 'path': str(project),
+                                       'ids': ['D1']}]} if has_project else {'count': 0, 'sources': []})
+                    if has_project:
+                        self.assertEqual(self.read_json(root / 'decisions.json')['decisions'],
+                                         [dict(self.decision(), id='D1', iteration=1,
+                                               findingIds=[], sources=['project'])])
+                    else:
+                        self.assertFalse((root / 'decisions.json').exists())
+        self.assertEqual(self.read_json(fallback), self.decision(body='HOME の決定'))
+
+    def test_standing_decisions_invalid_inputs_and_retry(self):
+        path = self.repo / '.multi-review/decisions.json'
+        path.parent.mkdir()
+        a = self.decision()
+        bad = [None, True, 1, 'text', [], {}, dict(a, id='D1'), dict(a, iteration=1),
+               dict(a, sources=['user']), dict(a, findingIds=['F1'])]
+        for key in ('type', 'body', 'reason'):
+            bad.extend(({k: v for k, v in a.items() if k != key},
+                        dict(a, **{key: ' \n'}), dict(a, **{key: []})))
+        bad.append(dict(a, type='unknown'))
+        root = self.root / 'retry'
+        for value in bad:
+            with self.subTest(value=value):
+                self.write_json(path, [a, value, a])
+                self.call('init', root, '--cwd', self.repo, '--path', '.', code=1)
+                self.assertIn(str(path) + '[1]', self.last_stderr)
+                self.assertEqual(set(p.name for p in root.iterdir()), {'.mr.lock'})
+        for value in (None, 1, 'text'):
+            self.write_json(path, value)
+            self.call('init', root, '--cwd', self.repo, '--path', '.', code=1)
+            self.assertIn(str(path) + '[0]', self.last_stderr)
+            self.assertEqual({p.name for p in root.iterdir()}, {'.mr.lock'})
+        for text in ('', ' ', '{', '{"type":"policy","type":"triage"}', 'NaN', '\ufeff' + json.dumps(a)):
+            path.write_text(text)
+            self.call('init', root, '--cwd', self.repo, '--path', '.', code=1)
+            self.assertIn(str(path) + ': ', self.last_stderr)
+            self.assertNotIn(str(path) + '[', self.last_stderr)
+        path.write_bytes(b'\xff')
+        self.call('init', root, '--cwd', self.repo, '--path', '.', code=1)
+        self.assertIn(str(path), self.last_stderr)
+        path.unlink()
+        path.mkdir()
+        self.call('init', root, '--cwd', self.repo, '--path', '.', code=1)
+        self.assertIn(str(path), self.last_stderr)
+        path.rmdir()
+        self.write_json(path, a)
+        self.call('init', root, '--cwd', self.repo, '--path', '.')
+        self.assertEqual(self.read_json(root / 'decisions.json')['decisions'][0]['id'], 'D1')
+
+    def test_standing_decisions_scopes(self):
+        self.repository()
+        path = self.repo / '.multi-review/decisions.json'
+        path.parent.mkdir()
+        self.write_json(path, self.decision())
+        sub = self.repo / 'sub'
+        sub.mkdir()
+        (sub / '.multi-review').mkdir()
+        self.write_json(sub / '.multi-review/decisions.json', {'invalid': True})
+        for index, (options, mode) in enumerate(((('--path', '../a.txt'), 'paths'), ((), 'uncommitted'))):
+            root = self.root / f'scope-{index}'
+            result = self.call('init', root, '--cwd', sub, *options)
+            self.assertEqual(result['mode'], mode)
+            self.assertEqual(result['standingDecisions']['sources'][0]['path'], str(path))
+        self.git('add', '.')
+        self.git('commit', '-m', 'standing decisions')
+        self.git('checkout', '-b', 'topic')
+        (self.repo / 'a.txt').write_text('topic\n')
+        self.git('commit', '-am', 'topic')
+        result = self.call('init', self.root / 'base', '--cwd', sub)
+        self.assertEqual(result['mode'], 'base')
+        self.assertEqual(result['standingDecisions']['count'], 1)
+
+    def test_standing_decisions_prompts_receipts_and_remove(self):
+        a, b = self.decision(), self.decision(type='triage', body='常設の基準')
+        path = self.repo / '.multi-review/decisions.json'
+        path.parent.mkdir()
+        self.write_json(path, [a, b])
+        (self.repo / 'ja.txt').write_text('日本語の本文\n')
+        self.run = self.root / 'standing-run'
+        self.call('init', self.run, '--cwd', self.repo, '--path', '.', '--ja-review', '--ja-skill', self.ja_skill())
+        before = (self.run / 'decisions.json').read_bytes()
+        self.assertEqual(self.add_decisions([a, b])['ids'], ['D1', 'D2'])
+        self.assertEqual((self.run / 'decisions.json').read_bytes(), before)
+        self.add()
+        for iteration in (1, 2):
+            jobs = self.call('prompts', self.run / f'iter-{iteration}', '--reconsider', 'F1')['reviewers']
+            self.assertTrue(any(j['source'].startswith('ja-review') for j in jobs))
+            for job in jobs:
+                text = Path(job['prompt']).read_text()
+                self.assertIn('出所: プロジェクト', text)
+                self.assertEqual('常設の基準' in text, iteration > 1)
+        saved = path.read_bytes()
+        self.call('decisions', self.run, 'remove', 'D1')
+        self.assertEqual(path.read_bytes(), saved)
+        self.call('decisions', self.run, 'render')
+        self.assertEqual(self.add_decisions(a)['ids'], ['D3'])
+        self.assertNotIn('sources', self.read_json(self.run / 'decisions.json')['decisions'][-1])
+        source = self.root / 'invalid-source.json'
+        self.write_json(source, dict(a, sources=['user']))
+        self.call('decisions', self.run, 'add', '--input', source, code=1)
+        self.assertIn('invalid decision input fields', self.last_stderr)
+        self.call('init', self.root / 'next-run', '--cwd', self.repo, '--path', '.')
+        self.assertEqual(self.read_json(self.root / 'next-run/decisions.json')['decisions'][0]['id'], 'D1')
+        path.write_text('{')
+        self.call('decisions', self.run, 'render')
+        self.call('prompts', self.run / 'iter-2')
+        for sources in ([], ['unknown'], ['user', 'user'], ['project', 'user'], 'user', [False]):
+            value = self.read_json(self.run / 'decisions.json')
+            value['decisions'][0]['sources'] = sources
+            self.write_json(self.run / 'decisions.json', value)
+            self.call('decisions', self.run, 'render', code=1)
+            self.assertIn('invalid decision sources', self.last_stderr)
+
+    def test_standing_decisions_init_save_failures(self):
+        path = self.repo / '.multi-review/decisions.json'
+        path.parent.mkdir()
+        self.write_json(path, self.decision())
+        for name in ('run.json', 'findings.json', 'ledger.md', 'decisions.json', 'decisions.md'):
+            with self.subTest(name=name):
+                root = self.root / ('failure-' + name)
+                self.fail_replacement(root / name, 'init', root, '--cwd', self.repo, '--path', '.')
+                self.assertEqual(set(p.name for p in root.iterdir()), {'.mr.lock'})
+                self.call('init', root, '--cwd', self.repo, '--path', '.')
+                before = {p: p.read_bytes() for p in root.iterdir() if p.is_file()}
+                self.call('init', root, '--cwd', self.repo, '--path', '.', code=1)
+                self.assertEqual({p: p.read_bytes() for p in before}, before)
+
+    def test_standing_decisions_read_error_and_interrupted_init(self):
+        path = self.repo / '.multi-review/decisions.json'
+        path.parent.mkdir()
+        self.write_json(path, self.decision())
+        for failure in ('read', 'interrupt', 'mkdir', 'unexpected', 'render', 'restore'):
+            with self.subTest(failure=failure):
+                root = self.root / failure
+                if failure == 'restore':
+                    root.mkdir()
+                    for name in ('ledger.md', 'decisions.json', 'decisions.md'):
+                        (root / name).write_bytes(b'original ' + name.encode())
+                    (root / 'iter-1').mkdir()
+                    (root / 'iter-1/keep').write_bytes(b'keep')
+                    before = {p: p.read_bytes() for p in root.rglob('*') if p.is_file()}
+                argv = ['mr', 'init', str(root), '--cwd', str(self.repo), '--path', '.']
+                read, save, mkdir = mr.read_json, mr.save_json, mr.Path.mkdir
+                def read_error(target):
+                    if target == path:
+                        raise PermissionError('injected read failure')
+                    return read(target)
+                def failing_save(target, value):
+                    if target == root / 'decisions.json':
+                        if failure == 'restore':
+                            save(target, value)
+                            raise OSError('injected save failure')
+                        if failure == 'unexpected':
+                            raise RuntimeError('injected unexpected failure')
+                        raise KeyboardInterrupt
+                    return save(target, value)
+                def mkdir_error(target, *args, **kwargs):
+                    if target == root / 'iter-1':
+                        raise OSError('injected mkdir failure')
+                    return mkdir(target, *args, **kwargs)
+                if failure == 'render':
+                    self.fake('jev-guard', "import sys\nfrom pathlib import Path\n"
+                              "Path(sys.argv[sys.argv.index('--out')+1]).write_text('partial')\n"
+                              "sys.exit('injected render failure')\n")
+                with patch.object(sys, 'argv', argv), patch.dict(os.environ, self.env), \
+                        patch.object(mr.signal, 'signal'), redirect_stderr(io.StringIO()) as stderr, \
+                        patch.object(mr, 'read_json', read_error if failure == 'read' else read), \
+                        patch.object(mr, 'save_json', failing_save if failure in ('interrupt', 'unexpected', 'restore') else save), \
+                        patch.object(mr.Path, 'mkdir', mkdir_error if failure == 'mkdir' else mkdir):
+                    if failure == 'unexpected':
+                        with self.assertRaisesRegex(RuntimeError, 'injected unexpected failure'):
+                            mr.main()
+                    else:
+                        self.assertEqual(mr.main(), 1)
+                if failure == 'render':
+                    (self.bin / 'jev-guard').unlink()
+                if failure != 'unexpected':
+                    self.assertIn(str(path) if failure == 'read' else
+                                  'interrupted' if failure == 'interrupt' else
+                                  'injected render failure' if failure == 'render' else
+                                  'injected save failure' if failure == 'restore' else
+                                  'injected mkdir failure', stderr.getvalue())
+                if failure == 'restore':
+                    self.assertEqual({p: p.read_bytes() for p in root.rglob('*')
+                                      if p.is_file() and p.name != '.mr.lock'}, before)
+                    self.assertEqual({p.name for p in root.iterdir()},
+                                     {'.mr.lock', 'ledger.md', 'decisions.json', 'decisions.md', 'iter-1'})
+                    self.assertTrue((root / 'iter-1').is_dir())
+                else:
+                    self.assertEqual(set(p.name for p in root.iterdir()), {'.mr.lock'})
+                self.call('init', root, '--cwd', self.repo, '--path', '.')
+
+    def test_standing_decisions_source_metadata_counts_toward_limit(self):
+        path = Path(self.env['XDG_CONFIG_HOME']) / 'multi-review/decisions.json'
+        project = self.repo / '.multi-review/decisions.json'
+        path.parent.mkdir(parents=True)
+        project.parent.mkdir()
+        a = self.decision(type='triage', body='日本語\n次の行')
+        size = len(mr.decisions_markdown({'decisions': [dict(a, id='D1', iteration=1,
+                         sources=['user'])]}, field='問題').encode())
+        for index, (delta, duplicate) in enumerate(((-1, False), (0, False), (1, False), (0, True))):
+            with self.subTest(delta=delta, duplicate=duplicate):
+                item = dict(a, body=a['body'] + 'x' * (mr.DECISIONS_MAX_BYTES - size + delta))
+                self.write_json(path, [item, item])
+                if duplicate:
+                    self.write_json(project, item)
+                root = self.root / f'limit-{index}'
+                self.call('init', root, '--cwd', self.repo, '--path', '.',
+                          code=1 if delta > 0 or duplicate else 0)
+                if delta > 0 or duplicate:
+                    self.assertIn(str(project if duplicate else path) + '[0]', self.last_stderr)
+                    self.assertEqual(set(p.name for p in root.iterdir()), {'.mr.lock'})
+                else:
+                    self.assertEqual(len(self.read_json(root / 'decisions.json')['decisions']), 1)
 
     def test_decisions_add_remove_and_receipts_across_iterations(self):
         self.add()
@@ -296,7 +665,7 @@ with patch.object(subprocess.Popen, 'communicate', communicate):
             self.assertIn('D1（', text)
             self.assertIn('再評価対象に関連する方針', text)
         text = (self.run / 'decisions.md').read_text()
-        self.assertTrue(text.startswith('<!-- mr decisions render で生成。編集は mr decisions add / remove で行う -->'))
+        self.assertTrue(text.startswith('<!-- mr が生成。編集は mr decisions add / remove で行う -->'))
         self.assertNotIn('指摘は出さない', text)
         self.assertLess(text.index('### 方針'), text.index('### 再報告しない基準'))
 
@@ -844,6 +1213,336 @@ print('挨拶' if n==1 else '### 指摘1（重要度: 低）\\n- ファイル: �
         self.call('task', self.iter, '--input', task, code=1)
         self.assertIn('empty delegation task', self.last_stderr)
         self.assertFalse((self.iter / 'task.json').exists())
+
+    def stats_rows(self):
+        path = Path(self.env['XDG_DATA_HOME']) / 'multi-review/runs.jsonl'
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def stats_gate(self, directory=None, code=0):
+        directory = directory or self.iter
+        output = self.call('gate', directory, code=code)
+        self.assertEqual(output, self.read_json(directory / 'gate.json'))
+        return output
+
+    def test_stats_collected_mixed_empty_and_missing(self):
+        patch = '--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+new\n'
+        self.collection_fixture(''.join(self.report(n) for n in (1, 2, 20, '-')), patch)
+        second = self.run / 'iter-2'
+        self.stats_gate(second)
+        row = self.stats_rows()[-1]
+        self.assertEqual(row['collected'], {'total': 4, 'near': 2, 'outside': 1, 'unknown': 1,
+                                           'bySource': {'claude-general': 4}})
+        self.assertEqual((row['reviewId'], row['cwd'], row['mode'], row['profile'], row['iteration']),
+                         (self.run.name, str(self.repo), 'paths', 'default', 2))
+        self.assertRegex(row['recordedAt'], r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|\+00:00)$')
+        self.fake('codex', "import sys\nfrom pathlib import Path\nPath(sys.argv[sys.argv.index('-o')+1]).write_text("
+                  + repr(self.report(1)) + ')')
+        self.collection_fixture(self.report(1), patch)
+        self.stats_gate(second)
+        self.assertEqual(self.stats_rows()[-1]['collected']['bySource'], {'claude-general': 1, 'codex-general': 1})
+        self.fake('codex', "import sys\nfrom pathlib import Path\nPath(sys.argv[sys.argv.index('-o')+1]).write_text('問題なし')")
+        self.collection_fixture('問題なし')
+        self.stats_gate(second)
+        self.assertEqual(self.stats_rows()[-1]['collected'],
+                         {'total': 0, 'near': 0, 'outside': 0, 'unknown': 0, 'bySource': {}})
+        (second / 'collected.json').unlink()
+        self.stats_gate(second)
+        self.assertIsNone(self.stats_rows()[-1]['collected'])
+        self.assertIsNone(self.stats_rows()[-1]['rules'])
+
+    def test_stats_ledger_and_decisions_current_saved_values(self):
+        self.fake_render_guard()
+        for n in range(7):
+            self.add(problem=str(n))
+        self.call('ledger', self.run, 'fix', 'F1', '--iteration', 1, '--summary', 'first')
+        self.call('prompts', self.run / 'iter-2')
+        self.call('ledger', self.run, 'fix', 'F2', 'F3', '--iteration', 2, '--summary', 'second')
+        self.call('ledger', self.run, 'hold', 'F4', '--reason', 'later')
+        self.call('ledger', self.run, 'reject', 'F5', 'F6', '--reason', 'excluded')
+        self.add_decisions([self.decision(), self.decision(type='triage', body='再報告不要')])
+        source = Path(self.env['XDG_CONFIG_HOME']) / 'multi-review/decisions.json'
+        source.parent.mkdir(parents=True)
+        self.write_json(source, self.decision(body='常設'))
+        project = self.repo / '.multi-review/decisions.json'
+        project.parent.mkdir()
+        self.write_json(project, self.decision(body='常設'))
+        other = self.root / 'standing-review'
+        self.call('init', other, '--cwd', self.repo, '--path', '.')
+        self.stats_gate(other / 'iter-1')
+        self.assertEqual(self.stats_rows()[-1]['decisions'], {'policy': 1, 'triage': 0, 'withSources': 1})
+        self.stats_gate(self.run / 'iter-2')
+        self.assertEqual(self.stats_rows()[-1]['ledger'],
+                         {'unresolved': 1, 'fixed': 3, 'on_hold': 1, 'rejected': 2, 'fixedThisIteration': 2})
+        self.assertEqual(self.stats_rows()[-1]['decisions'], {'policy': 1, 'triage': 1, 'withSources': 0})
+        renamed = self.run.with_name('renamed-review')
+        self.run.rename(renamed)
+        self.run = renamed
+        self.iter = self.run / 'iter-1'
+        self.stats_gate()
+        self.assertEqual(self.stats_rows()[-1]['iteration'], 1)
+        self.assertEqual(self.stats_rows()[-1]['ledger']['fixedThisIteration'], 1)
+
+    def test_stats_diff_empty_headers_binary_and_missing(self):
+        for patch, additions, deletions in [('', 0, 0),
+                ('--- a/a\n+++ b/a\n@@ -1 +1 @@\n---old\n+++value\n\\ No newline at end of file\n', 1, 1),
+                ('--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n', 1, 1),
+                ('--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\rvalue\n+new\rvalue\n', 1, 1),
+                ('--- a/a\n+++ b/a\n@@ -1 +1 @@\nx\n', 0, 0),
+                ('--- a/a\n+++ b/a\n@@ -1 +1 @@\n-a\n-b\n', 0, 2),
+                ('--- a/a\n+++ b/a\n@@ -2 +2 @@\n-a\n', 0, 1),
+                ('--- a/a\n+++ b/a\n@@ -1 +1 @@\n-a\n+b\n+extra\n', 1, 1),
+                ('--- a/a\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-a\n-b\n', 0, 2),
+                ('--- /dev/null\n+++ b/a\n@@ -0,0 +1,2 @@\n+a\n+b\n', 2, 0),
+                ('diff --git a/a b/a\nBinary files a/a and b/a differ\n', 0, 0),
+                (b'--- a/a\n+++ b/a\n@@ -1 +1 @@\n-\xff\n+\xfe\n', 1, 1),
+                ('diff --git a/a b/b\nrename from a\nrename to b\n', 0, 0)]:
+            with self.subTest(patch=patch):
+                (self.iter / 'fix.diff').write_bytes(patch if isinstance(patch, bytes) else patch.encode())
+                self.assertIn('statsPath', self.stats_gate())
+                self.assertEqual(self.stats_rows()[-1]['fixDiff'],
+                                 {'additions': additions, 'deletions': deletions, 'empty': not patch})
+        (self.iter / 'fix.diff').unlink()
+        self.stats_gate()
+        self.assertIsNone(self.stats_rows()[-1]['fixDiff'])
+        for body, line, near, additions in [('@@ -1 +1 @@\n-old\n+new\r@@ bad\n', 1, True, 1),
+                ('@@ -1,2 +1,3 @@\n-old\n+new\r context\n+next\n same\n', 8, False, 2)]:
+            with self.subTest(body=body):
+                patch = '--- a/a.py\n+++ b/a.py\n' + body
+                findings = self.collection_fixture(self.report(line), patch)['findings']
+                self.assertIs(findings[0]['nearPreviousFix'], near)
+                self.assertIn('statsPath', self.stats_gate())
+                self.assertEqual(self.stats_rows()[-1]['fixDiff'],
+                                 {'additions': additions, 'deletions': 1, 'empty': False})
+
+    def test_stats_gate_branches_and_repeated_append(self):
+        previous_umask = os.umask(0)
+        try:
+            output = self.stats_gate()
+        finally:
+            os.umask(previous_umask)
+        self.assertEqual(stat.S_IMODE(Path(output['statsPath']).stat().st_mode), 0o600)
+        self.assertEqual(self.stats_rows()[-1]['gate']['next'], 'abort')
+        self.repository()
+        self.call('snapshot', self.iter)
+        self.call('fixdiff', self.iter)
+        self.stats_gate()
+        self.assertEqual(self.stats_rows()[-1]['gate']['next'], 'finish')
+        (self.repo / 'a.txt').write_text('fixed\n')
+        self.call('fixdiff', self.iter)
+        self.stats_gate()
+        self.assertEqual(self.stats_rows()[-1]['gate']['reason'], 'jev-guard not installed')
+        for verdict, code, status in [(self.verdict(reason='oversized', oversized=True), 0, 'evaluated'),
+                ({key: value for key, value in self.verdict(verdict='skippable', reviewPrompt='confirm', oversized=False).items()
+                  if key != 'reason'}, 0, 'evaluated'),
+                ({}, 2, 'awaiting_instruction'), ({}, 1, 'error'), ({}, 0, 'not_performed')]:
+            with self.subTest(status=status, code=code):
+                self.fake_gate(verdict, code)
+                self.stats_gate(code=2 if code == 2 else 0)
+                row = self.stats_rows()[-1]['gate']
+                self.assertEqual(row['status'], status)
+                self.assertEqual(row['oversized'], verdict.get('oversized'))
+                self.assertEqual(row['verdict'], verdict.get('verdict'))
+                self.assertEqual(row['verdictReason'], verdict.get('reason'))
+        self.assertEqual(len(self.stats_rows()), 8)
+        self.fake_gate(self.verdict(oversized='yes'))
+        output = self.stats_gate()
+        self.assertIn('invalid verdict oversized', output['statsError'])
+        self.assertEqual((output['status'], output['next']), ('evaluated', 'caller_decision'))
+        self.assertEqual(len(self.stats_rows()), 8)
+        self.fake_render_guard()
+        self.call('prompts', self.run / 'iter-2')
+        self.call('prompts', self.run / 'iter-3')
+        self.call('prompts', self.run / 'iter-4')
+        self.call('prompts', self.run / 'iter-5')
+        self.stats_gate()
+        self.assertEqual(self.stats_rows()[-1]['gate']['next'], 'limit')
+
+    def test_stats_copy_and_rules_counts(self):
+        (self.repo / 'a').write_text('before\n')
+        self.call('snapshot', self.iter)
+        (self.repo / 'a').write_text('after\n')
+        self.call('fixdiff', self.iter)
+        self.stats_gate()
+        self.assertEqual(self.stats_rows()[-1]['gate']['reason'], 'copy mode')
+        for stdout, count in [('違反候補 3 件 / 2 ファイル、判定不能 0 件\n', 3),
+                              ('候補1\n候補2\n違反候補 2 件 / 1 ファイル、判定不能 0 件\n', 2),
+                              ('違反候補 2 件 / 1 ファイル、判定不能 0 件\n追記', None),
+                              ('{"summary":{"violations":-1}}', None),
+                              ('{"summary":{"violations":0}}', 0),
+                              ('{"summary":{"violations":2.0}}', None),
+                              ('{"summary":[]}', None), ('[]', None),
+                              ('candidate', None), ('{"summary":{"violations":2}}', 2),
+                              ('{"summary":{"violations":true}}', None)]:
+            with self.subTest(stdout=stdout):
+                self.write_json(self.iter / 'rules.json', {'status': 'candidates', 'stdout': stdout})
+                self.stats_gate()
+                self.assertEqual(self.stats_rows()[-1]['rules'], {'status': 'candidates', 'candidates': count})
+
+        self.write_json(self.iter / 'rules.json', {'status': 'not_performed'})
+        self.stats_gate()
+        self.assertEqual(self.stats_rows()[-1]['rules'], {'status': 'not_performed', 'candidates': None})
+
+    def test_stats_corrupt_artifact_and_unwritable_destination(self):
+        for name, contents, message in [
+                ('collected.json', '{', 'Expecting property name'),
+                ('collected.json', b'\xff', 'utf-8'),
+                ('collected.json', '{"findings":{}}', 'invalid collected findings'),
+                ('collected.json', '{"findings":[{"source":"x","nearPreviousFix":1}]}', 'invalid collected findings'),
+                ('collected.json', 'null', 'invalid stats artifact: collected.json'),
+                ('collected.json', '{"findings":[],"findings":[]}', 'duplicate JSON key'),
+                ('collected.json', '{"findings":[[]]}', 'invalid collected findings'),
+                ('collected.json', '{"findings":[{"source":"x"}]}', 'invalid collected findings'),
+                ('rules.json', '{"status":1}', 'invalid rules stats'),
+                ('rules.json', '{"status":"clear","stdout":[]}', 'invalid rules stats'),
+                ('decisions.json', '[]', 'invalid decisions fields or identity'),
+                ('decisions.json', '{"reviewId":"other","decisions":[]}', 'invalid decisions fields or identity'),
+                ('findings.json', '{}', 'invalid ledger fields'),
+                ('fix.diff', '--- a/a\n+++ b/a\n@@ bad @@\n', 'invalid diff hunk')]:
+            with self.subTest(name=name, contents=contents):
+                path = (self.run if name in ('decisions.json', 'findings.json') else self.iter) / name
+                original = path.read_bytes() if path.exists() else None
+                path.write_bytes(contents if isinstance(contents, bytes) else contents.encode())
+                try:
+                    output = self.stats_gate()
+                    self.assertIn(message, output['statsError'])
+                    if name == 'collected.json' and contents in ('{', b'\xff'):
+                        self.assertIn(str(path), output['statsError'])
+                    self.assertNotIn('statsPath', output)
+                    self.assertEqual(self.stats_rows(), [])
+                finally:
+                    if original is None:
+                        path.unlink()
+                    else:
+                        path.write_bytes(original)
+        for name in ('collected.json', 'fix.diff', 'decisions.json'):
+            with self.subTest(link=name):
+                path = (self.run if name == 'decisions.json' else self.iter) / name
+                path.symlink_to(self.root / 'missing')
+                try:
+                    output = self.stats_gate()
+                    self.assertIn(str(path), output['statsError'])
+                    self.assertNotIn('statsPath', output)
+                    self.assertEqual(self.stats_rows(), [])
+                    if name == 'decisions.json':
+                        for args in [('decisions', self.run, 'render'), ('prompts', self.iter)]:
+                            with self.subTest(command=args[0]):
+                                self.call(*args, code=1)
+                                self.assertIn(str(path), self.last_stderr)
+                finally:
+                    path.unlink()
+        self.ready_diff()
+        self.fake_gate({}, code=2)
+        Path(self.env['XDG_DATA_HOME']).write_text('not a directory')
+        output = self.stats_gate(code=2)
+        self.assertIn('Not a directory', output['statsError'])
+        self.assertEqual(output['next'], 'awaiting_instruction')
+        Path(self.env['XDG_DATA_HOME']).unlink()
+        path = Path(self.env['XDG_DATA_HOME']) / 'multi-review/runs.jsonl'
+        path.mkdir(parents=True)
+        output = self.stats_gate(code=2)
+        self.assertIn('Is a directory', output['statsError'])
+        self.assertNotIn('statsPath', output)
+        self.assertEqual(output['next'], 'awaiting_instruction')
+
+    def test_stats_disabled_never_touches_destination(self):
+        Path(self.env['XDG_DATA_HOME']).write_text('not a directory')
+        self.env['MR_NO_STATS'] = '1'
+        output = self.stats_gate()
+        self.assertNotIn('statsError', output)
+        self.assertNotIn('statsPath', output)
+        self.assertEqual(output['next'], 'abort')
+        Path(self.env['XDG_DATA_HOME']).unlink()
+        for value in ('true', ''):
+            with self.subTest(value=value):
+                self.env['MR_NO_STATS'] = value
+                self.assertIn('statsPath', self.stats_gate())
+        self.assertEqual(len(self.stats_rows()), 2)
+
+    def test_stats_xdg_fallback_and_unresolvable_home(self):
+        fallback = Path(self.env['HOME']) / '.local/share/multi-review/runs.jsonl'
+        for xdg in (None, '', 'relative'):
+            with self.subTest(xdg=xdg):
+                if xdg is None:
+                    self.env.pop('XDG_DATA_HOME', None)
+                else:
+                    self.env['XDG_DATA_HOME'] = xdg
+                output = self.stats_gate()
+                self.assertEqual(output['statsPath'], str(fallback))
+        self.assertEqual(len(fallback.read_text().splitlines()), 3)
+        for home in ('relative', ''):
+            with self.subTest(home=home):
+                self.env['HOME'] = home
+                self.assertIn('cannot resolve an absolute home directory', self.stats_gate()['statsError'])
+        self.assertEqual(len(fallback.read_text().splitlines()), 3)
+        self.env.pop('HOME')
+        launcher = """import pwd,runpy,sys
+from unittest.mock import patch
+sys.argv = sys.argv[1:]
+with patch.object(pwd, 'getpwuid', side_effect=KeyError('no home')):
+    runpy.run_path(sys.argv[0], run_name='__main__')
+"""
+        result = subprocess.run([sys.executable, '-c', launcher, str(CLI), 'gate', str(self.iter)],
+                                env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('cannot resolve an absolute home directory', json.loads(result.stdout)['statsError'])
+
+    def test_stats_write_failure_short_write_and_gate_save_failure(self):
+        self.ready_diff()
+        self.fake_gate({}, code=2)
+        launcher = """import sys
+from unittest.mock import patch
+sys.path.insert(0, sys.argv.pop(1))
+import mr
+kind = sys.argv.pop(1)
+def write(fd, data):
+    if kind == 'short':
+        return len(data) - 1
+    raise OSError('injected stats write failure')
+with patch.object(mr.os, 'write', write):
+    sys.exit(mr.main())
+"""
+        for kind in ('short', 'error'):
+            with self.subTest(kind=kind):
+                result = subprocess.run([sys.executable, '-c', launcher, str(CLI.parent), kind,
+                                         'gate', str(self.iter)], env=self.env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                output = json.loads(result.stdout)
+                self.assertEqual(output, self.read_json(self.iter / 'gate.json'))
+                self.assertIn('short stats write' if kind == 'short' else 'injected stats write failure', output['statsError'])
+                self.assertNotIn('statsPath', output)
+                self.assertEqual(output['next'], 'awaiting_instruction')
+        self.fail_replacement(self.iter / 'gate.json', 'gate', self.iter)
+        self.assertEqual(len(self.stats_rows()), 1)
+        self.assertEqual(self.stats_rows()[0]['gate']['status'], 'awaiting_instruction')
+
+    def test_stats_handler_preconditions_and_missing_artifacts(self):
+        self.add_decisions(self.decision())
+        ledger = (self.run / 'findings.json').read_bytes()
+        (self.run / 'findings.json').unlink()
+        output = self.stats_gate()
+        self.assertIn('findings.json', output['statsError'])
+        self.assertEqual(self.stats_rows(), [])
+        (self.run / 'findings.json').write_bytes(ledger)
+        original = (self.run / 'decisions.json').read_bytes()
+        value = self.read_json(self.run / 'decisions.json')
+        value['decisions'][0]['body'] = 1
+        self.write_json(self.run / 'decisions.json', value)
+        self.assertIn('invalid decision strings', self.stats_gate()['statsError'])
+        (self.run / 'decisions.json').unlink()
+        self.assertIn('import receipt without decision', self.stats_gate()['statsError'])
+        (self.run / 'decisions.json').write_bytes(original)
+        self.call('decisions', self.run, 'remove', 'D1')
+        (self.run / 'decisions.json').unlink()
+        output = self.stats_gate()
+        self.assertIn('statsPath', output)
+        self.assertEqual(self.stats_rows()[-1]['decisions'], {'policy': 0, 'triage': 0, 'withSources': 0})
+        self.call('gate', self.run / 'iter-6', code=1)
+        with (self.run / '.mr.lock').open('a') as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX)
+            self.call('gate', self.iter, code=1)
+        (self.run / 'run.json').write_text('{}')
+        self.call('gate', self.iter, code=1)
+        self.assertEqual(len(self.stats_rows()), 1)
 
     def test_gate_eligibility_and_api_key_wait(self):
         self.ready_diff()
@@ -3322,6 +4021,8 @@ print('問題なし')
                     self.assertIn('timed out', output['reason'])
                     if command == 'gate':
                         self.assertEqual(output['next'], 'rereview')
+                        self.assertIn('statsPath', output)
+                        self.assertEqual(self.stats_rows()[-1]['gate']['next'], 'rereview')
                     self.assertEqual((self.iter / (command + '.stdout.log')).read_text(), 'started\n')
                 marker = (self.run if command == 'ledger' else self.repo) / 'guard-child'
                 pid = marker.read_text()

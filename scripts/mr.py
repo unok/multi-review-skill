@@ -5,6 +5,7 @@ import ast
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import fcntl
 from fractions import Fraction
@@ -68,6 +69,7 @@ DECISIONS_FILE = 'decisions.json'
 DECISIONS_MD_FILE = 'decisions.md'
 DECISIONS_MAX_BYTES = 8192
 DECISION_TYPES = {'policy': '方針', 'triage': '再報告しない基準'}
+DECISION_SOURCES = {'user': '利用者共通', 'project': 'プロジェクト'}
 STATUS_AWAITING = 'awaiting_instruction'
 NO_LINE_MARK = '［行なし］'
 NO_VALUE_MARK = '［初期値なし］'
@@ -90,6 +92,7 @@ DOWNSTREAM = {'inventory': (INVENTORY_FILE, INVENTORY_JSON_FILE),
 SECTION_RISK_THRESHOLD = .5
 DIFF_OPTIONS = ('--no-ext-diff', '--no-textconv', '--no-color',
                 '--src-prefix=a/', '--dst-prefix=b/')
+DIFF_HUNK = re.compile(r'@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@.*')
 JOB_MODELS = {
     'default': {'claude': {'general': ('claude-opus-5-5', 'medium'),
                            'specialist': ('claude-opus-5-5', 'high')},
@@ -100,6 +103,7 @@ JOB_MODELS = {
     # Model copied from ~/.claude/skills/ja-review/SKILL.md, 2026-11-10.
     'ja-review': {'agy': {'general': ('gemini-3.8-flash-high', None)}},
 }
+RULES_STATUSES = {name: name for name in ('clear', 'candidates', 'error', 'not_performed')}
 STATES = ('unresolved', 'fixed', 'on_hold', 'rejected')
 LABELS = ('未解決', '修正済み', '保留', '却下')
 FIELDS = {'id', 'severity', 'source', 'file', 'line', 'problem', 'fixSummary',
@@ -422,7 +426,13 @@ def validate_decisions(value, ledger, run):
     for item in value['decisions']:
         require(isinstance(item, dict) and
                 {'id', 'type', 'body', 'reason', 'iteration'} <= set(item) <=
-                {'id', 'type', 'body', 'reason', 'iteration', 'findingIds'}, 'invalid decision fields')
+                {'id', 'type', 'body', 'reason', 'iteration', 'findingIds', 'sources'}, 'invalid decision fields')
+        if 'sources' in item:
+            sources = item['sources']
+            require(isinstance(sources, list) and sources and
+                    all(isinstance(source, str) and source in DECISION_SOURCES for source in sources) and
+                    sources == [source for source in DECISION_SOURCES if source in sources],
+                    'invalid decision sources')
         require(nonempty(item['id']) and re.fullmatch(r'D[1-9]\d*', item['id']) and
                 item['id'] not in seen, 'invalid or duplicate decision ID')
         seen.add(item['id'])
@@ -440,7 +450,7 @@ def validate_decisions(value, ledger, run):
 
 def load_decisions(root, ledger, run):
     path = root / DECISIONS_FILE
-    value = read_json(path) if path.exists() else {'reviewId': ledger['reviewId'], 'decisions': []}
+    value = read_json(path) if path.exists() or path.is_symlink() else {'reviewId': ledger['reviewId'], 'decisions': []}
     return validate_decisions(value, ledger, run)
 
 
@@ -455,6 +465,8 @@ def decisions_markdown(value, iteration=None, field=None, reconsider=()):
                                         set(item.get('findingIds', [])) & set(reconsider)):
                 continue
             metadata = f"記録: iter-{item['iteration']}"
+            if item.get('sources'):
+                metadata += '、出所: ' + '・'.join(DECISION_SOURCES[s] for s in item['sources'])
             if item.get('findingIds'):
                 metadata += '、関連: ' + ', '.join(item['findingIds'])
             body = item['body'].replace('\n', '\n  ')
@@ -493,6 +505,78 @@ def save_decisions_and_run(root, value, run):
         raise
 
 
+def add_decision(raw, value, ledger, run, source=None):
+    allowed = {'type', 'body', 'reason'} | ({'findingIds'} if source is None else set())
+    require(isinstance(raw, dict) and {'type', 'body', 'reason'} <= set(raw) <= allowed,
+            'invalid decision input fields')
+    item = dict(raw)
+    require(nonempty(item['type']) and item['type'] in DECISION_TYPES and
+            all(nonempty(item[key]) for key in ('body', 'reason')), 'invalid decision strings')
+    links = item.get('findingIds', [])
+    require(isinstance(links, list) and all(nonempty(link) for link in links) and
+            set(links) <= {i['id'] for i in ledger['findings']}, 'invalid decision findingIds')
+    item['findingIds'] = sorted(set(links), key=lambda link: tuple(
+        (1, int(p)) if p.isdecimal() else (0, p) for p in re.split(r'(\d+)', link)))
+    receipt = digest(json.dumps(item, sort_keys=True).encode())
+    previous_id = run.get('decisionImports', {}).get(receipt)
+    if previous_id:
+        if source:
+            previous = next(i for i in value['decisions'] if i['id'] == previous_id)
+            previous['sources'] = [s for s in DECISION_SOURCES
+                                   if s in {*previous.get('sources', []), source}]
+        return previous_id
+    run['decisionSequence'] = run.get('decisionSequence', 0) + 1
+    item.update(id='D' + str(run['decisionSequence']), iteration=ledger['iteration'])
+    if source:
+        item['sources'] = [source]
+    value['decisions'].append(item)
+    run.setdefault('decisionImports', {})[receipt] = item['id']
+    return item['id']
+
+
+def xdg_home(variable, fallback):
+    path = Path(os.environ.get(variable) or '')
+    if path.is_absolute():
+        return path
+    # Python 3.12+ の Path.home() は空の HOME で / を返すため、先に除外する。
+    if os.environ.get('HOME') == '':
+        return None
+    try:
+        home = Path.home()
+    except RuntimeError:
+        return None
+    return home / fallback if home.is_absolute() else None
+
+
+def standing_decisions(cwd, value, ledger, run, disabled):
+    result = {'count': 0, 'sources': []}
+    if disabled:
+        return result
+    config = xdg_home('XDG_CONFIG_HOME', '.config')
+    paths = (config / 'multi-review' / DECISIONS_FILE if config else None,
+             cwd / '.multi-review' / DECISIONS_FILE)
+    for source, path in zip(DECISION_SOURCES, paths):
+        if path is None or (not path.exists() and not path.is_symlink()):
+            continue
+        try:
+            incoming = read_json(path)
+        except EXPECTED_ERRORS as error:
+            raise Failure(display_path(str(path)) + ': ' + str(error)) from error
+        ids = []
+        for index, raw in enumerate(incoming if isinstance(incoming, list) else [incoming]):
+            try:
+                decision_id = add_decision(raw, value, ledger, run, source)
+                bounded_decisions_markdown(value)
+            except EXPECTED_ERRORS as error:
+                raise Failure(display_path(str(path)) + f'[{index}]: ' + str(error)) from error
+            if decision_id not in ids:
+                ids.append(decision_id)
+        result['sources'].append({'source': source, 'path': str(path),
+                                  'ids': sorted(ids, key=lambda item: int(item[1:]))})
+    result['count'] = len({item for source in result['sources'] for item in source['ids']})
+    return result
+
+
 def decisions_action(args, root, run):
     ledger = load_ledger(root)
     value = load_decisions(root, ledger, run)
@@ -503,25 +587,7 @@ def decisions_action(args, root, run):
         require(args.input is not None, '--input required for add')
         incoming = read_json(args.input)
         incoming = incoming if isinstance(incoming, list) else [incoming]
-        for raw in incoming:
-            require(isinstance(raw, dict) and {'type', 'body', 'reason'} <= set(raw) <=
-                    {'type', 'body', 'reason', 'findingIds'}, 'invalid decision input fields')
-            item = dict(raw)
-            links = item.get('findingIds', [])
-            require(isinstance(links, list) and all(nonempty(link) for link in links) and
-                    set(links) <= {i['id'] for i in ledger['findings']}, 'invalid decision findingIds')
-            item['findingIds'] = sorted(set(links), key=lambda link: tuple(
-                (1, int(p)) if p.isdecimal() else (0, p) for p in re.split(r'(\d+)', link)))
-            receipt = digest(json.dumps(item, sort_keys=True).encode())
-            previous_id = run.get('decisionImports', {}).get(receipt)
-            if previous_id:
-                ids.append(previous_id)
-                continue
-            run['decisionSequence'] = run.get('decisionSequence', 0) + 1
-            item.update(id='D' + str(run['decisionSequence']), iteration=ledger['iteration'])
-            value['decisions'].append(item)
-            run.setdefault('decisionImports', {})[receipt] = item['id']
-            ids.append(item['id'])
+        ids = [add_decision(raw, value, ledger, run) for raw in incoming]
     elif args.action == 'remove':
         require(args.ids, 'decision IDs required')
         require(set(args.ids) <= {i['id'] for i in value['decisions']}, 'unknown decision ID')
@@ -532,11 +598,15 @@ def decisions_action(args, root, run):
     text = bounded_decisions_markdown(value) or '決定事項なし\n'
     if args.action != 'render':
         save_decisions_and_run(root, value, run)
+    render_decisions(root, text)
+    return {'ids': ids}
+
+
+def render_decisions(root, text):
     output = root / DECISIONS_MD_FILE
     # 書き込み失敗時に保存済み JSON と異なる決定を渡さないよう、古い Markdown を削除する。
     output.unlink(missing_ok=True)
-    write_atomic(output, '<!-- mr decisions render で生成。編集は mr decisions add / remove で行う -->\n' + text)
-    return {'ids': ids}
+    write_atomic(output, '<!-- mr が生成。編集は mr decisions add / remove で行う -->\n' + text)
 
 
 def safe_relative(cwd, name):
@@ -876,16 +946,35 @@ def init(args, root, run):
     run['baseSummary'] = args.base_summary or f'{mode}: {branch}, {scope}; {len(scope_files(run))} files'
     enabled = set(REVIEWERS) if args.ja_review else set(REVIEWERS) - {'ja-review'}
     require(enabled - excluded, 'all reviewers excluded')
+    ledger = {'reviewId': root.name, 'iteration': 1, 'findings': []}
+    value = {'reviewId': root.name, 'decisions': []}
+    imported = standing_decisions(cwd, value, ledger, run, args.no_standing_decisions)
+    names = [RUN_FILE, LEDGER_FILE, LEDGER_MD_FILE, 'ledger.render.md']
+    if imported['count']:
+        names.extend((DECISIONS_FILE, DECISIONS_MD_FILE))
+    originals = {root / name: (root / name).read_bytes() if (root / name).exists() else None
+                 for name in names}
+    directory = iteration_dir(root, 1)
+    existed = directory.exists()
     try:
         save_json(root / RUN_FILE, run)
-        save_json(root / LEDGER_FILE, {'reviewId': root.name, 'iteration': 1, 'findings': []})
-        render(root, load_ledger(root))
-        iteration_dir(root, 1).mkdir(exist_ok=True)
-    except EXPECTED_ERRORS:
-        for name in (RUN_FILE, LEDGER_FILE, LEDGER_MD_FILE):
-            (root / name).unlink(missing_ok=True)
+        save_json(root / LEDGER_FILE, ledger)
+        render(root, ledger)
+        if imported['count']:
+            validate_decisions(value, ledger, run)
+            save_json(root / DECISIONS_FILE, value)
+            render_decisions(root, bounded_decisions_markdown(value))
+        directory.mkdir(exist_ok=True)
+    except BaseException:
+        for path, original in originals.items():
+            if original is None:
+                path.unlink(missing_ok=True)
+            else:
+                write_atomic(path, original)
+        if not existed and directory.is_dir():
+            directory.rmdir()
         raise
-    return run
+    return dict(run, standingDecisions=imported)
 
 
 def report_format():
@@ -1019,19 +1108,22 @@ def diff_header_path(raw, prefix):
     return name[2:] if name.startswith(prefix) else name
 
 
-def changed_lines(patch, *, additions_only=False):
-    """Track hunk counts so body lines cannot become file headers."""
-    changed, binary = {}, set()
+def diff_lines(patch):
+    """Yield (path, line, kind) with the new filename (old for a deleted file).
+
+    kind is '+', '-', 'header', or 'binary'. line is the new-side line number
+    (at least 1), including for '-'; header and binary use 0.
+    Track hunk counts so body lines cannot become file headers.
+    """
     path = old_path = None
     line, old_left, new_left = 0, 0, 0
     for raw in patch.split('\n'):
         if old_left or new_left:
             if raw.startswith('+'):
-                changed[path].add(max(1, line))
+                yield path, max(1, line), '+'
                 line, new_left = line + 1, new_left - 1
             elif raw.startswith('-'):
-                if not additions_only:
-                    changed[path].add(max(1, line))
+                yield path, max(1, line), '-'
                 old_left -= 1
             elif raw.startswith(' '):
                 line, old_left, new_left = line + 1, old_left - 1, new_left - 1
@@ -1061,7 +1153,7 @@ def changed_lines(patch, *, additions_only=False):
             path = diff_header_path(raw, 'b/')
             if path == '/dev/null':
                 path = old_path
-            changed.setdefault(path, set())
+            yield path, 0, 'header'
         elif raw.startswith(('Binary files ', 'GIT binary patch')):
             if raw.startswith('Binary files '):
                 match = re.fullmatch(r'Binary files ("(?:[^"\\]|\\.)*"|\S+) and ("(?:[^"\\]|\\.)*"|\S+) differ', raw)
@@ -1072,13 +1164,24 @@ def changed_lines(patch, *, additions_only=False):
                     elif new == '/dev/null' and old.startswith('a/'):
                         path = old[2:]
             require(path is not None, 'cannot locate binary diff')
-            binary.add(path)
+            yield path, 0, 'binary'
         elif raw.startswith('@@ '):
-            match = re.fullmatch(r'@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@.*', raw)
+            match = DIFF_HUNK.fullmatch(raw)
             require(match is not None and path is not None, 'invalid diff hunk')
             old_left = int(match[1]) if match[1] is not None else 1
             line = int(match[2])
             new_left = int(match[3]) if match[3] is not None else 1
+
+
+def changed_lines(patch, *, additions_only=False):
+    changed, binary = {}, set()
+    for path, line, kind in diff_lines(patch):
+        if kind == 'binary':
+            binary.add(path)
+        elif kind == 'header':
+            changed.setdefault(path, set())
+        elif kind == '+' or (kind == '-' and not additions_only):
+            changed[path].add(line)
     return changed, binary
 
 
@@ -1544,7 +1647,8 @@ def collect(args, root, run):
         previous = iteration_dir(directory.parent, iteration - 1)
         try:
             valid_diff(previous)
-            changes, binary = changed_lines((previous / FIX_DIFF_FILE).read_text(encoding='utf-8', errors='replace'))
+            # read_text の改行変換で単独の CR が行区切りになるのを避ける。
+            changes, binary = changed_lines((previous / FIX_DIFF_FILE).read_bytes().decode('utf-8', errors='replace'))
             previous_valid = True
         except EXPECTED_ERRORS:
             # A failed regeneration cannot supply reliable proximity information.
@@ -1659,8 +1763,9 @@ def rules(args, root, run):
                 'stale delegation task')
         result = guard_command(['jev-guard', 'rules', '--diff', str(directory / FIX_DIFF_FILE),
                                 '--task', str(directory / 'fix-task.md')], run['cwd'], directory, 'rules')
-        output = {'status': 'clear' if result.returncode == 0 else 'candidates' if result.returncode == EXIT_CANDIDATES
-                  else 'error', **process_fields(result)}
+        output = {'status': RULES_STATUSES['clear'] if result.returncode == 0 else
+                  RULES_STATUSES['candidates'] if result.returncode == EXIT_CANDIDATES else
+                  RULES_STATUSES['error'], **process_fields(result)}
     except EXPECTED_ERRORS as error:
         output = not_performed(str(error))
     save_json(directory / 'rules.json', output)
@@ -1733,6 +1838,102 @@ def evaluate_verdict(verdict):
             'grounds': grounds, 'next': NEXT['caller_decision']}
 
 
+def diff_stats(patch):
+    counts = Counter(kind for _, _, kind in diff_lines(patch))
+    return {'additions': counts['+'], 'deletions': counts['-'], 'empty': not patch}
+
+
+def rules_candidates(output):
+    try:
+        value = parse_json(output)
+    except EXPECTED_ERRORS:
+        # rules は非 JSON 出力も保存するため jev-guard の末尾要約を読む。形式変更時は None。
+        match = re.search(r'^違反候補 (\d+) 件 / \d+ ファイル、判定不能 \d+ 件\s*\Z', output, re.M)
+        return int(match[1]) if match else None
+    summary = value.get('summary') if isinstance(value, dict) else None
+    count = summary.get('violations') if isinstance(summary, dict) else None
+    return count if type(count) is int and count >= 0 else None
+
+
+def run_stats(root, directory, run, output):
+    iteration = iteration_number(directory)
+    result = dict(reviewId=root.name, cwd=run['cwd'], mode=run['mode'], profile=run['profile'],
+                  iteration=iteration, recordedAt=datetime.now(timezone.utc).isoformat(),
+                  collected=None, fixDiff=None, rules=None)
+    path = root / LEDGER_FILE
+    try:
+        ledger = load_ledger(root)
+        path = root / DECISIONS_FILE
+        decisions = load_decisions(root, ledger, run)
+    except EXPECTED_ERRORS as error:
+        raise Failure(display_path(str(path)) + ': ' + str(error)) from error
+    values = {}
+    for key, path in [('collected', directory / 'collected.json'), ('rules', directory / 'rules.json')]:
+        # 壊れたリンクも、不存在として黙って落とさず読み取り失敗にする。
+        values[key] = None
+        try:
+            if path.exists() or path.is_symlink():
+                values[key] = read_json(path)
+                require(isinstance(values[key], dict), 'invalid stats artifact: ' + path.name)
+        except EXPECTED_ERRORS as error:
+            raise Failure(display_path(str(path)) + ': ' + str(error)) from error
+    collected = values['collected']
+    if collected is not None:
+        findings = collected.get('findings')
+        require(isinstance(findings, list) and all(isinstance(i, dict) and nonempty(i.get('source')) and
+                'nearPreviousFix' in i and (i['nearPreviousFix'] is None or type(i['nearPreviousFix']) is bool)
+                for i in findings), 'invalid collected findings')
+        result['collected'] = dict(total=len(findings), near=sum(i['nearPreviousFix'] is True for i in findings),
+                                  outside=sum(i['nearPreviousFix'] is False for i in findings),
+                                  unknown=sum(i['nearPreviousFix'] is None for i in findings),
+                                  bySource=dict(Counter(i['source'] for i in findings)))
+    result['ledger'] = {state: sum(i['status'] == state for i in ledger['findings']) for state in STATES}
+    result['ledger']['fixedThisIteration'] = sum(i.get('fixedIteration') == iteration for i in ledger['findings'])
+    result['decisions'] = {kind: sum(i['type'] == kind for i in decisions['decisions']) for kind in DECISION_TYPES}
+    result['decisions']['withSources'] = sum(bool(i.get('sources')) for i in decisions['decisions'])
+    rules = values['rules']
+    if rules is not None:
+        require(isinstance(rules.get('status'), str) and rules['status'] in
+                RULES_STATUSES and
+                ('stdout' not in rules or isinstance(rules['stdout'], str)), 'invalid rules stats')
+        result['rules'] = dict(status=rules['status'], candidates=rules_candidates(rules.get('stdout', '')))
+    path = directory / FIX_DIFF_FILE
+    if path.exists() or path.is_symlink():
+        try:
+            # read_text の改行変換で単独の CR が行区切りになるのを避ける。
+            result['fixDiff'] = diff_stats(path.read_bytes().decode('utf-8', errors='replace'))
+        except EXPECTED_ERRORS as error:
+            raise Failure(display_path(str(path)) + ': ' + str(error)) from error
+    verdict = output.get('verdict', {})
+    require('oversized' not in verdict or type(verdict['oversized']) is bool, 'invalid verdict oversized')
+    result['gate'] = {key: output.get(key) for key in ('status', 'next', 'reason')}
+    result['gate'].update(verdict=verdict.get('verdict'), verdictReason=verdict.get('reason'),
+                          oversized=verdict.get('oversized'))
+    return result
+
+
+def save_gate(root, directory, run, output):
+    if os.environ.get('MR_NO_STATS') != '1':
+        try:
+            record = run_stats(root, directory, run, output)
+            data_home = xdg_home('XDG_DATA_HOME', '.local/share')
+            require(data_home is not None, 'cannot resolve an absolute home directory for stats')
+            path = data_home / 'multi-review/runs.jsonl'
+            data = (json.dumps(record, separators=(',', ':')) + '\n').encode('utf-8')
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # 並行するレビューの行が混ざらないよう、置換やロックを使わず O_APPEND で1回書く。
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                require(os.write(fd, data) == len(data), 'short stats write')
+            finally:
+                os.close(fd)
+            output['statsPath'] = str(path)
+        except EXPECTED_ERRORS as error:
+            output['statsError'] = str(error)
+    save_json(directory / 'gate.json', output)
+    return output
+
+
 def gate(args, root, run):
     directory = args.directory.resolve()
     (directory / 'gate.json').unlink(missing_ok=True)
@@ -1740,8 +1941,7 @@ def gate(args, root, run):
         state = valid_diff(directory)
     except EXPECTED_ERRORS as error:
         output = not_performed(str(error), next=NEXT['abort'])
-        save_json(directory / 'gate.json', output)
-        return output
+        return save_gate(root, directory, run, output)
     try:
         ledger = load_ledger(root)
         if state['mode'] == 'tree' and state['empty']:
@@ -1769,8 +1969,7 @@ def gate(args, root, run):
                 output = evaluate_verdict(verdict)
     except EXPECTED_ERRORS as error:
         output = not_performed(str(error), next=NEXT['rereview'])
-    save_json(directory / 'gate.json', output)
-    return output
+    return save_gate(root, directory, run, output)
 
 
 def inventory_entry(name, node):
@@ -2300,6 +2499,7 @@ def parser():
     init_parser.add_argument('--exclude', choices=REVIEWERS, action='append', default=[])
     init_parser.add_argument('--only', choices=REVIEWERS, action='append', default=[])
     init_parser.add_argument('--ja-review', action='store_true')
+    init_parser.add_argument('--no-standing-decisions', action='store_true')
     init_parser.add_argument('--ja-skill', type=Path, default=Path('~/.claude/skills/ja-review'))
     init_parser.add_argument('--diff-budget', type=int, default=DIFF_BUDGET)
     init_parser.add_argument('--timeout', type=float, default=REVIEW_TIMEOUT)

@@ -9,7 +9,7 @@
 
 | コマンド・引数 | 入出力・契約 |
 | --- | --- |
-| `mr init R --cwd PATH [--path PATH]... [--profile default\|codex] [--roles SLUG,...] [--exclude CLI]... [--only CLI]... [--ja-review] [--ja-skill PATH] [--base-summary TEXT]` | `run.json`、空の `findings.json`・`ledger.md`、`iter-1/`。対象省略なら未コミット変更→デフォルトブランチとの差分。デフォルトブランチは origin/HEAD→main→master。空範囲・未検出・非 git の対象省略・複数リポジトリは中断。`--cwd` は必須、パスはそこから解釈する。対象の1行要約は `--base-summary` で保存し、省略時はブランチ名・比較元または指定パス・ファイル数を使う |
+| `mr init R --cwd PATH [--path PATH]... [--profile default\|codex] [--roles SLUG,...] [--exclude CLI]... [--only CLI]... [--ja-review] [--ja-skill PATH] [--base-summary TEXT] [--no-standing-decisions]` | `run.json`、空の `findings.json`・`ledger.md`、`iter-1/`。常設の決定事項を取り込む（停止は `--no-standing-decisions`、「決定事項」を参照）。対象省略なら未コミット変更→デフォルトブランチとの差分。デフォルトブランチは origin/HEAD→main→master。空範囲・未検出・非 git の対象省略・複数リポジトリは中断。`--cwd` は必須、パスはそこから解釈する。対象の1行要約は `--base-summary` で保存し、省略時はブランチ名・比較元または指定パス・ファイル数を使う |
 | `mr prompts I [--roles SLUG,...] [--reconsider F1,F2,...] [--ja-review\|--no-ja-review]` | 正本から `*.prompt.md`、`target.json`、`prompts.json` を生成。巨大差分は `target.diff`。次のイテレーションの準備と台帳の iteration 更新も担当。役割変更・再評価・ja-review 実行の判断を引数で渡す |
 | `mr review I` | 呼び出し元がバックグラウンドで起動する。mr は全レビュアーの完了まで待つ。同時実行は最大8ジョブ。生成済みプロンプトで並列実行し、既存名の出力・試行別 stdout/stderr・`review.json` を保存。全レビュアー失敗なら終了1。一部欠席は結果に残して続行 |
 | `mr collect I` | 完了した成功出力だけを解析し、位置順の `collected.json`・`collected.md` を生成。意味による重複統合・選別・台帳登録はしない |
@@ -26,7 +26,7 @@
 | `mr decisions R remove ID...` | 指定した決定事項を削除し、`decisions.md` を生成。未知 ID があれば全件未削除 |
 | `mr decisions R render` | `decisions.json` から `decisions.md` を生成。jev-guard は使わない |
 | `mr rules I` | 条件確認・実行後、`rules.json` と生出力を保存。候補の妥当性は呼び出し元が確かめる |
-| `mr gate I` | `gate.json` と生出力。必要フィールドと型、覆せる形式条件 `overruleEligible`、反証対象 `grounds` までを返す。反証・ダブルチェック・record は行わない |
+| `mr gate I` | `gate.json` と生出力。必要フィールドと型、覆せる形式条件 `overruleEligible`、反証対象 `grounds` までを返し、実行統計を1行追記する。反証・ダブルチェック・record は行わない |
 
 終了コードは 0＝処理完了（規定の未実施・一部欠席を含む）、1＝生成・保存・データ不正 / 全レビュアー失敗、2＝引数形式不正またはゲートの API キー未設定による指示待ち、10＝rules の候補あり。0 だけでゲート採用や検査済みと判断せず、JSON の `status`・`reason` を読む。
 `run.json` は実行条件の保存先で、台帳スキーマには含めない。`diffBudget` の既定は200000 bytes、超過時も全文を保存する。`timeout` は600秒、`jaTimeout` は1800秒で、いずれも `init` の同名 kebab-case オプションで設定できる。差分の上限は正の整数、時間制限は正の有限数とする。`--roles` 省略時は `pattern-consistency,naming-symmetry`（既存実装との一貫性・命名の対称性）、空文字なら専門役割なし。役割・プロファイル・除外は次のイテレーションに引き継ぐ。
@@ -158,9 +158,9 @@ multi-review は呼び出し元が実施するので実行しない。
 
 行不明の入力は `line: null` または `"-"` とし、`mr` が `line: 1` と problem 先頭の「［行なし］」へ変換する。collect では行不明を保持する。選別後の入力には上記フィールドだけを使い、collect の raw・suggestion・locations・近傍情報は台帳に転記しない。
 
-## 決定事項 `decisions.json`（Step 5・6・7）
+## 決定事項 `decisions.json`（Step 2・5・6・7・8）
 
-呼び出し元が決めた方針と再報告しない基準の正本。R 直下に保存し、台帳のフィールドは増やさない。台帳と同じく1回の実行内だけで使い、コミットしない。未作成なら決定事項なしとして扱い、壊れたファイルはエラーにする。
+呼び出し元が決めた方針と再報告しない基準の正本。R 直下に保存し、台帳のフィールドは増やさない。常設入力から取り込んだものも含め、この正本は1回の実行内で使い、コミットしない。未作成なら決定事項なしとして扱い、壊れたファイルはエラーにする。
 
 ```json
 {
@@ -178,17 +178,39 @@ multi-review は呼び出し元が実施するので実行しない。
 }
 ```
 
+`mr init` は、利用者共通の `${XDG_CONFIG_HOME:-$HOME/.config}/multi-review/decisions.json` → 対象ルートの `.multi-review/decisions.json` の順に常設入力を取り込む。git はリポジトリルート、非 git は解決済みの `--cwd` を対象ルートとする。XDG_CONFIG_HOME が未設定・空文字・相対パスなら無視し、`$HOME/.config` を使う。HOME が空文字、または絶対パスで決められない場合は利用者共通の常設ファイルを不存在として扱い、プロジェクトの常設ファイルは通常どおり読む。どちらのファイルも任意で、有効なリンクは読み、壊れたリンクはエラーにする。形式は add と同じ単体オブジェクトまたは配列だが、許すフィールドは `type`・`body`・`reason` だけで、`findingIds` は空配列でも受け付けない。`--no-standing-decisions` なら探索・読み取りを行わない。プロジェクトの常設ファイルは作業ツリー専用で、コミットして共有する使い方は想定しない。Step 8 で `.multi-review/` を `.git/info/exclude` に入れると、このファイルも無視対象になる。共有が必要な決定は利用者共通のファイルに置く。未追跡の常設ファイルをレビュー対象にしたくなければ `.git/info/exclude` か `.gitignore` に入れる。追跡済みなら `--path` で対象を絞る。
+
+取り込みは add と同じ検証・採番・重複防止・上限を使い、全件を検証してから保存する。不正入力はファイルパスと要素位置（配列は0始まりの `[n]`、単体は `[0]`）を診断して終了1。JSON の解析失敗はファイルと解析エラーを示す。init の保存失敗時も生成途中の状態ファイルを巻き戻し、R とロックは残す。取り込み0件なら decisions.json と decisions.md は作らない。常設ファイルは読み取り専用で、init 後に変更しても既存 R に再取り込みしない。
+
+常設由来は `sources: ["user"]` または `["project"]` を持ち、両方に同じ決定があれば1件にまとめて `["user", "project"]` を保持する。出所は receipt に含めず、実行中の同じ入力の add も既存 ID を返す。出所なしは実行中の決定（旧データを含む）とし、add の入力で出所を指定できない。remove は R の決定と receipt だけを削除し、常設ファイルは変えない。削除後の手動再追加は新しい ID・出所なしとなり、別の R の init では常設入力を再び取り込む。
+
+init の stdout は run.json のキー（取り込みがあれば `decisionSequence`・`decisionImports` も含む）に `standingDecisions: {"count": 1, "sources": [{"source": "user", "path": "/absolute/path/decisions.json", "ids": ["D1"]}]}` を加える。count は重複除去後の件数、sources は読み込んだファイルを取り込み順に示し、ids は重複なしの ID 数値順。空配列のファイルも ids が空の項目として示し、不存在・取り込み停止なら項目を出さない。このサマリは run.json に保存しない。
+
 - add の入力は `type`・`body`・`reason` と任意の `findingIds` だけ。種別は `policy`（方針）・`triage`（再報告しない基準）、本文・理由は空白だけを認めない文字列。関連指摘は同じ台帳の ID を配列で渡し、省略・空配列を許す。順序と重複を正規化する。配列の途中に不正要素があれば全件未登録とする。
 - `id` は D1 から R 全体で採番し、削除後も再利用しない。`iteration` は記録時の台帳の値。`run.json` の `decisionSequence` と `decisionImports` に採番と入力の receipt を保存し、同じ入力の再実行はイテレーションをまたいでも同じ ID を返す。削除時は receipt も除き、同内容の再追加は新しい ID になる。
 - stdout は台帳と同じ `{"ids":["D1"]}`。add は入力順、remove は登録順で ID を返し、render は空配列。空の入力配列は登録なし、remove の ID 省略・未知 ID はエラー。同一 R のロックと各ファイルの原子的置換を使い、run 保存時の例外では決定事項の JSON を復元する。Markdown 保存失敗は終了1とし、保存済み JSON から render で復旧する。
 
-`decisions.md` は種別ごとに ID の数値順で本文・理由・記録イテレーション・関連指摘を表示する。空の種別見出しは出さず、全件ゼロなら「決定事項なし」。生成物であることと編集先を先頭のコメントに示し、レビュアー向けの固定指示はプロンプトに埋め込むときだけ付ける。プロンプトの節と同じ生成処理を使い、固定指示を付けた節全体の上限は8192 bytes（UTF-8、見出し・固定指示・記録情報・改行を含む）。超える add は保存前に拒否し、古い決定の統合を促す。render・prompts でも上限を検査し、切り捨てない。
+`decisions.md` は種別ごとに ID の数値順で本文・理由・記録イテレーション・関連指摘を表示し、常設由来には `出所: 利用者共通・プロジェクト`（該当するものだけ）を添える。空の種別見出しは出さず、全件ゼロなら「決定事項なし」。生成物であることと編集先を先頭のコメントに示し、レビュアー向けの固定指示はプロンプトに埋め込むときだけ付ける。プロンプトの節と同じ生成処理を使い、固定指示を付けた節全体の上限は8192 bytes（UTF-8、見出し・固定指示・記録情報・改行を含む）。超える add は保存前に拒否し、古い決定の統合を促す。render・prompts でも上限を検査し、切り捨てない。
 
 通常プロンプトは役割本文・共通報告形式の後、対象本文の前に節を入れる。ja-review は外部テンプレートの後、FILE 本文の前に各バッチへ入れ、節も引数バッチの上限に数える。policy は初回から、triage は iter-2 以降だけ載せ、該当する決定がゼロなら節を出さない。decisions.md には常に両種別を載せる。`--reconsider` の対象指摘を `findingIds` に含む triage 決定は、そのプロンプトから外す。既存の却下・保留一覧は残す。決定事項に反する指摘・基準に当たる指摘は報告させず、前提が崩れている具体例を示せる場合だけ、共通報告形式の「問題:」欄、ja-review の「理由:」欄に決定 ID・入力・手順・結果を書かせる。
 
 決定事項の変更は成果物を失効させず、記録後に `mr prompts` で作るプロンプトから効く。決定事項を変えた後に、作成済みで未実行のプロンプトがあれば `mr prompts` を実行し直す。修正担当への受け渡しは「委譲の共通指示」に従う。
 
 ## ゲート `mr gate`（Step 7）
+
+`mr gate I` は結果が決まった全分岐で `${XDG_DATA_HOME:-$HOME/.local/share}/multi-review/runs.jsonl` に JSON を1行追記する。XDG_DATA_HOME が未設定・空文字・相対パスなら `$HOME/.local/share` を使う。HOME が空文字、または絶対パスで決められない場合は解決不能として statsError にする。結果を決めてから統計を追記し、`statsPath` または `statsError` を加えた `gate.json` を1回だけ保存する。追記後に gate.json の保存に失敗した場合は統計の行が残る。同じ I の再実行でも追記し、読む側は最後の行を使う。`MR_NO_STATS=1` で記録と保存先の探索を止める。
+
+| 統計の項目 | 内容 |
+| --- | --- |
+| `reviewId`・`cwd`・`mode`・`profile`・`iteration`・`recordedAt` | R のディレクトリ名、run.json の対象・モード・プロファイル、I の番号、記録時刻（UTC ISO 8601） |
+| `collected` | `total`・`near`・`outside`・`unknown` は指摘総数と近傍の三値別件数。`bySource` は source 別件数。位置単位でなく指摘単位 |
+| `ledger` | `unresolved`・`fixed`・`on_hold`・`rejected` の件数と、fixedIteration が I の番号と一致する `fixedThisIteration` |
+| `fixDiff` | `additions`・`deletions` はハンク本文の追加・削除行数。ファイル見出しは除く。`empty` は fix.diff が空かどうか。バイナリ変更などは追加・削除の行数がともに0でも空とは限らない |
+| `rules` | `status`・`candidates`。候補数は生出力の JSON の summary.violations または Markdown 末尾の件数から取得し、取得不能なら null |
+| `gate` | `status`・`next`・`reason`・`verdict`・`verdictReason`・`oversized`。verdict 関連の未提供値は null |
+| `decisions` | `policy`・`triage`・`withSources` の件数。出所が複数あっても1決定は1件 |
+
+台帳は必須とし、決定事項がなければ0件とする。それ以外の成果物がなければその集計項目は null、有効な空配列は0件とする。fix.diff は近傍判定と同じ読み方で集計する。壊れた集計入力や保存先の解決・作成・書き込み失敗では追記せず、stdout と gate.json に英語の `statsError` を入れる。書き込めたバイト数が足りないときはエラーとし、部分行が残る場合がある。統計の失敗ではゲートの終了コードと next を変えない。成功時は `statsPath` に追記先を返す。古い I の再実行では現存する台帳・決定事項を使い、成果物の鮮度は判定しない。run.json 不正・不正な I・既存ロックの競合など、handler に到達しない失敗では記録しない。
 
 - 実行: `mr gate I`。JSON の `status`・`verdict`・`overruleEligible`・`grounds` を読む。遷移は SKILL.md Step 7 を参照する。jev-guard の rules・rereview・ledger render は600秒で打ち切り、rules・rereview の超過は未実施とする。形式条件成立は反証完了を意味せず、終了は呼び出し元が決める。
 - 結末の記録: `jev-guard record --id <verdictId> --outcome accepted`。`needed` を覆すときは `jev-guard record --id <verdictId> --outcome overruled --note '詳細は <gate-overrule.md の絶対パス>'`。`--note` には反証本文を入れず、パスはシェルの単一引用符で安全に渡す（パス内の単一引用符は `'"'"'` として渡す）。
@@ -241,7 +263,7 @@ multi-review は呼び出し元が実施するので実行しない。
 ### exclude への追記（Step 8）
 
 - 判定: `git check-ignore -q .multi-review/<タイムスタンプ>/report.md` を実行する。終了コード 0（すでに無視されている）なら追記不要でそのまま書き出す。
-- 追記: 終了コード 1（無視されていない）なら、`git rev-parse --git-path info/exclude` が指すパスの親ディレクトリ（`info/`）がなければ作成し、`.multi-review/` を1行追記する。追記後にもう一度 `git check-ignore -q` を実行し、無視されるようになったか確かめる。
+- 追記: 終了コード 1（無視されていない）なら、`git rev-parse --git-path info/exclude` が指すパスの親ディレクトリ（`info/`）がなければ作成し、`.multi-review/` を1行追記する。作業ツリー専用の常設ファイル `.multi-review/decisions.json` も無視対象になる。追記後にもう一度 `git check-ignore -q` を実行し、無視されるようになったか確かめる。
 - 追記できない（`.git` が読み取り専用など）場合、または追記しても無視されない場合（`.gitignore` の `!.multi-review/` のような否定パターンが exclude より優先される場合を含む）は、レビューディレクトリ直下に `report.md` を置き（非 git と同じ扱い）、その理由を会話の最終レポートに書く。
 
 ## 品質チェック（Step 6 の基準・Step 7 の判定）
