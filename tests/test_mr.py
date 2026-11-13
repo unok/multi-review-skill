@@ -156,10 +156,99 @@ with patch.object(subprocess.Popen, 'communicate', communicate):
         self.write_json(source, value)
         return self.call('decisions', self.run, 'add', '--input', source)
 
+    def test_init_refuses_leftover_decisions(self):
+        for kind in ('file', 'link', 'dangling', 'markdown', 'markdown-link', 'markdown-dangling'):
+            with self.subTest(kind=kind):
+                root = self.root / ('leftover-' + kind)
+                root.mkdir()
+                path = root / ('decisions.md' if kind.startswith('markdown') else 'decisions.json')
+                target = self.root / ('target-' + kind)
+                if kind == 'file':
+                    path.write_text('{}')
+                elif kind != 'markdown':
+                    if kind in ('link', 'markdown-link'):
+                        target.write_text('{}')
+                    path.symlink_to(target)
+                if kind == 'markdown':
+                    (root / 'decisions.md').write_text('old decisions')
+                self.call('init', root, '--cwd', self.repo, '--path', '.', code=1)
+                self.assertIn('review already initialized', self.last_stderr)
+                self.assertFalse((root / 'run.json').exists())
+                self.assertFalse((root / 'findings.json').exists())
+                if kind == 'markdown':
+                    self.assertEqual((root / 'decisions.md').read_text(), 'old decisions')
+                elif not kind.startswith('markdown'):
+                    self.assertFalse((root / 'decisions.md').exists())
+                self.assertEqual(path.is_symlink(), kind not in ('file', 'markdown'))
+                if path.is_symlink():
+                    self.assertEqual(path.readlink(), target)
+                if kind == 'file':
+                    self.assertEqual(path.read_text(), '{}')
+                if kind in ('link', 'markdown-link'):
+                    self.assertEqual(target.read_text(), '{}')
+
+    def test_decisions_refuses_links_without_changing_state(self):
+        self.add_decisions(self.decision())
+        path = self.run / 'decisions.json'
+        target = self.root / 'linked-decisions.json'
+        path.rename(target)
+        source = self.root / 'new-decision.json'
+        self.write_json(source, self.decision(body='別の方針'))
+        for dangling in (False, True):
+            with self.subTest(dangling=dangling):
+                if dangling:
+                    target.unlink()
+                path.symlink_to(target)
+                before = {p: p.read_bytes() for p in
+                          (self.run / 'run.json', self.run / 'decisions.md')}
+                original = target.read_bytes() if target.exists() else None
+                for args in [('decisions', self.run, 'add', '--input', source),
+                             ('decisions', self.run, 'remove', 'D1'),
+                             ('decisions', self.run, 'render'), ('prompts', self.iter)]:
+                    with self.subTest(args=args):
+                        self.call(*args, code=1)
+                        self.assertEqual(self.last_stderr.strip(),
+                                         mr.display_path(str(path)) + ': decisions file must not be a link')
+                        self.assertTrue(path.is_symlink())
+                        self.assertEqual(path.readlink(), target)
+                        self.assertEqual(target.read_bytes() if target.exists() else None, original)
+                        self.assertEqual({p: p.read_bytes() for p in before}, before)
+                output = self.stats_gate()
+                self.assertEqual(output['statsError'],
+                                 mr.display_path(str(path)) + ': decisions file must not be a link')
+                self.assertEqual(self.stats_rows(), [])
+                path.unlink()
+
+    def test_decisions_and_ledger_tie_break_numeric_ids(self):
+        self.add(id='F1')
+        self.add(id='F01', problem='先頭ゼロ')
+        self.add(id='F001', problem='先頭ゼロ2桁')
+        text = (self.run / 'ledger.md').read_text()
+        with self.subTest(render=True):
+            self.assertLess(text.index('ID: F01 |'), text.index('ID: F1 |'))
+            self.assertLess(text.index('ID: F001 |'), text.index('ID: F01 |'))
+        for seed in ('0', '1', '2'):
+            with self.subTest(seed=seed):
+                self.env['PYTHONHASHSEED'] = seed
+                item = self.decision(findingIds=['F1', 'F01', 'F001'])
+                self.assertEqual(self.add_decisions(item)['ids'], ['D1'])
+                self.assertEqual(self.read_json(self.run / 'decisions.json')['decisions'][0]['findingIds'],
+                                 ['F001', 'F01', 'F1'])
+                self.assertEqual(self.add_decisions(dict(item, findingIds=['F001', 'F01', 'F1']))['ids'], ['D1'])
+                self.assertEqual(len(self.read_json(self.run / 'decisions.json')['decisions']), 1)
+
     def test_standing_decisions_examples(self):
         a, b = self.decision(), self.decision(type='triage')
-        size = len(mr.decisions_markdown({'decisions': [dict(a, id='D1', iteration=1,
-                         sources=['user'])]}, field='問題').encode())
+        path = Path(self.env['XDG_CONFIG_HOME']) / 'multi-review/decisions.json'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(path.unlink, missing_ok=True)
+        self.write_json(path, a)
+        probe = self.root / 'limit-probe'
+        self.call('init', probe, '--cwd', self.repo, '--path', '.')
+        jobs = self.call('prompts', probe / 'iter-2')['reviewers']
+        text = Path(jobs[0]['prompt']).read_text()
+        size = len(text[text.index('## 決定事項'):text.index('レビュー対象（')].rstrip('\n').encode()) + 1
+        path.unlink()
         exact = dict(a, body=a['body'] + 'x' * (mr.DECISIONS_MAX_BYTES - size))
         overflow = dict(exact, body=exact['body'] + 'x')
         half = dict(a, body='x' * 4000)
@@ -229,8 +318,10 @@ with patch.object(subprocess.Popen, 'communicate', communicate):
                 self.assertEqual(self.read_json(root / 'decisions.json'), before)
                 text = (root / 'decisions.md').read_text()
                 for i, (item, sources) in enumerate(expected, 1):
-                    self.assertIn(f"- D{i}（記録: iter-1、出所: " +
-                                  '・'.join(mr.DECISION_SOURCES[source] for source in sources) +
+                    label = {('user',): '出所: 利用者共通',
+                             ('project',): '出所: プロジェクト',
+                             ('user', 'project'): '出所: 利用者共通・プロジェクト'}[tuple(sources)]
+                    self.assertIn(f"- D{i}（記録: iter-1、" + label +
                                   '）' + item['body'].replace('\n', '\n  '), text)
                 jobs = self.call('prompts', root / 'iter-1')['reviewers']
                 self.assertEqual('## 決定事項' in Path(jobs[0]['prompt']).read_text(),
@@ -441,8 +532,7 @@ with patch.object(pwd, 'getpwuid', side_effect=KeyError('no home')):
                 root = self.root / failure
                 if failure == 'restore':
                     root.mkdir()
-                    for name in ('ledger.md', 'decisions.json', 'decisions.md'):
-                        (root / name).write_bytes(b'original ' + name.encode())
+                    (root / 'ledger.md').write_bytes(b'original ledger.md')
                     (root / 'iter-1').mkdir()
                     (root / 'iter-1/keep').write_bytes(b'keep')
                     before = {p: p.read_bytes() for p in root.rglob('*') if p.is_file()}
@@ -491,7 +581,7 @@ with patch.object(pwd, 'getpwuid', side_effect=KeyError('no home')):
                     self.assertEqual({p: p.read_bytes() for p in root.rglob('*')
                                       if p.is_file() and p.name != '.mr.lock'}, before)
                     self.assertEqual({p.name for p in root.iterdir()},
-                                     {'.mr.lock', 'ledger.md', 'decisions.json', 'decisions.md', 'iter-1'})
+                                     {'.mr.lock', 'ledger.md', 'iter-1'})
                     self.assertTrue((root / 'iter-1').is_dir())
                 else:
                     self.assertEqual(set(p.name for p in root.iterdir()), {'.mr.lock'})
@@ -503,8 +593,14 @@ with patch.object(pwd, 'getpwuid', side_effect=KeyError('no home')):
         path.parent.mkdir(parents=True)
         project.parent.mkdir()
         a = self.decision(type='triage', body='日本語\n次の行')
-        size = len(mr.decisions_markdown({'decisions': [dict(a, id='D1', iteration=1,
-                         sources=['user'])]}, field='問題').encode())
+        self.addCleanup(path.unlink, missing_ok=True)
+        self.write_json(path, a)
+        probe = self.root / 'limit-probe'
+        self.call('init', probe, '--cwd', self.repo, '--path', '.')
+        jobs = self.call('prompts', probe / 'iter-2')['reviewers']
+        text = Path(jobs[0]['prompt']).read_text()
+        size = len(text[text.index('## 決定事項'):text.index('レビュー対象（')].rstrip('\n').encode()) + 1
+        path.unlink()
         for index, (delta, duplicate) in enumerate(((-1, False), (0, False), (1, False), (0, True))):
             with self.subTest(delta=delta, duplicate=duplicate):
                 item = dict(a, body=a['body'] + 'x' * (mr.DECISIONS_MAX_BYTES - size + delta))
@@ -519,6 +615,10 @@ with patch.object(pwd, 'getpwuid', side_effect=KeyError('no home')):
                     self.assertEqual(set(p.name for p in root.iterdir()), {'.mr.lock'})
                 else:
                     self.assertEqual(len(self.read_json(root / 'decisions.json')['decisions']), 1)
+                    jobs = self.call('prompts', root / 'iter-2')['reviewers']
+                    text = Path(jobs[0]['prompt']).read_text()
+                    section = text[text.index('## 決定事項'):text.index('レビュー対象（')].rstrip('\n') + '\n'
+                    self.assertEqual(len(section.encode()), mr.DECISIONS_MAX_BYTES + delta)
 
     def test_decisions_add_remove_and_receipts_across_iterations(self):
         self.add()
@@ -643,7 +743,9 @@ with patch.object(pwd, 'getpwuid', side_effect=KeyError('no home')):
                     self.assertLess(text.index('## 決定事項'), text.index('レビュー対象（'))
                     self.assertIn('入力・手順・結果', text)
                     self.assertIn('「問題:」', text)
-                    self.assertNotIn('<!-- mr decisions render', text)
+                    comment = (self.run / 'decisions.md').read_text().splitlines()[0]
+                    self.assertTrue(comment.startswith('<!-- mr が生成。'))
+                    self.assertNotIn(comment, text)
         (self.run / 'run.json').write_bytes(original)
         self.add()
         self.add_decisions(self.decision(type='triage', body='再評価対象の基準', findingIds=['F1']))
@@ -837,16 +939,19 @@ with patch.object(pwd, 'getpwuid', side_effect=KeyError('no home')):
                 for argv in [('decisions', self.run, 'render'), ('prompts', self.iter)]:
                     with self.subTest(argv=argv):
                         self.call(*argv, code=1)
-                        self.assertIn(reason, self.last_stderr)
+                        self.assertIn(mr.display_path(str(path)) + ': ' + reason, self.last_stderr)
                         self.assertEqual((self.iter / 'prompts.json').read_bytes(), prompts)
                         self.assertEqual((self.run / 'decisions.md').read_bytes(), markdown)
         for text, reason in [('', 'Expecting value'), ('{', 'Expecting property name'),
                              ('{"reviewId":1,"reviewId":2}', 'duplicate JSON key')]:
             with self.subTest(text=text):
                 path.write_text(text)
-                self.call('decisions', self.run, 'render', code=1)
-                self.assertIn(reason, self.last_stderr)
-                self.assertEqual((self.run / 'decisions.md').read_bytes(), markdown)
+                for argv in [('decisions', self.run, 'render'), ('prompts', self.iter)]:
+                    with self.subTest(argv=argv):
+                        self.call(*argv, code=1)
+                        self.assertIn(mr.display_path(str(path)) + ': ' + reason, self.last_stderr)
+                        self.assertEqual((self.iter / 'prompts.json').read_bytes(), prompts)
+                        self.assertEqual((self.run / 'decisions.md').read_bytes(), markdown)
         self.write_json(path, value)
         run_path = self.run / 'run.json'
         run = self.read_json(run_path)
@@ -1291,6 +1396,8 @@ print('挨拶' if n==1 else '### 指摘1（重要度: 低）\\n- ファイル: �
                 ('--- a/a\n+++ b/a\n@@ -1 +1 @@\n-a\n-b\n', 0, 2),
                 ('--- a/a\n+++ b/a\n@@ -2 +2 @@\n-a\n', 0, 1),
                 ('--- a/a\n+++ b/a\n@@ -1 +1 @@\n-a\n+b\n+extra\n', 1, 1),
+                ('--- a/a\n+++ b/a\n@@ -1 +1 @@\n-a\n+b\n--- a/next\n+++ b/next\n@@ -1 +1 @@\n-c\n+d\n', 2, 2),
+                ('--- a/a\n+++ b/a\n@@ -1,2 +1,2 @@\n-a\n+b\n--- a/next\n+++ b/next\n@@ -1 +1 @@\n-c\n+d\n', 3, 3),
                 ('--- a/a\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-a\n-b\n', 0, 2),
                 ('--- /dev/null\n+++ b/a\n@@ -0,0 +1,2 @@\n+a\n+b\n', 2, 0),
                 ('diff --git a/a b/a\nBinary files a/a and b/a differ\n', 0, 0),
@@ -1313,6 +1420,57 @@ print('挨拶' if n==1 else '### 指摘1（重要度: 低）\\n- ファイル: �
                 self.assertIn('statsPath', self.stats_gate())
                 self.assertEqual(self.stats_rows()[-1]['fixDiff'],
                                  {'additions': additions, 'deletions': 1, 'empty': False})
+
+    def test_prompts_refuses_invalid_hunks_with_ja_review(self):
+        skill = self.ja_skill()
+        run = self.read_json(self.run / 'run.json')
+        self.write_json(self.run / 'run.json', dict(run, jaSkill=str(skill), paths=['target.py']))
+        (self.repo / 'target.py').write_text('対象\n')
+        (self.repo / 'a.py').write_text('前\n')
+        self.add(file='a.py')
+        self.call('snapshot', self.iter)
+        (self.repo / 'a.py').write_text('後\n')
+        patch = '--- a/a.py\n+++ b/a.py\n@@ bad @@\n'
+        self.fake('diff', 'import sys\nif "a/a.py" in sys.argv: print(' +
+                  repr(patch) + ', end="")\n')
+        self.call('fixdiff', self.iter)
+        self.assertEqual((self.iter / 'fix.diff').read_text(), patch)
+        second = self.run / 'iter-2'
+        self.call('prompts', second, '--no-ja-review')
+        self.assertTrue((second / 'prompts.json').is_file())
+        before = {p: p.read_bytes() for p in (second / 'prompts.json', second / 'claude.prompt.md')}
+        self.call('prompts', second, '--ja-review', code=1)
+        self.assertEqual({p: p.read_bytes() for p in before if p.exists()}, before)
+        self.assertIn('reconstructed re-review diff: invalid diff hunk', self.last_stderr)
+        current = self.read_json(self.run / 'run.json')
+        self.write_json(self.run / 'run.json', dict(current, excluded=['ja-review']))
+        self.call('prompts', second, '--ja-review')
+        self.assertTrue((second / 'prompts.json').is_file())
+        self.write_json(self.run / 'run.json', current)
+
+    def test_prompts_invalid_git_hunk_preserves_artifacts(self):
+        self.changed_repository('--ja-review', '--ja-skill', self.ja_skill())
+        self.call('prompts', self.iter)
+        before = {p: p.read_bytes() for p in (self.iter / 'prompts.json', self.iter / 'claude.prompt.md')}
+        patch = 'diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ bad @@\n'
+        self.fake('git', 'import os,sys\n'
+                  'if "diff" in sys.argv: print(' + repr(patch) + ', end=""); sys.exit(0)\n'
+                  + 'os.execv(' + repr(shutil.which('git')) + ', ["git", *sys.argv[1:]])\n')
+        self.call('prompts', self.iter, code=1)
+        self.assertIn('git diff: invalid diff hunk', self.last_stderr)
+        self.assertEqual({p: p.read_bytes() for p in before if p.exists()}, before)
+        run = self.read_json(self.run / 'run.json')
+        self.write_json(self.run / 'run.json', dict(run, mode='base', base='HEAD'))
+        for command in ('diff', 'merge-base'):
+            with self.subTest(command=command):
+                self.fake('git', 'import os,sys\n'
+                          'if ' + repr(command) + ' in sys.argv and "--name-only" not in sys.argv: '
+                          'sys.exit("injected git failure")\n'
+                          + 'os.execv(' + repr(shutil.which('git')) + ', ["git", *sys.argv[1:]])\n')
+                self.call('prompts', self.iter, code=1)
+                self.assertIn('injected git failure', self.last_stderr)
+                self.assertNotIn('git diff: ', self.last_stderr)
+                self.assertEqual({p: p.read_bytes() for p in before if p.exists()}, before)
 
     def test_stats_gate_branches_and_repeated_append(self):
         previous_umask = os.umask(0)
@@ -2462,6 +2620,27 @@ Path('leaked').touch()
         self.write_json(self.iter / 'task.json', entry)
         self.assertEqual(self.call('rules', self.iter)['reason'], 'stale delegation task')
 
+    def test_copy_diff_mode_change_then_content_change_stats_and_proximity(self):
+        first, second = self.repo / 'a.py', self.repo / 'z.py'
+        for path in (first, second):
+            path.write_text('before\n')
+            path.chmod(0o644)
+        self.call('snapshot', self.iter)
+        first.chmod(0o755)
+        for path in (first, second):
+            path.write_text('after\n')
+        result = self.call('fixdiff', self.iter)
+        self.assertEqual(result['mode'], 'copy')
+        patch = (self.iter / 'fix.diff').read_text()
+        self.assertEqual(patch.count('diff --git '), 1)
+        self.assertIn('old mode 100644\nnew mode 100755', patch)
+        self.assertLess(patch.index('+after'), patch.index('--- a/z.py'))
+        self.assertIn('statsPath', self.stats_gate())
+        self.assertEqual(self.stats_rows()[-1]['fixDiff'],
+                         {'additions': 2, 'deletions': 2, 'empty': False})
+        findings = self.collection_fixture(self.report(1, path='z.py'))['findings']
+        self.assertIs(findings[0]['nearPreviousFix'], True)
+
     def test_copy_diff_detects_executable_bit_without_content_change(self):
         path = self.repo / 'script'
         path.write_text('echo test\n')
@@ -3162,6 +3341,28 @@ else:
         self.assertIn('review.json', self.last_stderr)
         self.assertEqual([(self.run / 'iter-2' / name).read_bytes() for name in ('collected.json', 'collected.md')], saved)
 
+    def test_readme_mentions_stats_and_standing_decisions(self):
+        readme = (CLI.parent.parent / 'README.md').read_text(encoding='utf-8')
+        for text in ('${XDG_DATA_HOME:-$HOME/.local/share}/multi-review/runs.jsonl',
+                     'MR_NO_STATS=1', '${XDG_CONFIG_HOME:-$HOME/.config}/multi-review/decisions.json',
+                     '[実行仕様](references/execution.md)'):
+            with self.subTest(readme=text):
+                self.assertIn(text, readme)
+        stats = re.search(r'`(\$\{XDG_DATA_HOME[^`]+)`', readme)[1]
+        self.assertEqual(stats.replace('${XDG_DATA_HOME:-$HOME/.local/share}', self.env['XDG_DATA_HOME']),
+                         self.stats_gate()['statsPath'])
+        config = re.search(r'`(\$\{XDG_CONFIG_HOME[^`]+)`', readme)[1]
+        path = Path(config.replace('${XDG_CONFIG_HOME:-$HOME/.config}', self.env['XDG_CONFIG_HOME']))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(path.unlink, missing_ok=True)
+        self.write_json(path, self.decision())
+        result = self.call('init', self.root / 'documented-config', '--cwd', self.repo, '--path', '.')
+        self.assertEqual(result['standingDecisions']['sources'][0]['path'], str(path))
+        self.env['MR_NO_STATS'] = '1'
+        count = len(self.stats_rows())
+        self.assertNotIn('statsPath', self.stats_gate())
+        self.assertEqual(len(self.stats_rows()), count)
+
     def test_documented_defaults_match_init_and_batch_limit(self):
         run = self.read_json(self.run / 'run.json')
         docs = (CLI.parent.parent / 'references/execution.md').read_text(encoding='utf-8')
@@ -3829,8 +4030,8 @@ sys.exit(mr.main())
                 self.fake('git', 'import os,sys\nif "diff" in sys.argv:\n    print(' +
                           repr(patch) + ')\nelse:\n    os.execv(' + repr(real_git) + ', ["git", *sys.argv[1:]])')
                 self.call('prompts', self.iter, code=1)
-                self.assertIn(reason, self.last_stderr)
-                self.assertFalse((self.iter / 'prompts.json').exists())
+                self.assertIn('git diff: ' + reason, self.last_stderr)
+                self.assertEqual(self.read_json(self.iter / 'prompts.json'), plan)
         for patch in ['diff --git a/a.txt b/a.txt\nGIT binary patch\n',
                       'diff --git a/a.txt b/a.txt\nBinary files /dev/null and b/a.txt differ\n',
                       'diff --git a/a.txt b/a.txt\nBinary files a/a.txt and /dev/null differ\n',

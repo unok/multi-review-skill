@@ -284,6 +284,12 @@ def load_ledger(root):
     return validate_ledger(read_json(root / LEDGER_FILE))
 
 
+def natural_id_key(text):
+    # 受領ハッシュを安定させるには、F1/F01 の同順位も文字列で決着させる必要がある。
+    return (tuple((1, int(p)) if p.isdecimal() else (0, p)
+                  for p in re.split(r'(\d+)', text)), text)
+
+
 def render(root, ledger):
     output = root / LEDGER_MD_FILE
     if shutil.which('jev-guard'):
@@ -297,8 +303,7 @@ def render(root, ledger):
         sections = []
         for state, label in zip(STATES, LABELS):
             items = sorted((i for i in ledger['findings'] if i['status'] == state),
-                           key=lambda i: tuple((1, int(p)) if p.isdecimal() else (0, p)
-                                               for p in re.split(r'(\d+)', i['id'])))
+                           key=lambda i: natural_id_key(i['id']))
             rows = []
             for item in items:
                 fields = [('ID', item['id']), ('重要度', item['severity']),
@@ -450,7 +455,9 @@ def validate_decisions(value, ledger, run):
 
 def load_decisions(root, ledger, run):
     path = root / DECISIONS_FILE
-    value = read_json(path) if path.exists() or path.is_symlink() else {'reviewId': ledger['reviewId'], 'decisions': []}
+    # この成果物は R に属し、リンクをたどると R の外から決定事項を読むことになる。
+    require(not path.is_symlink(), 'decisions file must not be a link')
+    value = read_json(path) if path.exists() else {'reviewId': ledger['reviewId'], 'decisions': []}
     return validate_decisions(value, ledger, run)
 
 
@@ -515,8 +522,7 @@ def add_decision(raw, value, ledger, run, source=None):
     links = item.get('findingIds', [])
     require(isinstance(links, list) and all(nonempty(link) for link in links) and
             set(links) <= {i['id'] for i in ledger['findings']}, 'invalid decision findingIds')
-    item['findingIds'] = sorted(set(links), key=lambda link: tuple(
-        (1, int(p)) if p.isdecimal() else (0, p) for p in re.split(r'(\d+)', link)))
+    item['findingIds'] = sorted(set(links), key=natural_id_key)
     receipt = digest(json.dumps(item, sort_keys=True).encode())
     previous_id = run.get('decisionImports', {}).get(receipt)
     if previous_id:
@@ -579,7 +585,10 @@ def standing_decisions(cwd, value, ledger, run, disabled):
 
 def decisions_action(args, root, run):
     ledger = load_ledger(root)
-    value = load_decisions(root, ledger, run)
+    try:
+        value = load_decisions(root, ledger, run)
+    except EXPECTED_ERRORS as error:
+        raise Failure(display_path(str(root / DECISIONS_FILE)) + ': ' + str(error)) from error
     ids = []
     require(not args.ids or args.action == 'remove', 'IDs are only for remove')
     require(args.input is None or args.action == 'add', '--input is only for add')
@@ -893,7 +902,9 @@ def target_root(args, root):
 
 
 def init(args, root, run):
-    require(not (root / RUN_FILE).exists() and not (root / LEDGER_FILE).exists(),
+    require(not (root / RUN_FILE).exists() and not (root / LEDGER_FILE).exists() and
+            not (root / DECISIONS_FILE).exists() and not (root / DECISIONS_FILE).is_symlink() and
+            not (root / DECISIONS_MD_FILE).exists() and not (root / DECISIONS_MD_FILE).is_symlink(),
             'review already initialized')
     requested, cwd, is_git = args.target
     paths = []
@@ -1369,21 +1380,28 @@ def prompts(args, root, run):
         run['roles'] = role_list(args.roles)
     reconsider = set(args.reconsider.split(',')) if args.reconsider else set()
     require(reconsider <= {i['id'] for i in ledger['findings']}, 'unknown reconsider ID')
-    value = load_decisions(root, ledger, run)
+    try:
+        value = load_decisions(root, ledger, run)
+    except EXPECTED_ERRORS as error:
+        raise Failure(display_path(str(root / DECISIONS_FILE)) + ': ' + str(error)) from error
     decisions = bounded_decisions_markdown(value, iteration, reconsider=reconsider)
-    invalidate(directory, 'prompts')
     ja_review = run['jaReview'] if args.ja_review is None else args.ja_review
     files, extra_files, fixes = iteration_files(directory, run, iteration)
-    target = prompt_target(directory, run, ledger, iteration, files, reconsider, fixes)
-    jobs = review_jobs(directory, run, target, decisions)
     if ja_review and 'ja-review' not in run['excluded']:
         cwd = Path(run['cwd'])
         ranges = {}
-        extra_additions, _ = changed_lines(b'\n'.join(fixes).decode('utf-8', 'replace'), additions_only=True)
+        try:
+            extra_additions, _ = changed_lines(b'\n'.join(fixes).decode('utf-8', 'replace'), additions_only=True)
+        except EXPECTED_ERRORS as error:
+            raise Failure('reconstructed re-review diff: ' + str(error)) from error
         if run['git'] and head_exists(cwd) and (run['mode'] != 'paths' or iteration > 1):
-            # Only the git patch has hunk syntax; untracked bodies are whole-file inputs.
+            # git の差分だけがハンク構文を持ち、untracked の本文は全行を対象にする。
             ranges = {name: set() for name in files}
-            additions, _ = changed_lines(scoped_git_diff(run).decode('utf-8', 'replace'), additions_only=True)
+            diff = scoped_git_diff(run)
+            try:
+                additions, _ = changed_lines(diff.decode('utf-8', 'replace'), additions_only=True)
+            except EXPECTED_ERRORS as error:
+                raise Failure('git diff: ' + str(error)) from error
             ranges.update(additions)
             for name, numbers in extra_additions.items():
                 ranges.setdefault(name, set()).update(numbers)
@@ -1391,6 +1409,11 @@ def prompts(args, root, run):
                 ranges.pop(name, None)
         elif extra_files:
             ranges = {name: extra_additions.get(name, set()) for name in extra_files}
+    # 既存の成果物を残す保証は範囲計算の失敗に限り、計算後に失効させる。
+    invalidate(directory, 'prompts')
+    target = prompt_target(directory, run, ledger, iteration, files, reconsider, fixes)
+    jobs = review_jobs(directory, run, target, decisions)
+    if ja_review and 'ja-review' not in run['excluded']:
         jobs.extend(ja_batches(directory, run, files, ranges,
                                bounded_decisions_markdown(value, iteration, field='理由', reconsider=reconsider)))
     require(jobs, 'no reviewer selected')
