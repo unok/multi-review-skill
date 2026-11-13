@@ -30,6 +30,12 @@ MAX_OPTIONAL_SPECIALISTS = 4
 DEFAULT_SPECIALISTS = ('pattern-consistency', 'naming-symmetry')
 MAX_SPECIALISTS = len(DEFAULT_SPECIALISTS) + MAX_OPTIONAL_SPECIALISTS
 MAX_ITERATIONS = 5
+MAX_CONFIRM_REVIEWS = 2
+CONFIRM_SPECIALISTS = ('bug-hunt', 'test-quality')
+CONFIRM_DECISIONS_HEADING = '異議を出してよい方針'
+CONFIRM_DECISIONS_DESCRIPTION = (
+    'この方針は呼び出し元がレビュアーの指摘を却下して決めたもので、誤っている可能性がある。'
+    '具体的な不備を示せるなら決定 ID を書いて指摘してよい。')
 INVENTORY_MAX_BYTES = 32768
 INVENTORY_VALUE_CHARS = 120
 INVENTORY_SIGNATURE_CHARS = 240
@@ -172,11 +178,23 @@ def load_run(root):
             all(nonempty(k) and nonempty(v) for k, v in run.get('imports', {}).items()),
             'invalid run state')
     role_list(','.join(run['roles']))
+    # 旧版が作った run.json にはこのキーがないため、空配列として扱う。
+    confirms = run.get('confirmIterations', [])
+    require(isinstance(confirms, list) and len(confirms) <= MAX_CONFIRM_REVIEWS and
+            all(positive_int(i) and i <= MAX_ITERATIONS for i in confirms) and
+            confirms == sorted(set(confirms)), 'invalid run state')
     require(type(run.get('decisionSequence', 0)) is int and run.get('decisionSequence', 0) >= 0 and
             isinstance(run.get('decisionImports', {}), dict) and
             all(nonempty(k) and isinstance(v, str) and re.fullmatch(r'D[1-9]\d*', v)
                 for k, v in run.get('decisionImports', {}).items()), 'invalid run state')
     return run
+
+
+def prompt_confirm(state):
+    # 旧版が作った prompts.json にはこのキーがないため、false として扱う。
+    confirm = state.get('confirm', False)
+    require(type(confirm) is bool, 'invalid prompts.json confirm')
+    return confirm
 
 
 def load_review_state(directory, filename):
@@ -185,6 +203,7 @@ def load_review_state(directory, filename):
             'invalid ' + filename)
     if filename == 'prompts.json':
         require(nonempty(state.get('cwd')) and positive_int(state.get('iteration')), 'invalid prompts.json')
+        prompt_confirm(state)
     for job in state['reviewers']:
         require(isinstance(job, dict) and
                 all(nonempty(job.get(key)) for key in ('cli', 'source', 'model', 'prompt', 'output')) and
@@ -461,13 +480,16 @@ def load_decisions(root, ledger, run):
     return validate_decisions(value, ledger, run)
 
 
-def decisions_markdown(value, iteration=None, field=None, reconsider=()):
+def decisions_markdown(value, iteration=None, field=None, reconsider=(), confirm_rejected=None):
     sections = []
     for kind, label in DECISION_TYPES.items():
         if kind == 'triage' and iteration == 1:
             continue
         rows = []
         for item in sorted(value['decisions'], key=lambda i: int(i['id'][1:])):
+            if confirm_rejected is not None and (kind != 'policy' or
+                    not set(item.get('findingIds', [])) & confirm_rejected):
+                continue
             if item['type'] != kind or (kind == 'triage' and
                                         set(item.get('findingIds', [])) & set(reconsider)):
                 continue
@@ -481,6 +503,9 @@ def decisions_markdown(value, iteration=None, field=None, reconsider=()):
             rows.append(f"- {item['id']}（{metadata}）{body}\n  理由: {reason}")
         if rows:
             sections.append('### ' + label + f'（{kind}）\n' + '\n'.join(rows))
+            if confirm_rejected is not None:
+                return '\n\n'.join(['## ' + CONFIRM_DECISIONS_HEADING,
+                    CONFIRM_DECISIONS_DESCRIPTION, '\n'.join(rows)]) + '\n'
     if not sections:
         return ''
     if field is not None:
@@ -489,13 +514,15 @@ def decisions_markdown(value, iteration=None, field=None, reconsider=()):
     return '\n\n'.join(['## 決定事項', *sections]) + '\n'
 
 
-def bounded_decisions_markdown(value, iteration=None, field='問題', reconsider=()):
+def bounded_decisions_markdown(value, iteration=None, field='問題', reconsider=(), confirm_rejected=None):
     text = decisions_markdown(value, field=field)
+    # 確認用の節は通常の節から方針を絞り、固定部分も短い。
     size = len(text.encode('utf-8'))
     require(size <= DECISIONS_MAX_BYTES,
             f'decisions section is {size} bytes (limit {DECISIONS_MAX_BYTES}); '
             'merge or reduce decisions in decisions.json')
-    return decisions_markdown(value, iteration, field if iteration is not None else None, reconsider)
+    return decisions_markdown(value, iteration, field if iteration is not None else None,
+                              reconsider, confirm_rejected)
 
 
 def save_decisions_and_run(root, value, run):
@@ -948,7 +975,7 @@ def init(args, root, run):
            'profile': args.profile, 'roles': roles, 'excluded': sorted(excluded),
            'jaReview': args.ja_review, 'jaSkill': str(args.ja_skill.expanduser().resolve()),
            'diffBudget': args.diff_budget, 'timeout': args.timeout, 'jaTimeout': args.ja_timeout,
-           'taskSequence': 0, 'tasks': {}}
+           'taskSequence': 0, 'tasks': {}, 'confirmIterations': []}
     branch = 'non-git'
     if is_git:
         branch_result = run_command(['git', 'symbolic-ref', '--short', '-q', 'HEAD'], cwd, allowed=(0, 1))
@@ -1317,7 +1344,7 @@ def iteration_dir(root, number):
     return root / f'iter-{number}'
 
 
-def prompt_target(directory, run, ledger, iteration, files, reconsider, fixes=()):
+def prompt_target(directory, run, ledger, iteration, files, reconsider, fixes=(), confirm=False):
     target = 'レビュー対象（git 差分では変更行だけ）:\n' + '\n'.join(map(display_path, files)) + '\n'
     if run['mode'] == 'paths':
         target += '\n指定パス:\n' + '\n'.join(map(display_path, run['paths'])) + '\n'
@@ -1329,11 +1356,13 @@ def prompt_target(directory, run, ledger, iteration, files, reconsider, fixes=()
         else:
             target += '\n' + patch.decode('utf-8', 'replace')
     save_json(directory / 'target.json', {'files': files, 'mode': run['mode']})
-    if iteration > 1:
+    if iteration > 1 or confirm:
         target += '\n検討済みのため再報告不要（前提変更で再評価する項目を除く）:\n'
         target += '\n'.join(f"{i['id']} {display_path(i['file'])}:{i['line']} {i['problem']} 理由: {i['reason']}"
-                            for i in ledger['findings'] if i['status'] in ('rejected', 'on_hold')
+                            for i in ledger['findings']
+                            if i['status'] in (('on_hold',) if confirm else ('rejected', 'on_hold'))
                             and i['id'] not in reconsider)
+    if iteration > 1:
         target += '\n前回の修正概要:\n' + '\n'.join(
             f"{i['id']} {i['fixSummary']}" for i in ledger['findings']
             if i['status'] == 'fixed' and i.get('fixedIteration') == iteration - 1)
@@ -1376,6 +1405,10 @@ def prompts(args, root, run):
     iteration = iteration_number(directory)
     ledger = load_ledger(root)
     require(iteration in (ledger['iteration'], ledger['iteration'] + 1), 'invalid iteration transition')
+    # 旧版が作った run.json にはこのキーがないため、空配列として扱う。
+    confirms = run.get('confirmIterations', [])
+    require(not args.confirm or iteration in confirms or len(confirms) < MAX_CONFIRM_REVIEWS,
+            f'confirmation review limit {MAX_CONFIRM_REVIEWS} reached')
     if args.roles is not None:
         run['roles'] = role_list(args.roles)
     reconsider = set(args.reconsider.split(',')) if args.reconsider else set()
@@ -1384,8 +1417,9 @@ def prompts(args, root, run):
         value = load_decisions(root, ledger, run)
     except EXPECTED_ERRORS as error:
         raise Failure(display_path(str(root / DECISIONS_FILE)) + ': ' + str(error)) from error
-    decisions = bounded_decisions_markdown(value, iteration, reconsider=reconsider)
-    ja_review = run['jaReview'] if args.ja_review is None else args.ja_review
+    rejected = {i['id'] for i in ledger['findings'] if i['status'] == 'rejected'} if args.confirm else None
+    decisions = bounded_decisions_markdown(value, iteration, reconsider=reconsider, confirm_rejected=rejected)
+    ja_review = not args.confirm and (run['jaReview'] if args.ja_review is None else args.ja_review)
     files, extra_files, fixes = iteration_files(directory, run, iteration)
     if ja_review and 'ja-review' not in run['excluded']:
         cwd = Path(run['cwd'])
@@ -1411,18 +1445,32 @@ def prompts(args, root, run):
             ranges = {name: extra_additions.get(name, set()) for name in extra_files}
     # 既存の成果物を残す保証は範囲計算の失敗に限り、計算後に失効させる。
     invalidate(directory, 'prompts')
-    target = prompt_target(directory, run, ledger, iteration, files, reconsider, fixes)
-    jobs = review_jobs(directory, run, target, decisions)
+    target = prompt_target(directory, run, ledger, iteration, files, reconsider, fixes, args.confirm)
+    jobs = review_jobs(directory, dict(run, roles=CONFIRM_SPECIALISTS) if args.confirm else run, target, decisions)
     if ja_review and 'ja-review' not in run['excluded']:
         jobs.extend(ja_batches(directory, run, files, ranges,
                                bounded_decisions_markdown(value, iteration, field='理由', reconsider=reconsider)))
     require(jobs, 'no reviewer selected')
     require(any(shutil.which(job['cli']) for job in jobs), 'no installed reviewer selected')
+    originals = {root / name: (root / name).read_bytes() for name in (LEDGER_FILE, RUN_FILE)}
     ledger['iteration'] = iteration
-    save_ledger_and_run(root, ledger, run)
-    render(root, ledger)
-    result = {'cwd': run['cwd'], 'iteration': iteration, 'reviewers': jobs}
-    save_json(directory / 'prompts.json', result)
+    if args.confirm:
+        run['confirmIterations'] = sorted({*confirms, iteration})
+    result = {'cwd': run['cwd'], 'iteration': iteration, 'confirm': args.confirm, 'reviewers': jobs}
+    try:
+        save_json(root / LEDGER_FILE, validate_ledger(ledger))
+        save_json(root / RUN_FILE, run)
+        render(root, ledger)
+        save_json(directory / 'prompts.json', result)
+    except BaseException as error:
+        # 生成失敗では確認回数と台帳のイテレーションを進めない。
+        for path, original in originals.items():
+            try:
+                write_atomic(path, original)
+            except BaseException as rollback_error:
+                # ほかの復元も試み、生成時の例外を呼び出し元へ返す。
+                error.__notes__ = [*getattr(error, '__notes__', []), f'{display_path(str(path))}: {rollback_error}']
+        raise
     return result
 
 
@@ -1891,13 +1939,16 @@ def run_stats(root, directory, run, output):
     except EXPECTED_ERRORS as error:
         raise Failure(display_path(str(path)) + ': ' + str(error)) from error
     values = {}
-    for key, path in [('collected', directory / 'collected.json'), ('rules', directory / 'rules.json')]:
+    for key, path in [('prompts', directory / 'prompts.json'),
+                      ('collected', directory / 'collected.json'), ('rules', directory / 'rules.json')]:
         # 壊れたリンクも、不存在として黙って落とさず読み取り失敗にする。
         values[key] = None
         try:
             if path.exists() or path.is_symlink():
                 values[key] = read_json(path)
                 require(isinstance(values[key], dict), 'invalid stats artifact: ' + path.name)
+            if key == 'prompts':
+                result['confirm'] = prompt_confirm(values[key]) if values[key] is not None else False
         except EXPECTED_ERRORS as error:
             raise Failure(display_path(str(path)) + ': ' + str(error)) from error
     collected = values['collected']
@@ -2529,7 +2580,9 @@ def parser():
     init_parser.add_argument('--ja-timeout', type=float, default=JA_TIMEOUT)
     prompts_parser = parsers['prompts']
     prompts_parser.add_argument('--roles')
-    prompts_parser.add_argument('--reconsider', default='')
+    # 空文字の指定も --confirm と併用できないため、未指定は None で区別する。
+    prompts_parser.add_argument('--reconsider')
+    prompts_parser.add_argument('--confirm', action='store_true')
     prompts_parser.add_argument('--ja-review', action=argparse.BooleanOptionalAction, default=None)
     inventory_parser = parsers['inventory']
     inventory_parser.add_argument('--max-bytes', type=int, default=INVENTORY_MAX_BYTES)
@@ -2561,7 +2614,11 @@ def run_lock(root):
 
 
 def main():
-    args = parser().parse_args()
+    p = parser()
+    args = p.parse_args()
+    if args.command == 'prompts' and args.confirm and (
+            args.roles is not None or args.ja_review is not None or args.reconsider is not None):
+        p.error('--confirm cannot be combined with --roles, --ja-review, --no-ja-review or --reconsider')
     signal.signal(signal.SIGTERM, interrupt)
     signal.signal(signal.SIGINT, interrupt)
     try:
@@ -2581,11 +2638,15 @@ def main():
             result = handler(args, root, run)
         print(json.dumps(result))
         return exit_code(result)
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as error:
         print('interrupted', file=sys.stderr)
+        for note in getattr(error, '__notes__', []):
+            print(note, file=sys.stderr)
         return 1
     except EXPECTED_ERRORS as error:
         print(str(error), file=sys.stderr)
+        for note in getattr(error, '__notes__', []):
+            print(note, file=sys.stderr)
         return 1
 
 

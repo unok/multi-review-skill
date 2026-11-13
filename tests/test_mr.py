@@ -156,6 +156,421 @@ with patch.object(subprocess.Popen, 'communicate', communicate):
         self.write_json(source, value)
         return self.call('decisions', self.run, 'add', '--input', source)
 
+    def test_confirm_examples_reviewers_and_records(self):
+        skill = self.ja_skill()
+        (self.repo / 'ja.txt').write_text('校閲対象')
+        for index, (options, missing, expected) in enumerate([
+                ([], None, [('claude-general', 'claude-opus-5-5', 'medium'),
+                            ('codex-general', 'gpt-6.1-sol', 'medium'),
+                            ('claude-bug-hunt', 'claude-opus-5-5', 'high'),
+                            ('claude-test-quality', 'claude-opus-5-5', 'high')]),
+                (['--profile', 'codex'], None,
+                 [('claude-general', 'claude-opus-5-5', 'high'),
+                  ('codex-general', 'gpt-6.1-sol', 'medium'),
+                  ('codex-bug-hunt', 'gpt-6.1-sol', 'high'),
+                  ('codex-test-quality', 'gpt-6.1-sol', 'high')]),
+                (['--only', 'codex'], None, [('codex-general', 'gpt-6.1-sol', 'medium')]),
+                (['--profile', 'codex', '--only', 'codex'], None,
+                 [('codex-general', 'gpt-6.1-sol', 'medium'),
+                  ('codex-bug-hunt', 'gpt-6.1-sol', 'high'),
+                  ('codex-test-quality', 'gpt-6.1-sol', 'high')]),
+                ([], 'claude', [('claude-general', 'claude-opus-5-5', 'medium'),
+                                ('codex-general', 'gpt-6.1-sol', 'medium')]),
+                (['--exclude', 'claude', '--exclude', 'codex', '--ja-review'], None, [])]):
+            with self.subTest(options=options, missing=missing):
+                root = self.root / f'confirm-{index}'
+                self.call('init', root, '--cwd', self.repo, '--path', '.', '--roles', '',
+                          '--diff-budget', '1', '--ja-skill', skill, *options)
+                if missing:
+                    (self.bin / missing).unlink()
+                try:
+                    before = self.read_json(root / 'run.json')
+                    if not expected:
+                        normal = self.call('prompts', root / 'iter-1')
+                        self.assertTrue(normal['reviewers'])
+                        self.assertTrue(all(j['cli'] == 'agy' for j in normal['reviewers']))
+                    plan = self.call('prompts', root / 'iter-1', '--confirm', code=0 if expected else 1)
+                    if not expected:
+                        self.assertIn('no reviewer selected', self.last_stderr)
+                    saved = self.read_json(root / 'run.json')
+                    self.assertEqual(saved['roles'], before['roles'])
+                    self.assertEqual(saved['jaReview'], before['jaReview'])
+                    self.assertEqual(saved['confirmIterations'], [1] if expected else [])
+                    if expected:
+                        self.assertEqual([(j['source'], j['model'], j['effort'])
+                                          for j in plan['reviewers']], expected)
+                        self.assertIs(plan['confirm'], True)
+                        self.assertEqual(plan['iteration'], 1)
+                        self.assertEqual(plan, self.read_json(root / 'iter-1/prompts.json'))
+                        self.call('review', root / 'iter-1')
+                        self.assertEqual(self.call('collect', root / 'iter-1')['findings'], [])
+                        self.stats_gate(root / 'iter-1')
+                        self.assertIs(self.stats_rows()[-1]['confirm'], True)
+                finally:
+                    if missing:
+                        self.fake(missing, "print('問題なし')\n")
+
+    def test_confirm_examples_repeats_limits_and_argument_errors(self):
+        self.call('prompts', self.iter)
+        for options in [('--roles', ''), ('--reconsider', ''), ('--ja-review',), ('--no-ja-review',)]:
+            for ordered in [('--confirm', *options), (*options, '--confirm')]:
+                with self.subTest(options=ordered):
+                    saved = {p: p.read_bytes() for p in self.run.rglob('*') if p.is_file()}
+                    self.call('prompts', self.iter, *ordered, code=2)
+                    self.assertIn('--confirm cannot be combined', self.last_stderr)
+                    self.assertEqual({p: p.read_bytes() for p in self.run.rglob('*') if p.is_file()}, saved)
+        for number, confirm, history in [(1, True, [1]), (1, False, [1]), (1, True, [1]),
+                                         (2, True, [1, 2]), (2, True, [1, 2])]:
+            directory = self.run / f'iter-{number}'
+            plan = self.call('prompts', directory, *(['--confirm'] if confirm else []))
+            self.assertIs(plan['confirm'], confirm)
+            self.assertEqual(self.read_json(self.run / 'run.json')['confirmIterations'], history)
+            self.stats_gate(directory)
+            self.assertIs(self.stats_rows()[-1]['confirm'], confirm)
+        second = self.run / 'iter-2'
+        self.call('review', second)
+        self.call('collect', second)
+        self.call('prompts', second, '--confirm')
+        for name in ('review.json', 'collected.json', 'collected.md'):
+            self.assertFalse((second / name).exists())
+        self.call('prompts', self.run / 'iter-3')
+        saved = {p: p.read_bytes() for p in self.run.rglob('*') if p.is_file()}
+        self.call('prompts', self.run / 'iter-3', '--confirm', code=1)
+        self.assertIn('limit 2', self.last_stderr)
+        self.assertEqual({p: p.read_bytes() for p in self.run.rglob('*') if p.is_file()}, saved)
+        for directory, reason in [(self.iter, 'invalid iteration transition'),
+                                  (self.run / 'iter-5', 'invalid iteration transition'),
+                                  (self.run / 'iter-6', 'iteration must be iter-1 through iter-5')]:
+            self.call('prompts', directory, '--confirm', code=1)
+            self.assertIn(reason, self.last_stderr)
+            self.assertEqual({p: p.read_bytes() for p in self.run.rglob('*') if p.is_file()}, saved)
+
+    def test_confirm_iterations_reject_invalid_run_state(self):
+        path = self.run / 'run.json'
+        run = self.read_json(path)
+        for value in (None, {}, [1, 2, 3], [1, 1], [2, 1], [0], [6], [True], ['1']):
+            with self.subTest(value=value):
+                self.write_json(path, dict(run, confirmIterations=value))
+                self.call('decisions', self.run, 'render', code=1)
+                self.assertIn('invalid run state', self.last_stderr)
+
+    def test_confirm_examples_decisions_and_current_status(self):
+        self.add(problem='却下本文')
+        self.add(problem='保留本文')
+        self.add(problem='修正対象')
+        self.add(problem='未解決本文')
+        self.call('ledger', self.run, 'fix', 'F3', '--iteration', '1', '--summary', '確認する修正概要')
+        self.call('ledger', self.run, 'reject', 'F1', '--reason', '却下理由')
+        self.call('ledger', self.run, 'hold', 'F2', '--reason', '保留理由')
+        self.add_decisions([self.decision(body='異議対象', findingIds=['F1', 'F2']),
+                            self.decision(body='異議対象2', findingIds=['F1']),
+                            self.decision(body='関連なし'),
+                            self.decision(type='triage', body='再報告基準', findingIds=['F1']),
+                            self.decision(body='保留だけ', findingIds=['F2']),
+                            *[self.decision(body=f'関連なし{n}') for n in range(6, 10)],
+                            self.decision(body='異議対象10', findingIds=['F1']),
+                            self.decision(body='未解決だけの方針', findingIds=['F4'])])
+        value = self.read_json(self.run / 'decisions.json')
+        value['decisions'].reverse()
+        self.write_json(self.run / 'decisions.json', value)
+        for directory in (self.iter, self.run / 'iter-2'):
+            for job in self.call('prompts', directory, '--confirm')['reviewers']:
+                text = Path(job['prompt']).read_text()
+                if directory.name == 'iter-2':
+                    self.assertIn('前回の修正概要:\nF3 確認する修正概要', text)
+                else:
+                    self.assertNotIn('前回の修正概要', text)
+                self.assertIn('## 異議を出してよい方針', text)
+                self.assertIn('D1（記録: iter-1、関連: F1, F2）異議対象\n', text)
+                self.assertIn('異議対象2', text)
+                self.assertIn('異議対象10', text)
+                self.assertLess(text.index('D1（'), text.index('D2（'))
+                self.assertLess(text.index('D2（'), text.index('D10（'))
+                self.assertIn('理由: 表示契約を維持する', text)
+                self.assertIn('誤っている可能性がある。具体的な不備を示せるなら決定 ID', text)
+                self.assertIn('保留本文 理由: 保留理由', text)
+                for excluded in ('却下本文', '却下理由', '関連なし', '再報告基準', '保留だけ',
+                                 '未解決だけの方針', '指摘は出さない'):
+                    self.assertNotIn(excluded, text)
+        for action, options in [('fix', ['--iteration', '2', '--summary', '修正']),
+                                ('hold', ['--reason', '見送り'])]:
+            self.call('ledger', self.run, action, 'F1', *options)
+            plan = self.call('prompts', self.run / 'iter-2', '--confirm')
+            for job in plan['reviewers']:
+                text = Path(job['prompt']).read_text()
+                self.assertNotIn('異議を出してよい方針', text)
+                if action == 'hold':
+                    self.assertIn('F1 日本語.py:3 却下本文 理由: 見送り', text.splitlines())
+        self.stats_gate(self.run / 'iter-2')
+        self.assertEqual(self.stats_rows()[-1]['decisions']['triage'], 1)
+
+    def test_confirm_examples_unlinked_standing_policy_and_target_diff(self):
+        self.changed_repository('--diff-budget', '1')
+        config = Path(self.env['XDG_CONFIG_HOME']) / 'multi-review/decisions.json'
+        config.parent.mkdir(parents=True)
+        self.write_json(config, self.decision())
+        root = self.root / 'standing-confirm'
+        self.call('init', root, '--cwd', self.repo)
+        plan = self.call('prompts', root / 'iter-1')
+        for job in plan['reviewers']:
+            text = Path(job['prompt']).read_text()
+            self.assertIn('## 決定事項', text)
+            self.assertIn(self.decision()['body'], text)
+        plan = self.call('prompts', root / 'iter-1', '--confirm')
+        for job in plan['reviewers']:
+            text = Path(job['prompt']).read_text()
+            self.assertNotIn('異議を出してよい方針', text)
+            self.assertNotIn(self.decision()['body'], text)
+        plan = self.call('prompts', self.iter, '--confirm')
+        self.assertIn('+change', (self.iter / 'target.diff').read_text())
+        self.assertTrue(all(str(self.iter / 'target.diff') in Path(j['prompt']).read_text()
+                            for j in plan['reviewers']))
+
+    def test_confirm_examples_legacy_stats_and_fifth_iteration(self):
+        run = self.read_json(self.run / 'run.json')
+        run.pop('confirmIterations', None)
+        self.write_json(self.run / 'run.json', run)
+        self.stats_gate()
+        self.assertIs(self.stats_rows()[-1]['confirm'], False)
+        plan = self.call('prompts', self.iter)
+        plan.pop('confirm')
+        self.write_json(self.iter / 'prompts.json', plan)
+        self.call('review', self.iter)
+        self.stats_gate()
+        self.assertIs(self.stats_rows()[-1]['confirm'], False)
+        for number in range(2, 6):
+            self.call('prompts', self.run / f'iter-{number}', *(['--confirm'] if number == 5 else []))
+        self.assertEqual(self.read_json(self.run / 'run.json')['confirmIterations'], [5])
+        saved = {p: p.read_bytes() for p in self.run.rglob('*') if p.is_file()}
+        self.call('prompts', self.run / 'iter-6', '--confirm', code=1)
+        self.assertIn('iteration must be iter-1 through iter-5', self.last_stderr)
+        self.assertEqual({p: p.read_bytes() for p in self.run.rglob('*') if p.is_file()}, saved)
+
+    def test_confirm_save_failures_do_not_consume_iteration_or_count(self):
+        self.call('prompts', self.iter)
+        original = [(self.run / name).read_bytes() for name in ('run.json', 'findings.json')]
+        second = self.run / 'iter-2'
+        second.mkdir()
+        for path in [second / 'claude.prompt.md', second / 'target.json', self.run / 'findings.json',
+                     self.run / 'run.json', self.run / 'ledger.md', second / 'prompts.json']:
+            with self.subTest(path=path):
+                self.fail_replacement(path, 'prompts', second, '--confirm')
+                self.assertEqual([(self.run / name).read_bytes() for name in ('run.json', 'findings.json')], original)
+                self.assertFalse((second / 'prompts.json').exists())
+        self.call('prompts', second, '--confirm')
+        self.assertEqual(self.read_json(self.run / 'run.json')['confirmIterations'], [2])
+
+    def test_confirm_rollback_failure_preserves_error_and_restores_run(self):
+        renamed = self.run.with_name('multi-review-\udcff')
+        self.run.rename(renamed)
+        self.run = renamed
+        self.iter = self.run / 'iter-1'
+        self.call('prompts', self.iter)
+        originals = {self.run / name: (self.run / name).read_bytes()
+                     for name in ('findings.json', 'run.json')}
+        second = self.run / 'iter-2'
+        write = mr.write_atomic
+        def failing_write(path, data):
+            nonlocal primary_failed, rollback_failed
+            if path == failure_path and not primary_failed:
+                primary_failed = True
+                raise failure_type('injected save failure')
+            if primary_failed and path == failed_path and not rollback_failed:
+                rollback_failed = True
+                raise OSError('injected rollback failure')
+            return write(path, data)
+        for failure_path in (second / 'prompts.json', self.run / 'run.json'):
+            for failure_type in (OSError, KeyboardInterrupt):
+                for failed_path in originals:
+                    with self.subTest(save=failure_path, error=failure_type, rollback=failed_path):
+                        primary_failed = rollback_failed = False
+                        for path, original in originals.items():
+                            write(path, original)
+                        with patch.object(sys, 'argv', ['mr', 'prompts', str(second), '--confirm']), \
+                                patch.dict(os.environ, self.env), patch.object(mr.signal, 'signal'), \
+                                patch.object(mr, 'write_atomic', failing_write), redirect_stderr(io.StringIO()) as stderr:
+                            self.assertEqual(mr.main(), 1)
+                        self.assertIn('interrupted' if failure_type is KeyboardInterrupt else 'injected save failure',
+                                      stderr.getvalue().splitlines())
+                        self.assertIn(mr.display_path(str(failed_path)) + ': injected rollback failure',
+                                      stderr.getvalue().splitlines())
+                        for path, original in originals.items():
+                            if path != failed_path:
+                                self.assertEqual(path.read_bytes(), original)
+
+    def test_confirm_decision_section_exact_byte_limit(self):
+        self.add()
+        self.call('ledger', self.run, 'reject', 'F1', '--reason', '却下')
+        item = self.decision(findingIds=['F1'])
+        self.add_decisions(item)
+        plan = self.call('prompts', self.iter)
+        text = Path(plan['reviewers'][0]['prompt']).read_text()
+        section = text[text.index('## 決定事項'):text.index('レビュー対象（')].rstrip('\n') + '\n'
+        padding = 8192 - len(section.encode())
+        source = self.root / 'sized.json'
+        for delta in (-1, 0, 1):
+            self.call('decisions', self.run, 'remove', self.read_json(self.run / 'decisions.json')['decisions'][0]['id'])
+            self.write_json(source, dict(item, body=item['body'] + 'x' * (padding + delta)))
+            self.call('decisions', self.run, 'add', '--input', source, code=1 if delta == 1 else 0)
+            if delta == 1:
+                self.assertIn('8192', self.last_stderr)
+            else:
+                plan = self.call('prompts', self.iter)
+                text = Path(plan['reviewers'][0]['prompt']).read_text()
+                section = text[text.index('## 決定事項'):text.index('レビュー対象（')].rstrip('\n') + '\n'
+                self.assertEqual(len(section.encode()), 8192 + delta)
+                normal_size = len(section.encode())
+                plan = self.call('prompts', self.iter, '--confirm')
+                text = Path(plan['reviewers'][0]['prompt']).read_text()
+                section = text[text.index('## 異議を出してよい方針'):text.index('レビュー対象（')].rstrip('\n') + '\n'
+                self.assertLess(len(section.encode()), normal_size)
+                self.assertIn(item['body'] + 'x' * (padding + delta), section)
+        saved = (self.iter / 'prompts.json').read_bytes()
+        self.write_json(source, dict(item, body=item['body'] + 'x' * padding))
+        self.call('decisions', self.run, 'add', '--input', source)
+        value = self.read_json(self.run / 'decisions.json')
+        value['decisions'][0]['body'] += 'x'
+        self.write_json(self.run / 'decisions.json', value)
+        self.call('prompts', self.iter, '--confirm', code=1)
+        self.assertIn('decisions section is 8193 bytes', self.last_stderr)
+        self.assertEqual((self.iter / 'prompts.json').read_bytes(), saved)
+
+    def test_confirm_stats_invalid_flags_and_disabled(self):
+        self.call('prompts', self.iter, '--confirm')
+        plan = self.read_json(self.iter / 'prompts.json')
+        for flag in (None, 0, 1, 'true', []):
+            with self.subTest(flag=flag):
+                self.write_json(self.iter / 'prompts.json', dict(plan, confirm=flag))
+                self.call('review', self.iter, code=1)
+                self.assertIn('invalid prompts.json confirm', self.last_stderr)
+                result = self.stats_gate()
+                self.assertIn('prompts.json: invalid prompts.json confirm', result['statsError'])
+                self.assertEqual(self.stats_rows(), [])
+        path = self.iter / 'prompts.json'
+        for content in ('[]', '{broken', None):
+            with self.subTest(content=content):
+                path.unlink()
+                if content is None:
+                    path.symlink_to(self.root / 'missing-prompts')
+                else:
+                    path.write_text(content)
+                result = self.stats_gate()
+                self.assertIn(str(path) + ': ', result['statsError'])
+                self.assertEqual(self.stats_rows(), [])
+        self.env['MR_NO_STATS'] = '1'
+        self.assertNotIn('statsError', self.stats_gate())
+
+    def test_confirm_gate_branches_and_rules(self):
+        self.ready_diff()
+        self.call('prompts', self.iter, '--confirm')
+        (self.repo / 'a.txt').write_text('original\n')
+        self.call('fixdiff', self.iter)
+        self.assertEqual(self.stats_gate()['next'], 'finish')
+        (self.repo / 'a.txt').write_text('fixed\n')
+        task = self.root / 'task.md'
+        task.write_text('修正する')
+        self.call('task', self.iter, '--input', task)
+        self.call('fixdiff', self.iter)
+        self.call('fixdiff', self.iter, '--after-check')
+        self.fake('jev-guard', "print('候補なし')\n")
+        self.assertEqual(self.call('rules', self.iter)['status'], 'clear')
+        for verdict, code, next_step in [
+                (self.verdict(), 0, 'caller_decision'),
+                (self.verdict(verdict='skippable', reviewPrompt='確認'), 0, 'caller_decision'),
+                ({}, 1, 'rereview'), ({}, 0, 'rereview'), ({}, 2, 'awaiting_instruction')]:
+            self.fake_gate(verdict, code)
+            self.assertEqual(self.stats_gate(code=2 if code == 2 else 0)['next'], next_step)
+            self.assertIs(self.stats_rows()[-1]['confirm'], True)
+        (self.bin / 'jev-guard').unlink()
+        self.assertEqual(self.stats_gate()['next'], 'rereview')
+        for number in range(2, 6):
+            self.call('prompts', self.run / f'iter-{number}')
+        self.assertEqual(self.stats_gate()['next'], 'limit')
+        (self.iter / 'fix.diff').write_text('改変')
+        self.assertEqual(self.stats_gate()['next'], 'abort')
+        self.assertTrue(all(row['confirm'] for row in self.stats_rows()))
+
+    def test_confirm_target_scope_and_proximity_match_rereview(self):
+        self.changed_repository('--path', 'a.txt', '--diff-budget', '1')
+        self.call('snapshot', self.iter)
+        (self.repo / 'a.txt').write_text('修正\n')
+        (self.repo / 'outside.txt').write_text('範囲外の修正\n')
+        self.call('fixdiff', self.iter)
+        second = self.run / 'iter-2'
+        self.call('prompts', second)
+        expected = [(second / name).read_bytes() for name in ('target.diff', 'target.json')]
+        self.call('prompts', second, '--confirm')
+        self.assertEqual([(second / name).read_bytes() for name in ('target.diff', 'target.json')], expected)
+        self.assertIn('outside.txt', (second / 'target.json').read_text())
+        self.fake('claude', 'print(' + repr(self.report(1, path='a.txt') + self.report(7, path='a.txt')) + ')')
+        self.call('review', second)
+        findings = self.call('collect', second)['findings']
+        self.assertEqual({i['line']: i['nearPreviousFix'] for i in findings}, {1: True, 7: False})
+
+    def test_confirm_non_git_copy_and_no_head(self):
+        (self.repo / 'a.txt').write_text('元の本文\n')
+        self.call('prompts', self.iter, '--confirm')
+        self.call('snapshot', self.iter)
+        (self.repo / 'a.txt').write_text('修正後の本文\n')
+        self.call('fixdiff', self.iter)
+        self.assertEqual(self.stats_gate()['next'], 'rereview')
+        second = self.run / 'iter-2'
+        self.call('prompts', second)
+        expected = (second / 'claude.prompt.md').read_bytes()
+        self.call('prompts', second, '--confirm')
+        self.assertEqual((second / 'claude.prompt.md').read_bytes(), expected)
+        self.git('init', '-b', 'main')
+        root = self.root / 'no-head'
+        self.call('init', root, '--cwd', self.repo, '--path', '.')
+        self.call('prompts', root / 'iter-1', '--confirm')
+        (self.repo / 'a.txt').write_text('HEAD 不在の再レビュー本文\n')
+        second = root / 'iter-2'
+        self.call('prompts', second)
+        names = ('target.json', 'claude.prompt.md')
+        expected = [(second / name).read_bytes() for name in names]
+        self.assertIn('HEAD 不在の再レビュー本文', expected[1].decode())
+        self.call('prompts', second, '--confirm')
+        self.assertEqual([(second / name).read_bytes() for name in names], expected)
+        self.assertEqual(self.read_json(root / 'run.json')['confirmIterations'], [1, 2])
+
+    def test_confirm_base_scope_and_next_normal_settings(self):
+        self.repository()
+        self.git('checkout', '-b', 'topic')
+        (self.repo / 'a.txt').write_text('コミット済み\n')
+        self.git('commit', '-am', 'topic')
+        self.initialize('--ja-review', '--ja-skill', self.ja_skill())
+        self.assertEqual(self.read_json(self.run / 'run.json')['mode'], 'base')
+        self.call('prompts', self.iter)
+        (self.repo / 'extra.txt').write_text('未コミット\n')
+        second = self.run / 'iter-2'
+        self.call('prompts', second)
+        expected = (second / 'claude.prompt.md').read_bytes()
+        plan = self.call('prompts', second, '--confirm')
+        self.assertEqual([j['source'] for j in plan['reviewers']],
+                         ['claude-general', 'codex-general', 'claude-bug-hunt', 'claude-test-quality'])
+        self.assertEqual((second / 'claude.prompt.md').read_bytes(), expected)
+        self.assertIn('コミット済み', expected.decode())
+        self.assertIn('未コミット', expected.decode())
+        self.assertFalse(any(j['cli'] == 'agy' for j in plan['reviewers']))
+        self.call('review', second)
+        self.call('collect', second)
+        plan = self.call('prompts', self.run / 'iter-3')
+        self.assertEqual([j['source'] for j in plan['reviewers']],
+                         ['claude-general', 'codex-general', 'claude-pattern-consistency',
+                          'claude-naming-symmetry', 'ja-review'])
+        self.assertIs(plan['confirm'], False)
+        self.assertEqual(self.read_json(self.run / 'run.json')['confirmIterations'], [2])
+        self.assertFalse((second / 'ja-review').exists())
+
+    def test_confirm_all_cli_missing_preserves_count(self):
+        for cli in ('claude', 'codex'):
+            (self.bin / cli).unlink()
+        original = (self.run / 'run.json').read_bytes()
+        self.call('prompts', self.iter, '--confirm', code=1)
+        self.assertIn('no installed reviewer selected', self.last_stderr)
+        self.assertEqual((self.run / 'run.json').read_bytes(), original)
+        self.assertFalse((self.iter / 'prompts.json').exists())
+
     def test_init_refuses_leftover_decisions(self):
         for kind in ('file', 'link', 'dangling', 'markdown', 'markdown-link', 'markdown-dangling'):
             with self.subTest(kind=kind):
@@ -2319,6 +2734,9 @@ with patch.object(mr.os, 'write', write):
         text = (second / 'claude.prompt.md').read_text(encoding='utf-8')
         self.assertIn('保留の理由', text)
         self.assertIn('検討済みのため再報告不要', text)
+        expected = (second / 'claude.prompt.md').read_bytes()
+        self.call('prompts', second, '--reconsider', '')
+        self.assertEqual((second / 'claude.prompt.md').read_bytes(), expected)
         self.call('prompts', second, '--reconsider', 'F1')
         text = (second / 'claude.prompt.md').read_text(encoding='utf-8')
         self.assertNotIn('保留の理由', text)
@@ -3373,6 +3791,20 @@ else:
                 self.assertEqual(int(re.search(pattern, docs)[1]), run[key])
         self.assertEqual(int(re.search(r'(\d+) bytes 以下の引数バッチ', docs)[1]), mr.JA_BATCH_LIMIT)
         self.assertEqual(int(re.search(r'節全体の上限は(\d+) bytes', docs)[1]), mr.DECISIONS_MAX_BYTES)
+        self.assertEqual(int(re.search(r'確認レビューは1実行Rで最大(\d+)回', docs)[1]), 2)
+        self.add()
+        self.call('ledger', self.run, 'reject', 'F1', '--reason', '却下')
+        self.add_decisions(self.decision(findingIds=['F1']))
+        plan = self.call('prompts', self.iter, '--confirm')
+        confirm_docs = docs.split('## 確認レビュー（Step 7）', 1)[1].split('\n## ', 1)[0]
+        for job in plan['reviewers']:
+            if not job['source'].endswith('-general'):
+                self.assertIn('`' + job['source'].split('-', 1)[1] + '`', confirm_docs)
+            text = Path(job['prompt']).read_text()
+            section = text[text.index('## 異議を出してよい方針'):text.index('レビュー対象（')]
+            heading, description, _ = section.split('\n\n', 2)
+            self.assertIn(heading.removeprefix('## '), confirm_docs)
+            self.assertIn(description, confirm_docs)
         self.assertEqual(int(re.search(r'`--max-bytes` の既定は(\d+) bytes', docs)[1]), mr.INVENTORY_MAX_BYTES)
         self.assertEqual(int(re.search(r'値は(\d+)文字', docs)[1]), mr.INVENTORY_VALUE_CHARS)
         self.assertEqual(int(re.search(r'シグネチャ・名前は(\d+)文字', docs)[1]), mr.INVENTORY_SIGNATURE_CHARS)

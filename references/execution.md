@@ -10,7 +10,7 @@
 | コマンド・引数 | 入出力・契約 |
 | --- | --- |
 | `mr init R --cwd PATH [--path PATH]... [--profile default\|codex] [--roles SLUG,...] [--exclude CLI]... [--only CLI]... [--ja-review] [--ja-skill PATH] [--base-summary TEXT] [--no-standing-decisions]` | `run.json`、空の `findings.json`・`ledger.md`、`iter-1/`。常設の決定事項を取り込む（停止は `--no-standing-decisions`、「決定事項」を参照）。対象省略なら未コミット変更→デフォルトブランチとの差分。デフォルトブランチは origin/HEAD→main→master。空範囲・未検出・非 git の対象省略・複数リポジトリは中断。`--cwd` は必須、パスはそこから解釈する。対象の1行要約は `--base-summary` で保存し、省略時はブランチ名・比較元または指定パス・ファイル数を使う |
-| `mr prompts I [--roles SLUG,...] [--reconsider F1,F2,...] [--ja-review\|--no-ja-review]` | 正本から `*.prompt.md`、`target.json`、`prompts.json` を生成。巨大差分は `target.diff`。次のイテレーションの準備と台帳の iteration 更新も担当。役割変更・再評価・ja-review 実行の判断を引数で渡す |
+| `mr prompts I [--confirm] [--roles SLUG,...] [--reconsider F1,F2,...] [--ja-review\|--no-ja-review]` | 正本から `*.prompt.md`、`target.json`、`prompts.json` を生成。巨大差分は `target.diff`。次のイテレーションの準備と台帳の iteration 更新も担当。役割変更・再評価・ja-review 実行の判断を引数で渡す。確認時の契約は「確認レビュー」を参照 |
 | `mr review I` | 呼び出し元がバックグラウンドで起動する。mr は全レビュアーの完了まで待つ。同時実行は最大8ジョブ。生成済みプロンプトで並列実行し、既存名の出力・試行別 stdout/stderr・`review.json` を保存。全レビュアー失敗なら終了1。一部欠席は結果に残して続行 |
 | `mr collect I` | 完了した成功出力だけを解析し、位置順の `collected.json`・`collected.md` を生成。意味による重複統合・選別・台帳登録はしない |
 | `mr snapshot I` | `snapshot.mode` と `snapshot.tree` または `snapshot.files`・`snapshot/`。保存済み基準の取り直しは拒否 |
@@ -38,7 +38,7 @@ git ではリポジトリルート、非 git では `--cwd` を共通 cwd にす
 ## 対象埋め込みの生成（Step 4）
 
 `prompts` は未コミット変更モードで HEAD との差分・untracked 本文・ファイル一覧を含め、HEAD 不在では全対象本文を使う。ベース差分モードは merge-base と作業ツリーを比較し、累積の未コミット変更・untracked 本文を含める。パス指定は対象パスを示し、HEAD がある git の再レビューでは指定パス内の累積未コミット差分と untracked 本文に、過去の修正 diff に含まれる範囲外の変更行・ファイル一覧を加える。HEAD 不在の再レビューは指定範囲と staged・unstaged・untracked の全対象本文を合わせる。リンクは参照先のパスだけを示し、本文を読まない。非 UTF-8 のパスは、git 差分では Git の引用表記、それ以外の文書では JSON 文字列のエスケープ表記を使い、ファイル操作と台帳では元の値を保つ。全レビュアーに同じ範囲を渡し、git 差分の未変更行は指摘対象に含めない。
-役割本文は `references/roles.md`、共通報告形式は SKILL.md の正本を毎回読む。再レビュー時の却下・保留一覧と直前イテレーションの修正概要は台帳から生成し、前提が変わった項目は呼び出し元が `--reconsider` で除外する。
+役割本文は `references/roles.md`、共通報告形式は SKILL.md の正本を毎回読む。通常の再レビュー時の却下・保留一覧と直前イテレーションの修正概要は台帳から生成し、前提が変わった項目は呼び出し元が `--reconsider` で除外する。
 
 ja-review の範囲計算は既存成果物の失効より前に行う。失敗時に既存成果物を残す保証は範囲計算の失敗に限り、その後のジョブ生成や CLI の存在確認の失敗には及ばない。不正な diff は、再レビュー用に作り直した修正差分なら `reconstructed re-review diff`、git の差分なら `git diff` を前に付けた診断を出して終了1にする。ja-review が無効または excluded のときは範囲計算を行わない。
 
@@ -194,9 +194,23 @@ init の stdout は run.json のキー（取り込みがあれば `decisionSeque
 
 `decisions.md` は種別ごとに ID の数値順で本文・理由・記録イテレーション・関連指摘を表示し、常設由来には `出所: 利用者共通・プロジェクト`（該当するものだけ）を添える。空の種別見出しは出さず、全件ゼロなら「決定事項なし」。生成物であることと編集先を先頭のコメントに示し、レビュアー向けの固定指示はプロンプトに埋め込むときだけ付ける。プロンプトの節と同じ生成処理を使い、固定指示を付けた節全体の上限は8192 bytes（UTF-8、見出し・固定指示・記録情報・改行を含む）。超える add は保存前に拒否し、古い決定の統合を促す。render・prompts でも上限を検査し、切り捨てない。
 
-通常プロンプトは役割本文・共通報告形式の後、対象本文の前に節を入れる。ja-review は外部テンプレートの後、FILE 本文の前に各バッチへ入れ、節も引数バッチの上限に数える。policy は初回から、triage は iter-2 以降だけ載せ、該当する決定がゼロなら節を出さない。decisions.md には常に両種別を載せる。`--reconsider` の対象指摘を `findingIds` に含む triage 決定は、そのプロンプトから外す。既存の却下・保留一覧は残す。決定事項に反する指摘・基準に当たる指摘は報告させず、前提が崩れている具体例を示せる場合だけ、共通報告形式の「問題:」欄、ja-review の「理由:」欄に決定 ID・入力・手順・結果を書かせる。
+通常レビューのプロンプトは役割本文・共通報告形式の後、対象本文の前に節を入れる。ja-review は外部テンプレートの後、FILE 本文の前に各バッチへ入れ、節も引数バッチの上限に数える。policy は初回から、triage は iter-2 以降だけ載せ、該当する決定がゼロなら節を出さない。decisions.md には常に両種別を載せる。`--reconsider` の対象指摘を `findingIds` に含む triage 決定は、そのプロンプトから外す。既存の却下・保留一覧は残す。決定事項に反する指摘・基準に当たる指摘は報告させず、前提が崩れている具体例を示せる場合だけ、共通報告形式の「問題:」欄、ja-review の「理由:」欄に決定 ID・入力・手順・結果を書かせる。
 
 決定事項の変更は成果物を失効させず、記録後に `mr prompts` で作るプロンプトから効く。決定事項を変えた後に、作成済みで未実行のプロンプトがあれば `mr prompts` を実行し直す。修正担当への受け渡しは「委譲の共通指示」に従う。
+
+## 確認レビュー（Step 7）
+
+`mr prompts I --confirm` は通常の終了前にもう一度見るプロンプトを作る。総合2インスタンスと専門役割 `bug-hunt`・`test-quality` だけを使い、プロファイル・CLI単位の除外・専門担当CLI未導入時の扱いは通常と同じ。ja-review は追加せず、run.json の役割・ja-review設定も変えない。`--roles`・`--ja-review`・`--no-ja-review`・`--reconsider` との同時指定は、空文字の指定も含め終了2。
+
+確認レビューは挙動とテストの取りこぼしを見る回で、回数に上限があるため、修正が日本語の文言に触れても ja-review は起動しない。その場合は呼び出し元が修正 diff の日本語を自分で読んで確かめ、確かめたことを最終レポートに書く。
+
+triage は載せない。policy は `findingIds` に現在の台帳で却下の指摘を1つ以上含むものだけを、通常の決定節の位置に「異議を出してよい方針」として本文・理由・決定 ID・記録情報・出所付きで載せる。固定説明は「この方針は呼び出し元がレビュアーの指摘を却下して決めたもので、誤っている可能性がある。具体的な不備を示せるなら決定 ID を書いて指摘してよい。」とし、通常の報告抑制文は付けない。該当policyがなければ節を出さない。確認用の節は通常の節より短いため、全決定に対する既存のサイズ検査で同じ上限を保証する。
+
+「検討済みのため再報告不要」には保留だけを載せ、保留の理由では区別しない。iter-1でもこの一覧を載せる。対象本文・差分・巨大差分の退避・前回の修正概要は既存のイテレーション番号ごとの規則を使う。
+
+確認レビューは1実行Rで最大2回。生成成功時に、run.json の `confirmIterations` へイテレーション番号を重複なし・番号順で記録する。同じIの再生成では増やさず、通常へ戻しても履歴を消さない。新たな番号が上限を超える場合は既存成果物の失効前に終了1にする。生成失敗では履歴と台帳のiterationを進めないが、生成途中の成果物全体の復元は保証しない。旧run.jsonの履歴欠落は空配列として扱う。確認回も通常のイテレーション上限に数え、iter-1も指定できる。
+
+prompts.json とstdoutの `confirm` は確認ならtrue、通常ならfalse。review・collect・snapshot・fixdiff・rules・gateは既存の契約で動く。統計は下表の `confirm` で区別する。確認で妥当な指摘がゼロだった回は修正もゲートもないため、統計の行は残らない。
 
 ## ゲート `mr gate`（Step 7）
 
@@ -205,6 +219,7 @@ init の stdout は run.json のキー（取り込みがあれば `decisionSeque
 | 統計の項目 | 内容 |
 | --- | --- |
 | `reviewId`・`cwd`・`mode`・`profile`・`iteration`・`recordedAt` | R のディレクトリ名、run.json の対象・モード・プロファイル、I の番号、記録時刻（UTC ISO 8601） |
+| `confirm` | prompts.json の同名の真偽値。旧形式・ファイル不存在はfalse、不正な値はstatsError。旧統計行の欠落も読み取り側はfalseとして扱う |
 | `collected` | `total`・`near`・`outside`・`unknown` は指摘総数と近傍の三値別件数。`bySource` は source 別件数。位置単位でなく指摘単位 |
 | `ledger` | `unresolved`・`fixed`・`on_hold`・`rejected` の件数と、fixedIteration が I の番号と一致する `fixedThisIteration` |
 | `fixDiff` | `additions`・`deletions` はハンク本文の追加・削除行数。ファイル見出しは除く。`empty` は fix.diff が空かどうか。バイナリ変更などは追加・削除の行数がともに0でも空とは限らない |
@@ -241,6 +256,7 @@ init の stdout は run.json のキー（取り込みがあれば `decisionSeque
 
 - 対象: <Step 1 で確定した対象の1行要約>
 - イテレーション: <N>（打ち切った場合はその理由）
+- 確認レビュー: <実行回数と各回の妥当な指摘件数・保留件数。未実行・失敗・上限で省略した回も区別する>
 - プロファイル: <default|codex>
 - レビュアー: <起動した CLI・役割・モデル・effort> / 欠席: <なし or 一覧>
 - ゲート: <イテレーションごとに「iter-1: …」と記載。ラベルと記載事項は SKILL.md Step 8 を参照>
