@@ -3266,6 +3266,14 @@ Path('leaked').touch()
                 ({'newRisk': {'value': False, 'rationale': 1}}, 'invalid newRisk rationale'),
                 ({'sections': [{}]}, 'invalid section'),
                 ({'sections': [{'path': ''}]}, 'invalid section'),
+                ({'reason': 'low_confidence', 'sections': [{'path': 'a', 'findingIds': None}]}, 'invalid section findingIds'),
+                ({'reason': 'low_confidence', 'sections': [{'path': 'a', 'findingIds': 'F1'}]}, 'invalid section findingIds'),
+                ({'reason': 'low_confidence', 'sections': [{'path': 'a', 'findingIds': [['F1']]}]}, 'invalid section findingIds'),
+                ({'reason': 'low_confidence', 'sections': [{'path': 'a', 'findingIds': [{}]}]}, 'invalid section findingIds'),
+                ({'reason': 'low_confidence', 'sections': [{'path': 'a', 'findingIds': ['']}]}, 'invalid section findingIds'),
+                ({'reason': 'low_confidence', 'sections': [{'path': 'a', 'findingIds': [1]}]}, 'invalid section findingIds'),
+                ({'reason': 'low_confidence', 'sections': [{'path': 'a', 'findingIds': [' ']}]}, 'invalid section findingIds'),
+                ({'reason': 'low_confidence', 'sections': [{'path': 'a', 'findingIds': [False]}]}, 'invalid section findingIds'),
                 ({'sections': [{'path': 'a', 'error': 1}]}, 'invalid section error'),
                 ({'sections': [{'path': 'a', 'newRiskRationale': 1}]}, 'invalid section rationale'),
                 ({'sections': [{'path': 'a', 'newRiskProbability': True}]}, 'invalid section risk probability'),
@@ -3276,6 +3284,7 @@ Path('leaked').touch()
                 result = self.call('gate', self.iter)
                 self.assertEqual(result['reason'], reason)
                 self.assertEqual(result['next'], 'rereview')
+                self.assertEqual(result, self.read_json(self.iter / 'gate.json'))
         for changes in [{'findings': [{'id': 'F1', 'resolved': None}]},
                         {'sections': [{'path': 'a', 'error': ''}]},
                         {'reason': 'no_fixed_findings'}]:

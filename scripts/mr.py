@@ -1879,6 +1879,9 @@ def validate_verdict(value):
     optional_str(risk, 'rationale', 'newRisk rationale')
     for section in value['sections']:
         require(isinstance(section, dict) and nonempty(section.get('path')), 'invalid section')
+        if 'findingIds' in section:
+            require(isinstance(section['findingIds'], list) and all(nonempty(i) for i in section['findingIds']),
+                    'invalid section findingIds')
         optional_str(section, 'error', 'section error')
         if 'newRiskProbability' in section:
             probability = section['newRiskProbability']
