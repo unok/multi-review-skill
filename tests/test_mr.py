@@ -1511,6 +1511,135 @@ with patch.object(pwd, 'getpwuid', side_effect=KeyError('no home')):
     def fake_gate(self, value, code=0):
         self.fake('jev-guard', 'import sys\nprint(' + repr(json.dumps(value)) + ')\nsys.exit(' + str(code) + ')\n')
 
+    def test_gate_min_confidence_argument_and_verdicts(self):
+        self.ready_diff()
+        for changes, eligible in [
+                ({'verdict': 'skippable', 'reviewPrompt': 'confirm'}, False),
+                ({'reason': 'low_confidence',
+                  'findings': [{'id': 'F1', 'resolved': True, 'confidence': .1,
+                                'probability': .56, 'rationale': 'uncertain fix'}],
+                  'newRisk': {'value': False, 'confidence': 1, 'probability': 0},
+                  'rechecks': [{'findingIds': ['F1'], 'paths': ['a.txt'], 'mode': 'full'},
+                               {'findingIds': ['F2'], 'paths': ['b.txt'], 'mode': 'full'}],
+                  'sections': []}, True),
+                ({'reason': 'oversized', 'oversized': True}, False)]:
+            with self.subTest(changes=changes):
+                (self.root / 'gate-argv.json').unlink(missing_ok=True)
+                value = self.verdict(**changes)
+                self.fake('jev-guard', "import json,sys\nfrom pathlib import Path\n"
+                          + 'Path(' + repr(str(self.root / 'gate-argv.json')) + ').write_text(json.dumps(sys.argv))\n'
+                          + 'print(' + repr(json.dumps(value)) + ')\n')
+                result = self.call('gate', self.iter)
+                argv = self.read_json(self.root / 'gate-argv.json')
+                self.assertIn('--min-confidence', argv)
+                self.assertEqual(argv[argv.index('--min-confidence') + 1], '0.2')
+                self.assertEqual(result['status'], 'evaluated')
+                self.assertEqual(result['next'], 'caller_decision')
+                self.assertEqual(result['verdict'], value)
+                self.assertEqual(result['overruleEligible'], eligible)
+                if changes.get('reason') == 'low_confidence':
+                    self.assertEqual(result['grounds'], [{'kind': 'finding', 'id': 'F1',
+                        'confidence': .12, 'rationale': 'uncertain fix',
+                        'rechecks': [{'findingIds': ['F1'], 'paths': ['a.txt'], 'mode': 'full'}]}])
+                    self.assertEqual(self.stats_rows()[-1]['gate']['verdictReason'], 'low_confidence')
+
+    def test_gate_low_confidence_boundaries_and_missing_evidence(self):
+        self.ready_diff()
+        for confidence, probability, expected in [(.19, .595, .19), (.2, .599, .198),
+                (.2, .6, None), (.21, .605, None), (0, .5, 0), (.1, .7, None),
+                (None, None, None), (.1, None, .1), (.2, None, None)]:
+            with self.subTest(confidence=confidence, probability=probability):
+                finding = {'id': 'F1', 'resolved': True, 'confidence': confidence,
+                           'probability': probability, 'rationale': 'uncertain'}
+                self.fake_gate(self.verdict(reason='low_confidence', findings=[finding],
+                    newRisk={'value': False, 'confidence': 1, 'probability': 0}, sections=[]))
+                result = self.call('gate', self.iter)
+                self.assertEqual(result['status'], 'evaluated')
+                self.assertEqual(result['grounds'], [] if expected is None else [
+                    {'kind': 'finding', 'id': 'F1', 'confidence': expected,
+                     'rationale': 'uncertain', 'rechecks': []}])
+                self.assertEqual(result['overruleEligible'], expected is not None)
+        for changes, grounds in [
+                ({'findings': []}, []),
+                ({'findings': [{'id': 'F1', 'resolved': True}]}, []),
+                ({'findings': [{'id': 'F1', 'resolved': False}]},
+                 [{'kind': 'finding', 'id': 'F1', 'rationale': None, 'rechecks': []}]),
+                ({'findings': [{'id': 'F1', 'resolved': None, 'confidence': .1}]},
+                 [{'kind': 'finding', 'id': 'F1', 'confidence': .1, 'rationale': None, 'rechecks': []}]),
+                ({'findings': [{'id': 'F1', 'resolved': True, 'confidence': .1}],
+                  'sections': [{'path': 'a.txt', 'error': 'failed'}]},
+                 [{'kind': 'finding', 'id': 'F1', 'confidence': .1, 'rationale': None, 'rechecks': []}])]:
+            with self.subTest(changes=changes):
+                value = self.verdict(reason='low_confidence', newRisk={'value': False}, sections=[])
+                value.update(changes)
+                self.fake_gate(value)
+                result = self.call('gate', self.iter)
+                self.assertFalse(result['overruleEligible'])
+                self.assertEqual(result['grounds'], grounds)
+
+    def test_gate_low_confidence_findings_in_multiple_sections(self):
+        self.ready_diff()
+        for reason, first_ids, second_ids, eligible in [
+                ('low_confidence', ['F1'], ['F1'], False),
+                ('low_confidence', ['F1'], ['F2'], True),
+                ('fix_not_resolved', ['F1'], ['F1'], True),
+                ('low_confidence', ['F1', 'F1'], ['F2'], True),
+                ('low_confidence', ['F1'], [], True),
+                ('low_confidence', ['F1'], None, True)]:
+            with self.subTest(reason=reason, first_ids=first_ids, second_ids=second_ids):
+                sections = [{'path': 'a.txt', 'findingIds': first_ids}, {'path': 'b.txt'}]
+                if second_ids is not None:
+                    sections[1]['findingIds'] = second_ids
+                self.fake_gate(self.verdict(reason=reason,
+                    findings=[{'id': 'F1', 'resolved': reason != 'fix_not_resolved'},
+                              {'id': 'F2', 'resolved': True, 'confidence': .1}],
+                    newRisk={'value': False}, sections=sections))
+                result = self.call('gate', self.iter)
+                self.assertEqual(result['overruleEligible'], eligible)
+                self.assertEqual(result['grounds'], [
+                    {'kind': 'finding', 'id': 'F2', 'confidence': .1, 'rationale': None, 'rechecks': []}]
+                    if reason == 'low_confidence' else [
+                    {'kind': 'finding', 'id': 'F1', 'rationale': None, 'rechecks': []}])
+
+    def test_gate_low_confidence_risk_and_section_grounds(self):
+        self.ready_diff()
+        self.fake_gate(self.verdict(reason='low_confidence',
+            findings=[{'id': 'F1', 'resolved': False, 'confidence': .1, 'rationale': 'fix'}],
+            newRisk={'value': False, 'confidence': .2, 'probability': .401, 'rationale': 'risk'},
+            sections=[{'path': 'a.txt', 'newRiskProbability': .401, 'newRiskRationale': 'section'},
+                      {'path': 'b.txt', 'confidence': .1, 'newRiskProbability': .4},
+                      {'path': 'c.txt', 'newRiskProbability': .6},
+                      {'path': 'd.txt', 'newRiskProbability': .5},
+                      {'path': 'e.txt', 'confidence': .1, 'newRiskProbability': .9},
+                      {'path': 'f.txt', 'confidence': .1}]))
+        result = self.call('gate', self.iter)
+        self.assertTrue(result['overruleEligible'])
+        self.assertEqual(result['grounds'], [
+            {'kind': 'finding', 'id': 'F1', 'confidence': .1, 'rationale': 'fix', 'rechecks': []},
+            {'kind': 'newRisk', 'confidence': .198, 'rationale': 'risk'},
+            {'kind': 'section', 'path': 'a.txt', 'confidence': .198, 'rationale': 'section'},
+            {'kind': 'section', 'path': 'c.txt', 'rationale': None},
+            {'kind': 'section', 'path': 'd.txt', 'confidence': 0, 'rationale': None},
+            {'kind': 'section', 'path': 'e.txt', 'rationale': None}])
+        self.fake_gate(self.verdict(reason='low_confidence', newRisk={'value': False, 'confidence': .1},
+                                    sections=[]))
+        result = self.call('gate', self.iter)
+        self.assertTrue(result['overruleEligible'])
+        self.assertEqual(result['grounds'], [{'kind': 'newRisk', 'confidence': .1, 'rationale': None}])
+        self.fake_gate(self.verdict(reason='low_confidence', findings=[],
+                                    newRisk={'value': None, 'probability': .45}, sections=[]))
+        result = self.call('gate', self.iter)
+        self.assertTrue(result['overruleEligible'])
+        self.assertEqual(result['grounds'], [{'kind': 'newRisk', 'confidence': .1, 'rationale': None}])
+        for reason in ('new_risk', 'fix_not_resolved'):
+            with self.subTest(reason=reason):
+                self.fake_gate(self.verdict(reason=reason,
+                    findings=[{'id': 'F1', 'resolved': True, 'confidence': .1}],
+                    newRisk={'value': False, 'probability': .45}, sections=[]))
+                result = self.call('gate', self.iter)
+                self.assertEqual(result['grounds'], [])
+                self.assertTrue(result['overruleEligible'])
+
     def ja_skill(self):
         skill = self.root / 'ja-skill'
         (skill / 'references').mkdir(parents=True)
@@ -3137,6 +3266,14 @@ Path('leaked').touch()
                 ({'newRisk': {'value': False, 'rationale': 1}}, 'invalid newRisk rationale'),
                 ({'sections': [{}]}, 'invalid section'),
                 ({'sections': [{'path': ''}]}, 'invalid section'),
+                ({'reason': 'low_confidence', 'sections': [{'path': 'a', 'findingIds': None}]}, 'invalid section findingIds'),
+                ({'reason': 'low_confidence', 'sections': [{'path': 'a', 'findingIds': 'F1'}]}, 'invalid section findingIds'),
+                ({'reason': 'low_confidence', 'sections': [{'path': 'a', 'findingIds': [['F1']]}]}, 'invalid section findingIds'),
+                ({'reason': 'low_confidence', 'sections': [{'path': 'a', 'findingIds': [{}]}]}, 'invalid section findingIds'),
+                ({'reason': 'low_confidence', 'sections': [{'path': 'a', 'findingIds': ['']}]}, 'invalid section findingIds'),
+                ({'reason': 'low_confidence', 'sections': [{'path': 'a', 'findingIds': [1]}]}, 'invalid section findingIds'),
+                ({'reason': 'low_confidence', 'sections': [{'path': 'a', 'findingIds': [' ']}]}, 'invalid section findingIds'),
+                ({'reason': 'low_confidence', 'sections': [{'path': 'a', 'findingIds': [False]}]}, 'invalid section findingIds'),
                 ({'sections': [{'path': 'a', 'error': 1}]}, 'invalid section error'),
                 ({'sections': [{'path': 'a', 'newRiskRationale': 1}]}, 'invalid section rationale'),
                 ({'sections': [{'path': 'a', 'newRiskProbability': True}]}, 'invalid section risk probability'),
@@ -3147,6 +3284,7 @@ Path('leaked').touch()
                 result = self.call('gate', self.iter)
                 self.assertEqual(result['reason'], reason)
                 self.assertEqual(result['next'], 'rereview')
+                self.assertEqual(result, self.read_json(self.iter / 'gate.json'))
         for changes in [{'findings': [{'id': 'F1', 'resolved': None}]},
                         {'sections': [{'path': 'a', 'error': ''}]},
                         {'reason': 'no_fixed_findings'}]:
@@ -3790,6 +3928,7 @@ else:
             with self.subTest(key=key):
                 self.assertEqual(int(re.search(pattern, docs)[1]), run[key])
         self.assertEqual(int(re.search(r'(\d+) bytes 以下の引数バッチ', docs)[1]), mr.JA_BATCH_LIMIT)
+        self.assertEqual(float(re.search(r'`--min-confidence ([0-9.]+)`', docs)[1]), mr.GATE_MIN_CONFIDENCE)
         self.assertEqual(int(re.search(r'節全体の上限は(\d+) bytes', docs)[1]), mr.DECISIONS_MAX_BYTES)
         self.assertEqual(int(re.search(r'確認レビューは1実行Rで最大(\d+)回', docs)[1]), 2)
         self.add()

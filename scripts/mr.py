@@ -96,6 +96,8 @@ DOWNSTREAM = {'inventory': (INVENTORY_FILE, INVENTORY_JSON_FILE),
               'collect': ('collected.json', 'collected.md')}
 # jev-guard treats section risk at or above this probability as new risk.
 SECTION_RISK_THRESHOLD = .5
+# jev-guard rereview はこの確信度未満の判定を low_confidence にする。
+GATE_MIN_CONFIDENCE = .2
 DIFF_OPTIONS = ('--no-ext-diff', '--no-textconv', '--no-color',
                 '--src-prefix=a/', '--dst-prefix=b/')
 DIFF_HUNK = re.compile(r'@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@.*')
@@ -1877,6 +1879,9 @@ def validate_verdict(value):
     optional_str(risk, 'rationale', 'newRisk rationale')
     for section in value['sections']:
         require(isinstance(section, dict) and nonempty(section.get('path')), 'invalid section')
+        if 'findingIds' in section:
+            require(isinstance(section['findingIds'], list) and all(nonempty(i) for i in section['findingIds']),
+                    'invalid section findingIds')
         optional_str(section, 'error', 'section error')
         if 'newRiskProbability' in section:
             probability = section['newRiskProbability']
@@ -1893,18 +1898,45 @@ def validate_verdict(value):
     return value
 
 
+def low_confidence_evidence(value, probability_key='probability'):
+    probability = value.get(probability_key)
+    # 指摘と newRisk は probability から算出した値を優先し、数値がなければ confidence を使う。
+    # 区画は newRiskProbability から算出し、confidence は使わない。
+    # jev-guard は区画に confidence を出さず、判定は確率から求めた確信度で行うため。
+    confidence = value.get('confidence') if probability_key == 'probability' else None
+    if probability is not None:
+        # jev-guard は表示用の小数2桁ではなく、小数9桁の確信度で下限を判定する。
+        confidence = round(abs(probability - .5) * 2, 9)
+    return {'confidence': confidence} if confidence is not None and confidence < GATE_MIN_CONFIDENCE else {}
+
+
 def evaluate_verdict(verdict):
+    low_confidence = verdict.get('reason') == 'low_confidence'
     eligible = verdict['verdict'] == 'needed' and \
-        verdict['reason'] in ('fix_not_resolved', 'new_risk') and \
+        verdict['reason'] in ('fix_not_resolved', 'new_risk', 'low_confidence') and \
         all('error' not in s for s in verdict['sections']) and \
         all(type(f['resolved']) is bool for f in verdict['findings'])
-    grounds = [{'kind': 'finding', 'id': f['id'], 'rationale': f.get('rationale'),
-                'rechecks': [r for r in verdict.get('rechecks', []) if f['id'] in r.get('findingIds', [])]}
-               for f in verdict['findings'] if f['resolved'] is False]
-    if verdict['newRisk']['value'] is True:
-        grounds.append({'kind': 'newRisk', 'rationale': verdict['newRisk'].get('rationale')})
-    grounds.extend({'kind': 'section', 'path': s['path'], 'rationale': s.get('newRiskRationale')}
-                   for s in verdict['sections'] if s.get('newRiskProbability', 0) >= SECTION_RISK_THRESHOLD)
+    grounds = []
+    for finding in verdict['findings']:
+        evidence = low_confidence_evidence(finding) if low_confidence else {}
+        if finding['resolved'] is False or evidence:
+            grounds.append({'kind': 'finding', 'id': finding['id'], 'rationale': finding.get('rationale'),
+                'rechecks': [r for r in verdict.get('rechecks', []) if finding['id'] in r.get('findingIds', [])],
+                **evidence})
+    risk = verdict['newRisk']
+    evidence = low_confidence_evidence(risk) if low_confidence else {}
+    if risk['value'] is True or evidence:
+        grounds.append({'kind': 'newRisk', 'rationale': risk.get('rationale'), **evidence})
+    for section in verdict['sections']:
+        evidence = low_confidence_evidence(section, 'newRiskProbability') if low_confidence else {}
+        if section.get('newRiskProbability', 0) >= SECTION_RISK_THRESHOLD or evidence:
+            grounds.append({'kind': 'section', 'path': section['path'],
+                            'rationale': section.get('newRiskRationale'), **evidence})
+    if low_confidence:
+        # 複数区画の指摘は最後の判定しか残らず、下限未満の根拠が欠けていないと確認できない。
+        counts = Counter(fid for section in verdict['sections'] for fid in set(section.get('findingIds', [])))
+        eligible = eligible and all(count == 1 for count in counts.values()) and \
+            any('confidence' in ground for ground in grounds)
     return {'status': 'evaluated', 'verdict': verdict, 'overruleEligible': eligible,
             'grounds': grounds, 'next': NEXT['caller_decision']}
 
@@ -2029,7 +2061,8 @@ def gate(args, root, run):
         else:
             result = guard_command(['jev-guard', 'rereview', '--provider', 'claude', '--findings',
                                     str(root / LEDGER_FILE), '--diff', str(directory / FIX_DIFF_FILE),
-                                    '--base-summary', run['baseSummary']],
+                                    '--base-summary', run['baseSummary'],
+                                    '--min-confidence', str(GATE_MIN_CONFIDENCE)],
                                    run['cwd'], directory, 'gate')
             if result.returncode == EXIT_AWAITING:
                 output = {'status': STATUS_AWAITING, 'exitCode': EXIT_AWAITING,
