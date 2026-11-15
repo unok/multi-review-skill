@@ -229,7 +229,7 @@ prompts.json とstdoutの `confirm` は確認ならtrue、通常ならfalse。re
 
 台帳は必須とし、決定事項がなければ0件とする。それ以外の成果物がなければその集計項目は null、有効な空配列は0件とする。fix.diff は近傍判定と同じ読み方で集計する。壊れた集計入力や保存先の解決・作成・書き込み失敗では追記せず、stdout と gate.json に英語の `statsError` を入れる。書き込めたバイト数が足りないときはエラーとし、部分行が残る場合がある。統計の失敗ではゲートの終了コードと next を変えない。成功時は `statsPath` に追記先を返す。古い I の再実行では現存する台帳・決定事項を使い、成果物の鮮度は判定しない。run.json 不正・不正な I・既存ロックの競合など、handler に到達しない失敗では記録しない。
 
-- 実行: `mr gate I`。JSON の `status`・`verdict`・`overruleEligible`・`grounds` を読む。遷移は SKILL.md Step 7 を参照する。jev-guard の rules・rereview・ledger render は600秒で打ち切り、rules・rereview の超過は未実施とする。形式条件成立は反証完了を意味せず、終了は呼び出し元が決める。
+- 実行: `mr gate I`。JSON の `status`・`verdict`・`overruleEligible`・`grounds` を読む。遷移は SKILL.md Step 7 を参照する。`jev-guard rereview` に `--min-confidence 0.2` を渡す。判定ログでは、skippable が人の確認で覆った割合は、最小確信度0.2未満で37件中24%、0.2〜0.3で75件中11.6%、0.3以上で約2%だった。0.2〜0.3も再レビューに回すと、記録のある不要判定の約4割が再レビューになるため、下限を0.3ではなく0.2とする。jev-guard の rules・rereview・ledger render は600秒で打ち切り、rules・rereview の超過は未実施とする。形式条件成立は反証完了を意味せず、終了は呼び出し元が決める。
 - 結末の記録: `jev-guard record --id <verdictId> --outcome accepted`。`needed` を覆すときは `jev-guard record --id <verdictId> --outcome overruled --note '詳細は <gate-overrule.md の絶対パス>'`。`--note` には反証本文を入れず、パスはシェルの単一引用符で安全に渡す（パス内の単一引用符は `'"'"'` として渡す）。
 - 判定ログは `~/.local/share/jev-guard/verdicts.jsonl`（`JEV_GUARD_LOG_DIR` で変更可）。集計は `jev-guard stats`。
 
@@ -240,6 +240,7 @@ prompts.json とstdoutの `confirm` は確認ならtrue、通常ならfalse。re
 反証の記録が残らないまま覆すのを防ぐため、次の内容を `I/gate-overrule.md` に保存する。
 
 - 指摘: `resolved: false` の各指摘の ID と `findings[].rationale`、再判定があれば `rechecks` の該当内容を挙げ、修正 diff（`fix.diff`）の該当行・位置の引用と、それぞれの理由に答える具体的な反証を書く。
+- 確信度不足: `reason: low_confidence` では、`grounds` の `confidence` が付いた指摘・新リスク・区画も反証対象とし、ID または path、確信度、根拠を挙げる。指摘と `newRisk` の確信度は `probability` から算出した値を優先し、数値がなければ `confidence` を使う。区画の確信度は `newRiskProbability` から算出し、`confidence` は使わない。jev-guard は区画に `confidence` を出さず、判定は確率から求めた確信度で行うため。算出値は判定に合わせて小数9桁に丸める。反証には、判定の向きによらず、指摘は解消した・新リスクはないことを、修正 diff の該当行の引用で示す。判定の向きが未解消・新リスクありの根拠には、「指摘」「新リスク」の項目と同じ反証も要る。確信度不足は判定役が決めきれなかったことを表し、呼び出し元が修正 diff で確かめれば足りるため、未解決・新リスクと同じ条件で覆せる。下限未満の根拠が特定できない場合は覆せない。`low_confidence` で、複数の区画に割り当てられた指摘があるときは、jev-guard の出力に最後の区画の判定しか残らず、下限未満の根拠が欠けていないと言えないため、覆せない。
 - 新リスク: `newRisk.value: true` の `newRisk.rationale` に加え、`sections[]` の `newRiskProbability >= 0.5`（jev-guard が新リスクありと判定するしきい値）の全区画の `newRiskRationale` を1つずつ挙げ、区画の `path` と各根拠への反証を書く。「差分にない」とされた修正の diff 上の位置と該当行、「テストがない」とされたテストの名前と実行結果などを示す。同一の根拠は反証を共有し、対応する全区画を明記する。
 - 確認結果: 全根拠との対応と、Step 7 で行ったダブルチェックの結果を書く。根拠が欠落・不明の場合や反証できない根拠も記載する。
 
