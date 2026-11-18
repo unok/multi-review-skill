@@ -161,21 +161,21 @@ with patch.object(subprocess.Popen, 'communicate', communicate):
         (self.repo / 'ja.txt').write_text('校閲対象')
         for index, (options, missing, expected) in enumerate([
                 ([], None, [('claude-general', 'claude-opus-5-5', 'medium'),
-                            ('codex-general', 'gpt-6.1-sol', 'medium'),
+                            ('codex-general', 'gpt-6.2-sol', 'medium'),
                             ('claude-bug-hunt', 'claude-opus-5-5', 'high'),
                             ('claude-test-quality', 'claude-opus-5-5', 'high')]),
                 (['--profile', 'codex'], None,
                  [('claude-general', 'claude-opus-5-5', 'high'),
-                  ('codex-general', 'gpt-6.1-sol', 'medium'),
-                  ('codex-bug-hunt', 'gpt-6.1-sol', 'high'),
-                  ('codex-test-quality', 'gpt-6.1-sol', 'high')]),
-                (['--only', 'codex'], None, [('codex-general', 'gpt-6.1-sol', 'medium')]),
+                  ('codex-general', 'gpt-6.2-sol', 'medium'),
+                  ('codex-bug-hunt', 'gpt-6.2-sol', 'high'),
+                  ('codex-test-quality', 'gpt-6.2-sol', 'high')]),
+                (['--only', 'codex'], None, [('codex-general', 'gpt-6.2-sol', 'medium')]),
                 (['--profile', 'codex', '--only', 'codex'], None,
-                 [('codex-general', 'gpt-6.1-sol', 'medium'),
-                  ('codex-bug-hunt', 'gpt-6.1-sol', 'high'),
-                  ('codex-test-quality', 'gpt-6.1-sol', 'high')]),
+                 [('codex-general', 'gpt-6.2-sol', 'medium'),
+                  ('codex-bug-hunt', 'gpt-6.2-sol', 'high'),
+                  ('codex-test-quality', 'gpt-6.2-sol', 'high')]),
                 ([], 'claude', [('claude-general', 'claude-opus-5-5', 'medium'),
-                                ('codex-general', 'gpt-6.1-sol', 'medium')]),
+                                ('codex-general', 'gpt-6.2-sol', 'medium')]),
                 (['--exclude', 'claude', '--exclude', 'codex', '--ja-review'], None, [])]):
             with self.subTest(options=options, missing=missing):
                 root = self.root / f'confirm-{index}'
@@ -4154,11 +4154,11 @@ else:
         (self.repo / 'a.txt').write_text('change\n')
         expected = {
             'default': [('claude-general', 'claude-opus-5-5', 'medium'),
-                        ('codex-general', 'gpt-6.1-sol', 'medium'),
+                        ('codex-general', 'gpt-6.2-sol', 'medium'),
                         ('claude-bug-hunt', 'claude-opus-5-5', 'high')],
             'codex': [('claude-general', 'claude-opus-5-5', 'high'),
-                      ('codex-general', 'gpt-6.1-sol', 'medium'),
-                      ('codex-bug-hunt', 'gpt-6.1-sol', 'high')]}
+                      ('codex-general', 'gpt-6.2-sol', 'medium'),
+                      ('codex-bug-hunt', 'gpt-6.2-sol', 'high')]}
         for profile, specs in expected.items():
             with self.subTest(profile=profile):
                 self.initialize('--profile', profile, '--roles', 'bug-hunt')

@@ -38,8 +38,8 @@ argument-hint: "[対象ディレクトリまたはファイルパス（省略時
 | 役割 | `default`（省略時） | `codex` |
 | --- | --- | --- |
 | claude の総合（1インスタンス） | Opus 5.5 medium | Opus 5.5 high |
-| codex の総合（1インスタンス） | gpt-6.1-sol medium | gpt-6.1-sol medium |
-| 選定した専門役割（役割ごとに1インスタンス） | claude / Opus 5.5 high | codex / gpt-6.1-sol high |
+| codex の総合（1インスタンス） | gpt-6.2-sol medium | gpt-6.2-sol medium |
+| 選定した専門役割（役割ごとに1インスタンス） | claude / Opus 5.5 high | codex / gpt-6.2-sol high |
 
 総合は両 CLI に同じ総合プロンプトを渡す。専門役割は選んだプロファイルの担当 CLI だけで起動する。`default` は claude 最大7・codex 1、`codex` は claude 1・codex 最大7インスタンス（除外・欠席前）。
 
