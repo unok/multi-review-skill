@@ -104,10 +104,10 @@ DIFF_HUNK = re.compile(r'@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@.*')
 JOB_MODELS = {
     'default': {'claude': {'general': ('claude-opus-5-5', 'medium'),
                            'specialist': ('claude-opus-5-5', 'high')},
-                'codex': {'general': ('gpt-6.1-sol', 'medium')}},
+                'codex': {'general': ('gpt-6.2-sol', 'medium')}},
     'codex': {'claude': {'general': ('claude-opus-5-5', 'high')},
-              'codex': {'general': ('gpt-6.1-sol', 'medium'),
-                        'specialist': ('gpt-6.1-sol', 'high')}},
+              'codex': {'general': ('gpt-6.2-sol', 'medium'),
+                        'specialist': ('gpt-6.2-sol', 'high')}},
     # Model copied from ~/.claude/skills/ja-review/SKILL.md, 2026-11-10.
     'ja-review': {'agy': {'general': ('gemini-3.8-flash-high', None)}},
 }
