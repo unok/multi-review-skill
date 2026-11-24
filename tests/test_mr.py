@@ -289,20 +289,70 @@ with patch.object(subprocess.Popen, 'communicate', communicate):
                 self.assertIn('理由: 表示契約を維持する', text)
                 self.assertIn('誤っている可能性がある。具体的な不備を示せるなら決定 ID', text)
                 self.assertIn('保留本文 理由: 保留理由', text)
-                for excluded in ('却下本文', '却下理由', '関連なし', '再報告基準', '保留だけ',
+                self.assertIn(mr.CONFIRM_REJECTED_HEADING + '\nF1 日本語.py:3 却下本文 理由: 却下理由', text)
+                decisions = text[text.index('## 異議を出してよい方針'):text.index('レビュー対象（')]
+                for excluded in ('却下本文', '却下理由'):
+                    self.assertNotIn(excluded, decisions)
+                for excluded in ('関連なし', '再報告基準', '保留だけ',
                                  '未解決だけの方針', '指摘は出さない'):
                     self.assertNotIn(excluded, text)
         for action, options in [('fix', ['--iteration', '2', '--summary', '修正']),
                                 ('hold', ['--reason', '見送り'])]:
+            self.call('ledger', self.run, 'reject', 'F1', '--reason', '却下理由')
             self.call('ledger', self.run, action, 'F1', *options)
             plan = self.call('prompts', self.run / 'iter-2', '--confirm')
             for job in plan['reviewers']:
                 text = Path(job['prompt']).read_text()
                 self.assertNotIn('異議を出してよい方針', text)
+                self.assertNotIn(mr.CONFIRM_REJECTED_HEADING, text)
                 if action == 'hold':
                     self.assertIn('F1 日本語.py:3 却下本文 理由: 見送り', text.splitlines())
         self.stats_gate(self.run / 'iter-2')
         self.assertEqual(self.stats_rows()[-1]['decisions']['triage'], 1)
+
+    def test_confirm_finding_sections_and_normal_rereview(self):
+        self.add(file='first.py', line=1, problem='最初の却下')
+        self.add(file='hold.py', line=2, problem='保留本文')
+        self.add(file='next.py', line=4, problem='次の却下\n問題の続き')
+        self.add(file='fixed.py', line=5, problem='修正済みの本文')
+        self.add(file='unresolved.py', line=6, problem='未解決の本文')
+        self.call('ledger', self.run, 'reject', 'F1', '--reason', '最初の却下理由')
+        self.call('ledger', self.run, 'hold', 'F2', '--reason', '保留理由')
+        self.call('ledger', self.run, 'reject', 'F3', '--reason', '次の却下理由\n理由の続き')
+        self.call('ledger', self.run, 'fix', 'F4', '--iteration', '1', '--summary', '修正概要')
+
+        considered = '検討済みのため再報告不要（前提変更で再評価する項目を除く）:\n'
+        rejected = mr.CONFIRM_REJECTED_HEADING + '\n'
+        first = 'F1 first.py:1 最初の却下 理由: 最初の却下理由\n'
+        held = 'F2 hold.py:2 保留本文 理由: 保留理由\n'
+        third = 'F3 next.py:4 次の却下\n問題の続き 理由: 次の却下理由\n理由の続き'
+        fixes = '前回の修正概要:\nF4 修正概要'
+        confirm_sections = considered + held + rejected + first + third
+        second = self.run / 'iter-2'
+        for directory, options, expected in [
+                (self.iter, ['--confirm'], confirm_sections),
+                (second, [], considered + first + held + third + '\n' + fixes),
+                (second, ['--confirm'], confirm_sections + '\n' + fixes)]:
+            with self.subTest(iteration=directory.name, options=options):
+                for job in self.call('prompts', directory, *options)['reviewers']:
+                    content = Path(job['prompt']).read_bytes()
+                    self.assertEqual(content[content.index(considered.encode()):], expected.encode())
+
+    def test_confirm_finding_sections_with_empty_status_groups(self):
+        considered = '検討済みのため再報告不要（前提変更で再評価する項目を除く）:\n'
+        for expected in ('', 'F1 日本語.py:3 不備 理由: 保留理由'):
+            with self.subTest(held=bool(expected)):
+                if expected:
+                    self.add()
+                    self.call('ledger', self.run, 'hold', 'F1', '--reason', '保留理由')
+                for job in self.call('prompts', self.iter, '--confirm')['reviewers']:
+                    text = Path(job['prompt']).read_text()
+                    self.assertEqual(text[text.index(considered):], considered + expected)
+        self.call('ledger', self.run, 'reject', 'F1', '--reason', '却下理由')
+        for job in self.call('prompts', self.iter, '--confirm')['reviewers']:
+            text = Path(job['prompt']).read_text()
+            self.assertIn(considered + '\n' + mr.CONFIRM_REJECTED_HEADING, text)
+            self.assertEqual(text.split('\n')[-1], 'F1 日本語.py:3 不備 理由: 却下理由')
 
     def test_confirm_examples_unlinked_standing_policy_and_target_diff(self):
         self.changed_repository('--diff-budget', '1')
@@ -347,6 +397,8 @@ with patch.object(subprocess.Popen, 'communicate', communicate):
         self.assertEqual({p: p.read_bytes() for p in self.run.rglob('*') if p.is_file()}, saved)
 
     def test_confirm_save_failures_do_not_consume_iteration_or_count(self):
+        self.add()
+        self.call('ledger', self.run, 'reject', 'F1', '--reason', '却下理由')
         self.call('prompts', self.iter)
         original = [(self.run / name).read_bytes() for name in ('run.json', 'findings.json')]
         second = self.run / 'iter-2'
@@ -357,7 +409,9 @@ with patch.object(subprocess.Popen, 'communicate', communicate):
                 self.fail_replacement(path, 'prompts', second, '--confirm')
                 self.assertEqual([(self.run / name).read_bytes() for name in ('run.json', 'findings.json')], original)
                 self.assertFalse((second / 'prompts.json').exists())
-        self.call('prompts', second, '--confirm')
+        plan = self.call('prompts', second, '--confirm')
+        for job in plan['reviewers']:
+            self.assertIn(mr.CONFIRM_REJECTED_HEADING, Path(job['prompt']).read_text())
         self.assertEqual(self.read_json(self.run / 'run.json')['confirmIterations'], [2])
 
     def test_confirm_rollback_failure_preserves_error_and_restores_run(self):
@@ -3936,6 +3990,7 @@ else:
         self.add_decisions(self.decision(findingIds=['F1']))
         plan = self.call('prompts', self.iter, '--confirm')
         confirm_docs = docs.split('## 確認レビュー（Step 7）', 1)[1].split('\n## ', 1)[0]
+        self.assertIn(mr.CONFIRM_REJECTED_HEADING, confirm_docs)
         for job in plan['reviewers']:
             if not job['source'].endswith('-general'):
                 self.assertIn('`' + job['source'].split('-', 1)[1] + '`', confirm_docs)

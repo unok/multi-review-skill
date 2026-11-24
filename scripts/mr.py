@@ -36,6 +36,9 @@ CONFIRM_DECISIONS_HEADING = '異議を出してよい方針'
 CONFIRM_DECISIONS_DESCRIPTION = (
     'この方針は呼び出し元がレビュアーの指摘を却下して決めたもので、誤っている可能性がある。'
     '具体的な不備を示せるなら決定 ID を書いて指摘してよい。')
+CONFIRM_REJECTED_HEADING = (
+    '却下済み（同じ内容は再報告不要。却下の理由が誤っている具体例を示せる場合だけ、'
+    '「問題:」欄に指摘 ID と具体例（入力・手順・結果）を書いて再指摘してよい）:')
 INVENTORY_MAX_BYTES = 32768
 INVENTORY_VALUE_CHARS = 120
 INVENTORY_SIGNATURE_CHARS = 240
@@ -1346,6 +1349,11 @@ def iteration_dir(root, number):
     return root / f'iter-{number}'
 
 
+def prompt_finding_lines(ledger, statuses, reconsider):
+    return '\n'.join(f"{i['id']} {display_path(i['file'])}:{i['line']} {i['problem']} 理由: {i['reason']}"
+                     for i in ledger['findings'] if i['status'] in statuses and i['id'] not in reconsider)
+
+
 def prompt_target(directory, run, ledger, iteration, files, reconsider, fixes=(), confirm=False):
     target = 'レビュー対象（git 差分では変更行だけ）:\n' + '\n'.join(map(display_path, files)) + '\n'
     if run['mode'] == 'paths':
@@ -1360,10 +1368,12 @@ def prompt_target(directory, run, ledger, iteration, files, reconsider, fixes=()
     save_json(directory / 'target.json', {'files': files, 'mode': run['mode']})
     if iteration > 1 or confirm:
         target += '\n検討済みのため再報告不要（前提変更で再評価する項目を除く）:\n'
-        target += '\n'.join(f"{i['id']} {display_path(i['file'])}:{i['line']} {i['problem']} 理由: {i['reason']}"
-                            for i in ledger['findings']
-                            if i['status'] in (('on_hold',) if confirm else ('rejected', 'on_hold'))
-                            and i['id'] not in reconsider)
+        statuses = ('on_hold',) if confirm else ('rejected', 'on_hold')
+        target += prompt_finding_lines(ledger, statuses, reconsider)
+    if confirm:
+        rejected = prompt_finding_lines(ledger, ('rejected',), reconsider)
+        if rejected:
+            target += '\n' + CONFIRM_REJECTED_HEADING + '\n' + rejected
     if iteration > 1:
         target += '\n前回の修正概要:\n' + '\n'.join(
             f"{i['id']} {i['fixSummary']}" for i in ledger['findings']
