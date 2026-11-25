@@ -1431,7 +1431,13 @@ def prompts(args, root, run):
         raise Failure(display_path(str(root / DECISIONS_FILE)) + ': ' + str(error)) from error
     rejected = {i['id'] for i in ledger['findings'] if i['status'] == 'rejected'} if args.confirm else None
     decisions = bounded_decisions_markdown(value, iteration, reconsider=reconsider, confirm_rejected=rejected)
-    ja_review = not args.confirm and (run['jaReview'] if args.ja_review is None else args.ja_review)
+    # 2回目以降の ja-review は採用が少なく時間がかかるため、省略時は初回だけ init の設定に従う。
+    # ja-review 以外のレビュアーが除外か未導入で 1 つも起動できない実行は、2回目以降にレビュアーなしで
+    # 止まらないよう init の設定に従う（claude・codex はレビュアー名と CLI 名が同じ）。
+    only_ja_review = not any(name not in run['excluded'] and shutil.which(name)
+                             for name in REVIEWERS if name != 'ja-review')
+    ja_default = run['jaReview'] and (iteration == 1 or only_ja_review)
+    ja_review = not args.confirm and (ja_default if args.ja_review is None else args.ja_review)
     files, extra_files, fixes = iteration_files(directory, run, iteration)
     if ja_review and 'ja-review' not in run['excluded']:
         cwd = Path(run['cwd'])
