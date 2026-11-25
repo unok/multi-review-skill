@@ -3461,6 +3461,9 @@ Path('leaked').touch()
                 ({'reason': 'low_confidence', 'sections': [{'path': 'a', 'findingIds': [False]}]}, 'invalid section findingIds'),
                 *[({'reason': 'low_confidence', 'sections': [{'path': 'a', 'findingIds': ['F1'], 'ownedFindingIds': value}]},
                    'invalid section ownedFindingIds') for value in (None, 'F1', [['F1']], [{}], [''], [1], [' '], [False])],
+                # jev-guard は入力した指摘をすべて findings[] に載せるので、未対応の ID は必ずそこにあり重複しない。
+                *[({'unmatchedFindings': value}, 'invalid unmatchedFindings')
+                  for value in (['FAKE'], ['F1', 'FAKE'], ['F1', 'F1'])],
                 *[({'unmatchedFindings': value}, 'invalid unmatchedFindings')
                   for value in (None, 'F1', [['F1']], [{}], [''], [1], [' '], [False])],
                 ({'sections': [{'path': 'a', 'error': 1}]}, 'invalid section error'),

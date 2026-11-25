@@ -1905,7 +1905,10 @@ def validate_verdict(value):
         require(isinstance(value['rechecks'], list), 'invalid rechecks')
         for recheck in value['rechecks']:
             require(isinstance(recheck, dict) and is_id_list(recheck.get('findingIds')), 'invalid recheck evidence')
-    require('unmatchedFindings' not in value or is_id_list(value['unmatchedFindings']), 'invalid unmatchedFindings')
+    # jev-guard は入力した指摘をすべて findings[] に載せるので、未対応の ID はそこに重複なく含まれる。
+    unmatched = value.get('unmatchedFindings', [])
+    require(is_id_list(unmatched) and len(set(unmatched)) == len(unmatched) and
+            set(unmatched) <= {finding['id'] for finding in value['findings']}, 'invalid unmatchedFindings')
     key = 'reason' if value['verdict'] == 'needed' else 'reviewPrompt'
     require(nonempty(value.get(key)), 'missing gate ' + key)
     return value
