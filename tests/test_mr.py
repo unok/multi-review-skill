@@ -597,7 +597,9 @@ with patch.object(subprocess.Popen, 'communicate', communicate):
         self.call('prompts', self.iter)
         (self.repo / 'extra.txt').write_text('未コミット\n')
         second = self.run / 'iter-2'
-        self.call('prompts', second)
+        # 確認回の作り直しで前回の ja-review の成果物を消すことを確かめるため、通常回で作っておく。
+        self.call('prompts', second, '--ja-review')
+        self.assertTrue((second / 'ja-review').is_dir())
         expected = (second / 'claude.prompt.md').read_bytes()
         plan = self.call('prompts', second, '--confirm')
         self.assertEqual([j['source'] for j in plan['reviewers']],
@@ -606,9 +608,11 @@ with patch.object(subprocess.Popen, 'communicate', communicate):
         self.assertIn('コミット済み', expected.decode())
         self.assertIn('未コミット', expected.decode())
         self.assertFalse(any(j['cli'] == 'agy' for j in plan['reviewers']))
+        self.assertFalse((second / 'ja-review').exists())
         self.call('review', second)
         self.call('collect', second)
-        plan = self.call('prompts', self.run / 'iter-3')
+        # 確認回の後の通常回は、役割構成が確認前の設定に戻る。ja-review は2回目以降の既定では起動しないので明示する。
+        plan = self.call('prompts', self.run / 'iter-3', '--ja-review')
         self.assertEqual([j['source'] for j in plan['reviewers']],
                          ['claude-general', 'codex-general', 'claude-pattern-consistency',
                           'claude-naming-symmetry', 'ja-review'])
@@ -949,8 +953,8 @@ with patch.object(pwd, 'getpwuid', side_effect=KeyError('no home')):
         self.assertEqual(self.add_decisions([a, b])['ids'], ['D1', 'D2'])
         self.assertEqual((self.run / 'decisions.json').read_bytes(), before)
         self.add()
-        for iteration in (1, 2):
-            jobs = self.call('prompts', self.run / f'iter-{iteration}', '--reconsider', 'F1')['reviewers']
+        for iteration, options in ((1, ()), (2, ('--ja-review',))):
+            jobs = self.call('prompts', self.run / f'iter-{iteration}', '--reconsider', 'F1', *options)['reviewers']
             self.assertTrue(any(j['source'].startswith('ja-review') for j in jobs))
             for job in jobs:
                 text = Path(job['prompt']).read_text()
@@ -1336,7 +1340,9 @@ with patch.object(pwd, 'getpwuid', side_effect=KeyError('no home')):
         self.ja_initialize()
         self.add_decisions([self.decision(), dict(self.decision(), type='triage', body='再報告しない文言')])
         for directory, triage in [(self.iter, False), (self.run / 'iter-2', True)]:
-            jobs = [j for j in self.call('prompts', directory)['reviewers'] if j['cli'] == 'agy']
+            # 2 回目以降の ja-review は明示したときだけ起動する。
+            options = ('--ja-review',) if triage else ()
+            jobs = [j for j in self.call('prompts', directory, *options)['reviewers'] if j['cli'] == 'agy']
             self.assertGreater(len(jobs), 1)
             for job in jobs:
                 path = Path(job['prompt'])
@@ -1488,15 +1494,18 @@ with patch.object(pwd, 'getpwuid', side_effect=KeyError('no home')):
         self.add()
         self.add_decisions(self.decision(type='triage', findingIds=['F1']))
         for directory, included in [(self.iter, False), (self.run / 'iter-2', True)]:
-            jobs = [j for j in self.call('prompts', directory)['reviewers'] if j['cli'] == 'agy']
+            # 2 回目以降の ja-review は明示したときだけ起動する。
+            options = ('--ja-review',) if included else ()
+            jobs = [j for j in self.call('prompts', directory, *options)['reviewers'] if j['cli'] == 'agy']
             self.assertEqual(len(jobs), 1)
             self.assertEqual('## 決定事項' in Path(jobs[0]['prompt']).read_text(), included)
-        jobs = [j for j in self.call('prompts', self.run / 'iter-2', '--reconsider', 'F1')['reviewers']
+        jobs = [j for j in self.call('prompts', self.run / 'iter-2', '--reconsider', 'F1', '--ja-review')['reviewers']
                 if j['cli'] == 'agy']
         self.assertEqual(len(jobs), 1)
         self.assertNotIn('## 決定事項', Path(jobs[0]['prompt']).read_text())
         (self.repo / 'ja.txt').write_text('english only\n')
-        jobs = self.call('prompts', self.run / 'iter-2')['reviewers']
+        # 明示して起動しても、日本語の対象がなければ ja-review のジョブを作らない。
+        jobs = self.call('prompts', self.run / 'iter-2', '--ja-review')['reviewers']
         self.assertFalse(any(j['cli'] == 'agy' for j in jobs))
 
     def git(self, *args):
@@ -2164,6 +2173,10 @@ print('挨拶' if n==1 else '### 指摘1（重要度: 低）\\n- ファイル: �
         self.call('fixdiff', self.iter)
         self.assertEqual((self.iter / 'fix.diff').read_text(), patch)
         second = self.run / 'iter-2'
+        # init で ja-review を有効にしていても、2回目以降の省略時は範囲計算をしないので不正なハンクで止まらない。
+        self.write_json(self.run / 'run.json', dict(self.read_json(self.run / 'run.json'), jaReview=True))
+        self.call('prompts', second)
+        self.assertFalse((second / 'ja-review').exists())
         self.call('prompts', second, '--no-ja-review')
         self.assertTrue((second / 'prompts.json').is_file())
         before = {p: p.read_bytes() for p in (second / 'prompts.json', second / 'claude.prompt.md')}
@@ -2924,7 +2937,7 @@ with patch.object(mr.os, 'write', write):
         run = self.read_json(self.run / 'run.json')
         run.update(git=True, mode='uncommitted', paths=[])
         self.write_json(self.run / 'run.json', run)
-        plan = self.call('prompts', self.run / 'iter-2')
+        plan = self.call('prompts', self.run / 'iter-2', '--ja-review')
         text = (self.run / 'iter-2/claude.prompt.md').read_text()
         self.assertNotIn('\ufffd', text)
         self.assertIn('\\udcfe', text)
@@ -3771,6 +3784,71 @@ Path('leaked').touch()
         self.assertFalse(self.read_json(self.run / 'run.json')['jaReview'])
         self.call('prompts', self.run / 'iter-3')
         self.assertEqual([j['cli'] for j in self.read_json(self.run / 'iter-3/prompts.json')['reviewers']], ['claude'])
+
+    def test_ja_review_runs_by_default_only_in_first_iteration(self):
+        self.repository()
+        (self.repo / 'a.txt').write_text('日本語\n')
+        self.ja_initialize()
+
+        def clis(directory, *options):
+            return [j['cli'] for j in self.call('prompts', directory, *options)['reviewers']]
+        second, third = self.run / 'iter-2', self.run / 'iter-3'
+        self.assertNotIn('agy', clis(self.iter, '--no-ja-review'))
+        self.assertIn('agy', clis(self.iter))
+        # 2回目以降は、省略時に init の設定があっても起動しない。
+        self.assertNotIn('agy', clis(second))
+        self.assertFalse((second / 'ja-review').exists())
+        # 同じイテレーションでも明示して作り直せば、そのイテレーションだけ起動する。
+        self.assertIn('agy', clis(second, '--ja-review'))
+        self.assertTrue((second / 'ja-review').is_dir())
+        # 明示の指定は次の呼び出しに残らず、省略時の作り直しで前回の ja-review の成果物も残さない。
+        self.assertNotIn('agy', clis(second))
+        self.assertFalse((second / 'ja-review').exists())
+        self.assertIn('agy', clis(second, '--ja-review'))
+        self.assertNotIn('agy', clis(second, '--no-ja-review'))
+        self.assertFalse((second / 'ja-review').exists())
+        self.assertNotIn('agy', clis(second, '--confirm'))
+        self.assertNotIn('agy', clis(third))
+        self.assertTrue(self.read_json(self.run / 'run.json')['jaReview'])
+
+    def test_ja_review_skipped_by_default_in_later_iterations_except_ja_only_run(self):
+        self.repository()
+        (self.repo / 'a.txt').write_text('日本語\n')
+        self.ja_initialize()
+
+        def clis(directory, *options):
+            return [j['cli'] for j in self.call('prompts', directory, *options)['reviewers']]
+        self.assertIn('agy', clis(self.iter))
+        # 確認回を挟まない通常回でも、日本語の変更があるまま 2回目以降は省略時に起動しない。
+        (self.repo / 'a.txt').write_text('日本語の修正\n')
+        self.assertNotIn('agy', clis(self.run / 'iter-2'))
+        self.assertNotIn('agy', clis(self.run / 'iter-3'))
+        skill = self.read_json(self.run / 'run.json')['jaSkill']
+        self.assertTrue(self.read_json(self.run / 'run.json')['jaReview'])
+        # ja-review だけを選んだ実行は、2回目以降も省略時に init の設定に従う。
+        self.run = self.root / 'ja-only-run'
+        self.call('init', self.run, '--cwd', self.repo, '--path', '.', '--only', 'ja-review',
+                  '--ja-review', '--ja-skill', skill)
+        self.assertEqual(clis(self.run / 'iter-1'), ['agy'])
+        self.assertEqual(clis(self.run / 'iter-2'), ['agy'])
+        # 明示して外せばレビュアーがなくなり、台帳のイテレーションを進めずに止まる。
+        self.call('prompts', self.run / 'iter-3', '--no-ja-review', code=1)
+        self.assertIn('no reviewer selected', self.last_stderr)
+        self.assertEqual(self.read_json(self.run / 'findings.json')['iteration'], 2)
+        # 一方だけを除外した実行は、ほかのレビュアーが起動できるので 2回目以降は省略時に起動しない。
+        self.run = self.root / 'one-excluded-run'
+        self.call('init', self.run, '--cwd', self.repo, '--path', '.', '--exclude', 'codex', '--roles', '',
+                  '--ja-review', '--ja-skill', skill)
+        self.assertEqual(clis(self.run / 'iter-1'), ['claude', 'agy'])
+        self.assertEqual(clis(self.run / 'iter-2'), ['claude'])
+        # 除外せず未導入で ja-review だけが起動できる実行も、2回目以降は省略時に init の設定に従う。
+        self.run = self.root / 'not-installed-run'
+        self.call('init', self.run, '--cwd', self.repo, '--path', '.', '--roles', '',
+                  '--ja-review', '--ja-skill', skill)
+        (self.bin / 'claude').unlink()
+        (self.bin / 'codex').unlink()
+        self.assertIn('agy', clis(self.run / 'iter-1'))
+        self.assertIn('agy', clis(self.run / 'iter-2'))
 
     def test_full_lifecycle_with_fake_guard(self):
         self.repository()
@@ -4899,9 +4977,10 @@ sys.exit(mr.main())
         self.initialize('--path', 'a.txt', '--ja-review', '--ja-skill', skill, '--roles', '')
         (self.repo / 'a.txt').write_text('未変更\n' + 'x' * mr.JA_BATCH_LIMIT + '\nnew\n')
         second = self.run / 'iter-2'
-        self.assertFalse(any(j['cli'] == 'agy' for j in self.call('prompts', second)['reviewers']))
+        # 明示して起動しても、日本語に触れない変更なら ja-review のジョブを作らない。
+        self.assertFalse(any(j['cli'] == 'agy' for j in self.call('prompts', second, '--ja-review')['reviewers']))
         (self.repo / 'a.txt').write_text('未変更\n' + 'x' * mr.JA_BATCH_LIMIT + '\n変更行\n')
-        self.call('prompts', second)
+        self.call('prompts', second, '--ja-review')
         text = (second / 'ja-review/batch-1.txt').read_text()
         self.assertIn('=== 指摘対象の行: 3-3\n3: 変更行', text)
         self.assertNotIn('=== 指摘対象の行: 全行', text)
