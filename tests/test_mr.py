@@ -3850,6 +3850,304 @@ Path('leaked').touch()
         self.assertIn('agy', clis(self.run / 'iter-1'))
         self.assertIn('agy', clis(self.run / 'iter-2'))
 
+    def archive_dir(self, name='20260101-000000'):
+        return Path(self.read_json(self.run / 'run.json')['cwd']) / '.multi-review' / name
+
+    def exclude_multi_review(self):
+        # Step 8 と同じく、.multi-review/ を git の無視対象にしてから写す。
+        exclude = self.repo / '.git/info/exclude'
+        exclude.parent.mkdir(exist_ok=True)
+        with exclude.open('a') as stream:
+            stream.write('.multi-review/\n')
+
+    def test_archive_copies_validated_state_and_carry_meta(self):
+        self.changed_repository()
+        self.exclude_multi_review()
+        for problem in ('却下する', '保留する', '直す'):
+            self.add(problem=problem)
+        self.call('ledger', self.run, 'reject', 'F1', '--reason', '誤検知')
+        self.call('ledger', self.run, 'hold', 'F2', '--reason', '別の変更で扱う')
+        self.call('snapshot', self.iter)
+        (self.repo / 'a.txt').write_text('fixed\n')
+        self.call('fixdiff', self.iter)
+        self.call('ledger', self.run, 'fix', 'F3', '--iteration', 1, '--summary', '直した')
+        self.add_decisions(self.decision())
+        target = self.archive_dir()
+        target.mkdir(parents=True)
+        (target / 'report.md').write_text('レポート\n')
+        state = {name: (self.run / name).read_bytes() for name in ('findings.json', 'decisions.json', 'run.json')}
+        result = self.call('archive', self.run, '--to', target)
+        meta = {'version': 1, 'reviewId': self.run.name, 'cwd': self.read_json(self.run / 'run.json')['cwd'],
+                'branch': 'main', 'mode': 'uncommitted', 'base': None, 'paths': [],
+                'tree': (self.iter / 'after.tree').read_text().strip(), 'iteration': 1,
+                'ledger': {'unresolved': 0, 'fixed': 1, 'on_hold': 1, 'rejected': 1}}
+        self.assertEqual(result, {'files': [str(target / name) for name in
+                                            ('carry-meta.json', 'findings.json', 'decisions.json')],
+                                  'carryMeta': meta})
+        self.assertEqual(self.read_json(target / 'carry-meta.json'), meta)
+        for name in ('findings.json', 'decisions.json'):
+            self.assertEqual((target / name).read_bytes(), state[name])
+        self.assertEqual((target / 'report.md').read_text(), 'レポート\n')
+        self.assertEqual({name: (self.run / name).read_bytes() for name in state}, state)
+        # 同じ R・同じ DIR への再実行は、同じ内容で上書きする。
+        before = {path: path.read_bytes() for path in target.iterdir()}
+        self.assertEqual(self.call('archive', self.run, '--to', target), result)
+        self.assertEqual({path: path.read_bytes() for path in target.iterdir()}, before)
+        # 台帳が変われば、同じ DIR の写しも新しい内容になる。
+        self.add(problem='追加')
+        self.assertEqual(self.call('archive', self.run, '--to', target)['carryMeta']['ledger']['unresolved'], 1)
+        self.assertEqual((target / 'findings.json').read_bytes(), (self.run / 'findings.json').read_bytes())
+        self.assertEqual(self.read_json(target / 'carry-meta.json')['ledger']['unresolved'], 1)
+        # 同名のタグがあっても、ブランチは完全な参照名から取る。
+        self.git('tag', 'main')
+        self.assertEqual(self.call('archive', self.run, '--to', target)['carryMeta']['branch'], 'main')
+        self.git('checkout', '-q', '-b', 'feat/x')
+        self.assertEqual(self.call('archive', self.run, '--to', target)['carryMeta']['branch'], 'feat/x')
+        self.git('checkout', '-q', '--detach')
+        self.assertIsNone(self.call('archive', self.run, '--to', target)['carryMeta']['branch'])
+        # 対象ルートへのリンクを含む論理パスでも、実体の .multi-review/ に書く。
+        link = self.root / 'repo-link'
+        link.symlink_to(self.repo, target_is_directory=True)
+        linked = self.call('archive', self.run, '--to', link / '.multi-review' / 'via-link')
+        self.assertEqual(linked['files'][0], str(link / '.multi-review' / 'via-link' / 'carry-meta.json'))
+        self.assertTrue((target.parent / 'via-link' / 'carry-meta.json').is_file())
+        # run.json の base は省略でき、そのときは null として写す。
+        run = self.read_json(self.run / 'run.json')
+        run.pop('base')
+        self.write_json(self.run / 'run.json', run)
+        self.assertIsNone(self.call('archive', self.run, '--to', target)['carryMeta']['base'])
+
+    def test_archive_rejects_non_git_target(self):
+        target = self.archive_dir()
+        self.call('archive', self.run, '--to', target, code=1)
+        self.assertIn('archive requires a git target', self.last_stderr)
+        self.assertFalse(target.parent.exists())
+
+    def test_archive_tree_is_from_last_attempted_snapshot(self):
+        self.changed_repository()
+        self.exclude_multi_review()
+        target = self.archive_dir()
+
+        def tree():
+            return self.call('archive', self.run, '--to', target)['carryMeta']['tree']
+        self.call('snapshot', self.iter)
+        (self.repo / 'a.txt').write_text('fixed\n')
+        self.call('fixdiff', self.iter)
+        first = (self.iter / 'after.tree').read_text().strip()
+        second, third = self.run / 'iter-2', self.run / 'iter-3'
+        self.call('prompts', second)
+        # (a) 後の回に snapshot がなければ、修正を確かめた回の木。
+        self.assertEqual(tree(), first)
+        # (c) 後の回が snapshot 済みで fixdiff 前なら、古い回の木を使わない。
+        self.call('snapshot', second)
+        self.assertIsNone(tree())
+        # (d) 後の回も確かめ済みなら、その回の木。
+        (self.repo / 'a.txt').write_text('fixed again\n')
+        self.call('fixdiff', second)
+        latest = (second / 'after.tree').read_text().strip()
+        self.assertNotEqual(latest, first)
+        self.assertEqual(tree(), latest)
+        # (e) 修正 diff が生成後に変わって検証を通らなければ、null。
+        original = (second / 'fix.diff').read_bytes()
+        (second / 'fix.diff').write_bytes(original + b'\n')
+        self.assertIsNone(tree())
+        (second / 'fix.diff').write_bytes(original)
+        self.assertEqual(tree(), latest)
+        # (b) 後の回が複製モードなら、木の方式の古い回があっても null。
+        self.call('prompts', third)
+        self.fail_tree_generation()
+        self.call('snapshot', third)
+        self.assertEqual((third / 'snapshot.mode').read_text().strip(), 'copy')
+        (self.repo / 'a.txt').write_text('copy mode\n')
+        self.call('fixdiff', third)
+        self.assertIsNone(tree())
+        self.assertEqual(self.call('archive', self.run, '--to', target)['carryMeta']['iteration'], 3)
+
+    def test_archive_rejects_invalid_targets_and_keeps_existing_files(self):
+        self.changed_repository()
+        self.add()
+        cwd = Path(self.read_json(self.run / 'run.json')['cwd'])
+        base = cwd / '.multi-review'
+        directly = 'archive directory must be a directory directly under'
+
+        def rejected(target, message):
+            self.call('archive', self.run, '--to', target, code=1)
+            self.assertIn(message, self.last_stderr)
+        # 無視されていない保存先には書かない。
+        rejected(self.archive_dir(), 'archive file is not ignored by git')
+        self.assertFalse(base.exists())
+        # 一部のファイルだけが無視されていても書かない。
+        (self.repo / '.git/info/exclude').write_text('.multi-review/*/carry-meta.json\n')
+        rejected(self.archive_dir(), 'archive file is not ignored by git: ' + str(self.archive_dir() / 'findings.json'))
+        self.assertFalse(base.exists())
+        self.exclude_multi_review()
+        for target in (cwd / 'outside', self.root / 'elsewhere', base, base / 'a' / 'b', base / '..' / 'escape'):
+            with self.subTest(target=target):
+                rejected(target, directly)
+                self.assertFalse(Path(os.path.abspath(target)).exists())
+        base.write_text('')
+        rejected(self.archive_dir(), directly)
+        base.unlink()
+        base.mkdir()
+        (base / 'file').write_text('')
+        rejected(base / 'file', directly)
+        # 常設の決定事項と同じ名前は保存先にしない。
+        for name in ('decisions.json', 'DECISIONS.JSON'):
+            rejected(base / name, 'archive directory name is reserved: ' + name)
+            self.assertFalse((base / name).exists())
+        real = base / 'real'
+        real.mkdir()
+        (base / 'link').symlink_to(real, target_is_directory=True)
+        rejected(base / 'link', directly)
+        self.assertEqual(list(real.iterdir()), [])
+        linked = self.root / 'linked-multi-review'
+        linked.mkdir()
+        shutil.rmtree(base)
+        base.symlink_to(linked, target_is_directory=True)
+        rejected(base / 'x', directly)
+        self.assertEqual(list(linked.iterdir()), [])
+        base.unlink()
+        target = self.archive_dir()
+        target.mkdir(parents=True)
+        outside = self.root / 'outside.json'
+        outside.write_text('外')
+        for name in ('findings.json', 'decisions.json', 'carry-meta.json'):
+            with self.subTest(name=name):
+                (target / name).symlink_to(outside)
+                rejected(target, 'archive file must be a regular file')
+                self.assertEqual(outside.read_text(), '外')
+                (target / name).unlink()
+                (target / name).mkdir()
+                rejected(target, 'archive file must be a regular file')
+                (target / name).rmdir()
+        # 所有元を確かめられない写しは上書きしない。
+        for name, text, message in (
+                ('carry-meta.json', json.dumps({'version': 1, 'reviewId': 'other-review'}),
+                 'archive directory holds another review'),
+                ('carry-meta.json', '{', 'carry-meta.json: '),
+                ('findings.json', '{}', 'archive directory holds another review')):
+            with self.subTest(name=name, text=text):
+                (target / name).write_text(text)
+                rejected(target, message)
+                self.assertNotIn('not ignored', self.last_stderr)
+                self.assertEqual(sorted(p.name for p in target.iterdir()), [name])
+                self.assertEqual((target / name).read_text(), text)
+                (target / name).unlink()
+        shutil.rmtree(base)
+        # レビューディレクトリの状態が壊れていれば、保存先を作らない。
+        self.add_decisions(dict(self.decision(), findingIds=['F1']))
+        unknown = self.read_json(self.run / 'decisions.json')
+        unknown['decisions'][0]['findingIds'] = ['F99']
+        for name, text, message in (('findings.json', '{', 'Expecting property name'),
+                                    ('decisions.json', '{', 'decisions.json: Expecting property name'),
+                                    ('decisions.json', json.dumps(unknown), 'decisions.json: invalid decision findingIds')):
+            with self.subTest(name=name, text=text):
+                path = self.run / name
+                original = path.read_bytes()
+                path.write_text(text)
+                rejected(target, message)
+                self.assertFalse(base.exists())
+                path.write_bytes(original)
+        # 同じレビューディレクトリを更新中なら、保存先を作らない。
+        with (self.run / '.mr.lock').open('a') as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX)
+            rejected(target, 'another command is updating this review')
+        self.assertFalse(base.exists())
+
+    def test_archive_write_failure_restores_previous_copy(self):
+        self.changed_repository()
+        self.exclude_multi_review()
+        self.add()
+        target = self.archive_dir()
+        # 初回の書き込み失敗では、作った DIR も .multi-review/ も残さない。
+        self.fail_replacement(target / 'carry-meta.json', 'archive', self.run, '--to', target)
+        self.assertFalse(target.parent.exists())
+        target.mkdir(parents=True)
+        (target / 'report.md').write_text('レポート\n')
+        self.fail_replacement(target / 'decisions.json', 'archive', self.run, '--to', target)
+        self.assertEqual(sorted(p.name for p in target.iterdir()), ['report.md'])
+        self.call('archive', self.run, '--to', target)
+        # 決定事項のないレビューは空の決定事項を写し、レビューディレクトリには作らない。
+        self.assertEqual(self.read_json(target / 'decisions.json'), {'reviewId': self.run.name, 'decisions': []})
+        self.assertFalse((self.run / 'decisions.json').exists())
+        before = {path: path.read_bytes() for path in target.iterdir()}
+        self.add(problem='追加')
+        # 最後に書く decisions.json の置き換えが失敗したら、先に置き換えた要約と台帳を以前の写しに戻す。
+        self.fail_replacement(target / 'decisions.json', 'archive', self.run, '--to', target)
+        self.assertEqual({path: path.read_bytes() for path in target.iterdir()}, before)
+        # 1つ目のファイルの復元に失敗しても、元のエラーに追記して残りのファイルを戻す。
+        launcher = """import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv.pop(1))
+import mr
+original = mr.os.replace
+target = Path(sys.argv.pop(1))
+seen = []
+def replace(source, destination):
+    destination = Path(destination)
+    if destination == target / 'decisions.json':
+        raise OSError('injected replacement failure')
+    if destination == target / 'carry-meta.json' and destination in seen:
+        raise OSError('injected restore failure')
+    seen.append(destination)
+    return original(source, destination)
+mr.os.replace = replace
+sys.exit(mr.main())
+"""
+        result = subprocess.run([sys.executable, '-c', launcher, str(CLI.parent), str(target),
+                                 'archive', str(self.run), '--to', str(target)],
+                                env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('injected replacement failure', result.stderr)
+        self.assertIn('carry-meta.json: injected restore failure', result.stderr)
+        self.assertEqual((target / 'findings.json').read_bytes(), before[target / 'findings.json'])
+        self.assertNotEqual((target / 'carry-meta.json').read_bytes(), before[target / 'carry-meta.json'])
+        # 最初のファイルを書いた直後に止まっても、残るのは要約だけで、再実行で写しを作り直せる。
+        resumed = self.archive_dir('20260103-000000')
+        stop = """import os, sys
+sys.path.insert(0, sys.argv.pop(1))
+import mr
+original = mr.os.replace
+def replace(source, destination):
+    original(source, destination)
+    os._exit(9)
+mr.os.replace = replace
+sys.exit(mr.main())
+"""
+        result = subprocess.run([sys.executable, '-c', stop, str(CLI.parent), 'archive', str(self.run), '--to', str(resumed)],
+                                env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 9, result.stdout + result.stderr)
+        self.assertEqual(sorted(p.name for p in resumed.iterdir()), ['carry-meta.json'])
+        self.call('archive', self.run, '--to', resumed)
+        self.assertEqual((resumed / 'findings.json').read_bytes(), (self.run / 'findings.json').read_bytes())
+        self.assertEqual(self.read_json(resumed / 'decisions.json'), {'reviewId': self.run.name, 'decisions': []})
+        self.assertEqual(self.read_json(resumed / 'carry-meta.json')['ledger']['unresolved'], 2)
+        # 作ったディレクトリの削除に失敗しても、元の書き込みエラーを残して後始末を続ける。
+        fresh = self.archive_dir('20260102-000000')
+        launcher = """import sys
+from pathlib import Path
+from unittest.mock import patch
+sys.path.insert(0, sys.argv.pop(1))
+import mr
+original = mr.os.replace
+target = Path(sys.argv.pop(1))
+def replace(source, destination):
+    if Path(destination) == target:
+        raise OSError('injected replacement failure')
+    return original(source, destination)
+def rmdir(self):
+    raise OSError('injected rmdir failure')
+with patch.object(mr.os, 'replace', replace), patch.object(mr.Path, 'rmdir', rmdir):
+    sys.exit(mr.main())
+"""
+        result = subprocess.run([sys.executable, '-c', launcher, str(CLI.parent), str(fresh / 'carry-meta.json'),
+                                 'archive', str(self.run), '--to', str(fresh)],
+                                env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('injected replacement failure', result.stderr)
+        self.assertIn('injected rmdir failure', result.stderr)
+        self.assertEqual(list(fresh.iterdir()), [])
+
     def test_full_lifecycle_with_fake_guard(self):
         self.repository()
         (self.repo / 'a.txt').write_text('initial review change\n')

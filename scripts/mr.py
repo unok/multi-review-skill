@@ -76,6 +76,11 @@ SNAPSHOT_MODE_FILE = 'snapshot.mode'
 LEDGER_MD_FILE = 'ledger.md'
 DECISIONS_FILE = 'decisions.json'
 DECISIONS_MD_FILE = 'decisions.md'
+# 対象ルートの作業ツリー側のディレクトリ。レポートファイル・常設の決定事項・写しを置く。
+MULTI_REVIEW_DIR = '.multi-review'
+# mr archive が MULTI_REVIEW_DIR/<タイムスタンプ>/ に書く、実行の要約。
+CARRY_META_FILE = 'carry-meta.json'
+CARRY_META_VERSION = 1
 DECISIONS_MAX_BYTES = 8192
 DECISION_TYPES = {'policy': '方針', 'triage': '再報告しない基準'}
 DECISION_SOURCES = {'user': '利用者共通', 'project': 'プロジェクト'}
@@ -485,6 +490,13 @@ def load_decisions(root, ledger, run):
     return validate_decisions(value, ledger, run)
 
 
+def load_decisions_reported(root, ledger, run):
+    try:
+        return load_decisions(root, ledger, run)
+    except EXPECTED_ERRORS as error:
+        raise Failure(display_path(str(root / DECISIONS_FILE)) + ': ' + str(error)) from error
+
+
 def decisions_markdown(value, iteration=None, field=None, reconsider=(), confirm_rejected=None):
     sections = []
     for kind, label in DECISION_TYPES.items():
@@ -592,7 +604,7 @@ def standing_decisions(cwd, value, ledger, run, disabled):
         return result
     config = xdg_home('XDG_CONFIG_HOME', '.config')
     paths = (config / 'multi-review' / DECISIONS_FILE if config else None,
-             cwd / '.multi-review' / DECISIONS_FILE)
+             cwd / MULTI_REVIEW_DIR / DECISIONS_FILE)
     for source, path in zip(DECISION_SOURCES, paths):
         if path is None or (not path.exists() and not path.is_symlink()):
             continue
@@ -617,10 +629,7 @@ def standing_decisions(cwd, value, ledger, run, disabled):
 
 def decisions_action(args, root, run):
     ledger = load_ledger(root)
-    try:
-        value = load_decisions(root, ledger, run)
-    except EXPECTED_ERRORS as error:
-        raise Failure(display_path(str(root / DECISIONS_FILE)) + ': ' + str(error)) from error
+    value = load_decisions_reported(root, ledger, run)
     ids = []
     require(not args.ids or args.action == 'remove', 'IDs are only for remove')
     require(args.input is None or args.action == 'add', '--input is only for add')
@@ -1425,10 +1434,7 @@ def prompts(args, root, run):
         run['roles'] = role_list(args.roles)
     reconsider = set(args.reconsider.split(',')) if args.reconsider else set()
     require(reconsider <= {i['id'] for i in ledger['findings']}, 'unknown reconsider ID')
-    try:
-        value = load_decisions(root, ledger, run)
-    except EXPECTED_ERRORS as error:
-        raise Failure(display_path(str(root / DECISIONS_FILE)) + ': ' + str(error)) from error
+    value = load_decisions_reported(root, ledger, run)
     rejected = {i['id'] for i in ledger['findings'] if i['status'] == 'rejected'} if args.confirm else None
     decisions = bounded_decisions_markdown(value, iteration, reconsider=reconsider, confirm_rejected=rejected)
     # 2回目以降の ja-review は採用が少なく時間がかかるため、省略時は初回だけ init の設定に従う。
@@ -2007,6 +2013,10 @@ def rules_candidates(output):
     return count if type(count) is int and count >= 0 else None
 
 
+def ledger_counts(ledger):
+    return {state: sum(i['status'] == state for i in ledger['findings']) for state in STATES}
+
+
 def run_stats(root, directory, run, output):
     iteration = iteration_number(directory)
     result = dict(reviewId=root.name, cwd=run['cwd'], mode=run['mode'], profile=run['profile'],
@@ -2042,7 +2052,7 @@ def run_stats(root, directory, run, output):
                                   outside=sum(i['nearPreviousFix'] is False for i in findings),
                                   unknown=sum(i['nearPreviousFix'] is None for i in findings),
                                   bySource=dict(Counter(i['source'] for i in findings)))
-    result['ledger'] = {state: sum(i['status'] == state for i in ledger['findings']) for state in STATES}
+    result['ledger'] = ledger_counts(ledger)
     result['ledger']['fixedThisIteration'] = sum(i.get('fixedIteration') == iteration for i in ledger['findings'])
     result['decisions'] = {kind: sum(i['type'] == kind for i in decisions['decisions']) for kind in DECISION_TYPES}
     result['decisions']['withSources'] = sum(bool(i.get('sources')) for i in decisions['decisions'])
@@ -2622,6 +2632,103 @@ def always_zero(result):
     return 0
 
 
+def last_checked_tree(root, iteration):
+    # snapshot を試みた最後の回だけを見る。その回が複製モード・fixdiff 前・失効なら、古い回の木を終わりの状態としない。
+    for number in range(iteration, 0, -1):
+        directory = iteration_dir(root, number)
+        if not any((directory / name).exists() for name in ('snapshot.json', SNAPSHOT_MODE_FILE)):
+            continue
+        try:
+            state = valid_diff(directory)
+        except EXPECTED_ERRORS:
+            return None
+        return state['state']['tree'] if state['mode'] == 'tree' else None
+    return None
+
+
+def current_branch(cwd):
+    # --short は同名のタグなどがあると短縮の形を変えるため、完全な参照名から接頭辞だけを外す。
+    # ブランチ名に含まれる空白を保つため、末尾の改行だけを除く。
+    ref = os.fsdecode(run_command(['git', 'symbolic-ref', '-q', 'HEAD'], cwd, allowed=(0, 1)).stdout).removesuffix('\n')
+    return ref[len('refs/heads/'):] if ref.startswith('refs/heads/') else None
+
+
+def archive(args, root, run):
+    # 写しを次のレビューの範囲やコミットから外す手段が git の無視設定しかないため、git の対象だけを受け付ける。
+    require(run['git'], 'archive requires a git target')
+    cwd = Path(run['cwd'])
+    # .multi-review/ と DIR は resolve するとリンク先へ書けてしまうので字句で扱ってリンクを拒否し、
+    # 対象ルートにあたる祖先だけは、リンクを含む論理パスでも受け付けるよう実パスに解決して比べる。
+    target = Path(os.path.abspath(args.to))
+    base = target.parent
+    require(base.name == MULTI_REVIEW_DIR and os.path.realpath(base.parent) == str(cwd) and
+            not base.is_symlink() and (base.is_dir() or not base.exists()) and
+            not target.is_symlink() and (target.is_dir() or not target.exists()),
+            'archive directory must be a directory directly under ' + display_path(str(cwd / MULTI_REVIEW_DIR)))
+    # 対象ルートの .multi-review/ で使っている名前（常設の決定事項）は保存先にしない。
+    # 大文字小文字を区別しないファイルシステムでも同じパスになるので、区別せずに比べる。
+    require(target.name.casefold() != DECISIONS_FILE.casefold(), 'archive directory name is reserved: ' + target.name)
+    # carry-meta.json を最初に書き、途中で止まっても同じ reviewId と確かめて再実行で上書きできるようにする。
+    names = (CARRY_META_FILE, LEDGER_FILE, DECISIONS_FILE)
+    paths = [target / name for name in names]
+    require(all(not path.is_symlink() and (path.is_file() or not path.exists()) for path in paths),
+            'archive file must be a regular file')
+    for path in paths:
+        ignored = run_command(['git', 'check-ignore', '-q', '--', str(path.relative_to(base.parent))], cwd,
+                              allowed=(0, 1))
+        require(ignored.returncode == 0, 'archive file is not ignored by git: ' + display_path(str(path)))
+    path = root / DECISIONS_FILE
+    # 検証した版と別の版を写さないよう、写すバイト列を先に読み、検証の後も変わっていないことを確かめる。
+    contents = [(root / LEDGER_FILE).read_bytes(), path.read_bytes() if path.exists() else None]
+    ledger = load_ledger(root)
+    decisions = load_decisions_reported(root, ledger, run)
+    require([(root / LEDGER_FILE).read_bytes(), path.read_bytes() if path.exists() else None] == contents,
+            'review state changed during archive')
+    # 所有元を確かめられない写しは上書きしない。
+    if any(path.exists() for path in paths):
+        meta_path = target / CARRY_META_FILE
+        require(meta_path.exists(), 'archive directory holds another review')
+        try:
+            existing = read_json(meta_path)
+        except EXPECTED_ERRORS as error:
+            raise Failure(display_path(str(meta_path)) + ': ' + str(error)) from error
+        require(isinstance(existing, dict) and existing.get('reviewId') == ledger['reviewId'],
+                'archive directory holds another review')
+    meta = {'version': CARRY_META_VERSION, 'reviewId': ledger['reviewId'], 'cwd': run['cwd'],
+            'branch': current_branch(cwd), 'mode': run['mode'], 'base': run.get('base'), 'paths': run['paths'],
+            'tree': last_checked_tree(root, ledger['iteration']), 'iteration': ledger['iteration'],
+            'ledger': ledger_counts(ledger)}
+    files = {CARRY_META_FILE: json.dumps(meta, indent=2) + '\n',
+             LEDGER_FILE: contents[0],
+             # 決定事項のないレビューも、写しを読む側が同じ形で読めるよう空の決定事項を写す。
+             DECISIONS_FILE: contents[1] if contents[1] is not None else json.dumps(decisions, indent=2) + '\n'}
+    created = [directory for directory in (base, target) if not directory.exists()]
+    originals = {path: path.read_bytes() if path.exists() else None for path in paths}
+    replaced = []
+    try:
+        for name, data in files.items():
+            write_atomic(target / name, data)
+            replaced.append(target / name)
+    except BaseException as error:
+        # 置き換えたファイルだけを戻す。1つの復元に失敗しても残りを続け、元のエラーに追記する。
+        for file in replaced:
+            try:
+                if originals[file] is None:
+                    file.unlink()
+                else:
+                    write_atomic(file, originals[file])
+            except BaseException as rollback_error:
+                error.__notes__ = [*getattr(error, '__notes__', []), f'{display_path(str(file))}: {rollback_error}']
+        for directory in reversed(created):
+            try:
+                if directory.is_dir() and not any(directory.iterdir()):
+                    directory.rmdir()
+            except BaseException as rollback_error:
+                error.__notes__ = [*getattr(error, '__notes__', []), f'{display_path(str(directory))}: {rollback_error}']
+        raise
+    return {'files': [str(path) for path in paths], 'carryMeta': meta}
+
+
 COMMANDS = {
     'init': (init, 'root', always_zero),
     'prompts': (prompts, 'iteration', always_zero),
@@ -2633,6 +2740,7 @@ COMMANDS = {
     'fixdiff': (fixdiff, 'iteration', always_zero),
     'ledger': (ledger_action, 'root', always_zero),
     'decisions': (decisions_action, 'root', always_zero),
+    'archive': (archive, 'root', always_zero),
     'rules': (rules, 'iteration', lambda result: EXIT_CANDIDATES if result.get('exitCode') == EXIT_CANDIDATES else 0),
     'gate': (gate, 'iteration', lambda result: EXIT_AWAITING if result.get('status') == STATUS_AWAITING else 0),
 }
@@ -2681,6 +2789,7 @@ def parser():
     decisions_parser.add_argument('action', choices=('add', 'remove', 'render'))
     decisions_parser.add_argument('ids', nargs='*')
     decisions_parser.add_argument('--input', type=Path)
+    parsers['archive'].add_argument('--to', type=Path, required=True)
     return p
 
 

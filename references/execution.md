@@ -25,6 +25,7 @@
 | `mr decisions R add --input FILE` | 1件または配列の決定事項を登録し、`decisions.md` を生成。入力・採番・重複防止・上限は「決定事項」を参照 |
 | `mr decisions R remove ID...` | 指定した決定事項を削除し、`decisions.md` を生成。未知 ID があれば全件未削除 |
 | `mr decisions R render` | `decisions.json` から `decisions.md` を生成。jev-guard は使わない |
+| `mr archive R --to DIR` | 台帳・決定事項を検証し、DIR に写しを書く。DIR・内容・失敗時の扱いは「レポートファイル」の「写し」を参照 |
 | `mr rules I` | 条件確認・実行後、`rules.json` と生出力を保存。候補の妥当性は呼び出し元が確かめる |
 | `mr gate I` | `gate.json` と生出力。必要フィールドと型、覆せる形式条件 `overruleEligible`、反証対象 `grounds` までを返し、実行統計を1行追記する。反証・ダブルチェック・record は行わない |
 
@@ -283,11 +284,18 @@ needed の理由を特定できないまま反証の手順に進めないよう�
 - 台帳の指摘は1件1行。各行は指摘 ID（`F1` など）から始め、各節の中は重要度（高→中→低。同じ重要度内は指摘 ID の昇順）で並べ、複数のレビュアーからの共通指摘には【共通】を付ける。行末ラベルは節ごとに「→ 修正概要:」「→ 保留理由:」「→ 却下理由:」を使う。範囲外の同じパターンの集約は「範囲外の記録」に従う。
 - 未解決は打ち切り時にだけ残り、行末は「→ 未解決理由: <差し戻しの失敗内容など>」とする。0件の節は見出しの下に「なし」と書く（上記の未解決を参照）。
 
+### 写し `mr archive`（Step 8）
+
+`mr archive R --to DIR` は、R の `findings.json`・`decisions.json`（未作成なら空の決定事項）を検証してから同じ名前で DIR に写し、実行の要約 `carry-meta.json` を書く。`carry-meta.json` は `version`（1）・`reviewId`・`cwd`・`branch`（archive 実行時のブランチ。完全な参照名から `refs/heads/` を外した値で、detached HEAD なら null）・`mode`・`base`・`paths`（run.json の値）・`tree`（snapshot を試みた最後の回が木の方式で、その回の修正 diff が `valid_diff` の検証を通る場合の `after.tree`。複製モード・fixdiff 前・失効・snapshot の失敗や、snapshot を試みた回がなければ null で、それより古い回の木は使わない）・`iteration`（台帳の値）・`ledger`（台帳の状態別の件数）を持ち、再実行で内容が変わらないよう日時を入れない。
+
+git の対象だけを受け付け、非 git は拒否する（写しを次のレビューの範囲やコミットから外す手段が git の無視設定しかないため）。DIR は対象ルートの `.multi-review/` 直下のディレクトリに限り、なければ作る。常設の決定事項と同じ名前（`decisions.json`）は保存先にしない。DIR と `.multi-review/` は通常のディレクトリ、写す3ファイルは既存なら通常のファイルであることを確かめ、リンクは拒否する。写す3ファイルが `git check-ignore` で無視対象と確かめられなければ書かない。DIR に写すファイルが既にあれば、`carry-meta.json` で同じ reviewId と確かめられた場合だけ上書きし、別の reviewId の場合や、`carry-meta.json` がない・読めない場合は拒否する。全てを検証してから `carry-meta.json`・`findings.json`・`decisions.json` の順に書く（途中で止まっても同じ reviewId と確かめて再実行で上書きできるよう、要約を先に書く）。書き込みに失敗したら置き換えたファイルだけを元に戻し、作った空のディレクトリを消す。1つの復元や削除に失敗しても残りを続け、元のエラーに追記する。DIR の report.md などほかのファイルと、R の台帳・決定事項・run.json は変えない。R のロックに従う。stdout は写したファイルの絶対パスの一覧 `files` と `carryMeta`。
+
 ### exclude への追記（Step 8）
 
 - 判定: `git check-ignore -q .multi-review/<タイムスタンプ>/report.md` を実行する。終了コード 0（すでに無視されている）なら追記不要でそのまま書き出す。
 - 追記: 終了コード 1（無視されていない）なら、`git rev-parse --git-path info/exclude` が指すパスの親ディレクトリ（`info/`）がなければ作成し、`.multi-review/` を1行追記する。作業ツリー専用の常設ファイル `.multi-review/decisions.json` も無視対象になる。追記後にもう一度 `git check-ignore -q` を実行し、無視されるようになったか確かめる。
 - 追記できない（`.git` が読み取り専用など）場合、または追記しても無視されない場合（`.gitignore` の `!.multi-review/` のような否定パターンが exclude より優先される場合を含む）は、レビューディレクトリ直下に `report.md` を置き（非 git と同じ扱い）、その理由を会話の最終レポートに書く。
+- 写し: `mr archive` が写しのファイルを無視対象でないとして拒否した場合（`.gitignore` が report.md だけを無視している場合など）は、report.md の判定が終了コード 0 でも、拒否されたファイル（例: `.multi-review/<タイムスタンプ>/findings.json`）で同じ判定をし、終了コード 1 なら `.multi-review/` を追記して同じファイルで確かめ直してから再実行する。追記できない・追記しても無視されない場合は写しを作らず、その理由を会話の最終レポートに書く。
 
 ## 品質チェック（Step 6 の基準・Step 7 の判定）
 
