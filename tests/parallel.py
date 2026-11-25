@@ -115,14 +115,28 @@ def split(ids, jobs):
     return [ids[index::count] for index in range(count)]
 
 
-def collect(root):
-    with tempfile.TemporaryDirectory() as temporary:
+def collect(root, requests):
+    processes = []
+    with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryFile() as stdout, \
+            tempfile.TemporaryFile() as stderr:
         output = Path(temporary) / 'ids.json'
-        listing = subprocess.run([sys.executable, '-c', LIST_SCRIPT, str(root), PATTERN, str(output)],
-                                 cwd=root, stdin=subprocess.DEVNULL, capture_output=True)
-        if listing.returncode != 0 or not output.is_file():
-            text = (listing.stdout + listing.stderr).decode('utf-8', 'replace')
-            return [], [f'listing exited with code {listing.returncode}\n' + text]
+        try:
+            # ワーカーと同じく別のプロセスグループで起動し、中断時は import 中に起動された子孫ごと止める。
+            requests.hold()
+            processes.append(subprocess.Popen([sys.executable, '-c', LIST_SCRIPT, str(root), PATTERN, str(output)],
+                                              cwd=root, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
+                                              start_new_session=True))
+            requests.release()
+            returncode = processes[0].wait()
+        except BaseException:
+            requests.hold()
+            stop_groups(processes)
+            raise
+        if returncode != 0 or not output.is_file():
+            stdout.seek(0)
+            stderr.seek(0)
+            text = (stdout.read() + stderr.read()).decode('utf-8', 'replace')
+            return [], [f'listing exited with code {returncode}\n' + text]
         value = json.loads(output.read_text(encoding='utf-8'))
     return value['ids'], value['errors']
 
@@ -182,7 +196,12 @@ def run_groups(root, groups, requests):
             finished = []
             for process, output, result in zip(processes, outputs, results):
                 output.seek(0)
-                finished.append((process.returncode, output.read().decode('utf-8', 'replace'), read_result(result)))
+                value = read_result(result)
+                if process.returncode != 0 or value is None:
+                    # 失敗・未完了の組は、テストが起動した子孫が残りうるのでグループごと止める。
+                    # 成功した組には送らない（回収済みの PID の再利用で無関係なプロセスを止めないため）。
+                    signal_group(process, signal.SIGKILL)
+                finished.append((process.returncode, output.read().decode('utf-8', 'replace'), value))
             return finished
         except BaseException:
             # 止めている最中のシグナルで子を取り残さないよう、保留したまま止める。
@@ -252,7 +271,7 @@ def main(argv=None, root=ROOT):
     previous = {signum: signal.signal(signum, requests.handle) for signum in STOP_SIGNALS}
     try:
         started = time.monotonic()
-        ids, errors = collect(root)
+        ids, errors = collect(root, requests)
         if errors:
             print('test collection failed:', file=sys.stderr)
             for error in errors:

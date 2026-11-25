@@ -368,7 +368,8 @@ class ParallelRunner(unittest.TestCase):
     def kill_remaining(self, markers):
         # テストが失敗しても、別セッションで動く子と孫を残さない。動いていて、コマンドラインが
         # このテストのものと一致する PID にだけ送る。
-        for prefix, token, kill in (('worker-', 'fakepkg.test_a', os.killpg), ('grandchild-', str(markers), os.kill)):
+        for prefix, token, kill in (('worker-', 'fakepkg.test_a', os.killpg), ('grandchild-', str(markers), os.kill),
+                                    ('listing-', str(self.root), os.kill)):
             for marker in markers.glob(prefix + '*'):
                 pid = int(marker.read_text())
                 state = subprocess.run(['ps', '-o', 'stat=,args=', '-p', str(pid)],
@@ -378,6 +379,17 @@ class ParallelRunner(unittest.TestCase):
                         kill(pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
+
+    def start_runner(self, stop_wait=parallel.STOP_WAIT_SECONDS):
+        launcher = ('import sys\nfrom pathlib import Path\nimport importlib.util\n'
+                    'spec = importlib.util.spec_from_file_location("parallel", sys.argv[1])\n'
+                    'parallel = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(parallel)\n'
+                    'parallel.STOP_WAIT_SECONDS = float(sys.argv[3])\n'
+                    'sys.exit(parallel.main(["-j", "2"], root=Path(sys.argv[2])))\n')
+        process = subprocess.Popen([sys.executable, '-c', launcher, str(RUNNER), str(self.root), str(stop_wait)],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(self.kill_running, process)
+        return process
 
     def interrupt(self, signum, ignore_sigint=False, grandchild_ignores_sigint=False,
                   stop_wait=parallel.STOP_WAIT_SECONDS):
@@ -421,14 +433,7 @@ class ParallelRunner(unittest.TestCase):
                 def test_two(self):
                     self.wait('two')
             ''' % (str(markers), ignore_sigint, grandchild, WAIT_SECONDS, POLL_SECONDS, LONG_SLEEP_SECONDS))
-        launcher = ('import sys\nfrom pathlib import Path\nimport importlib.util\n'
-                    'spec = importlib.util.spec_from_file_location("parallel", sys.argv[1])\n'
-                    'parallel = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(parallel)\n'
-                    'parallel.STOP_WAIT_SECONDS = float(sys.argv[3])\n'
-                    'sys.exit(parallel.main(["-j", "2"], root=Path(sys.argv[2])))\n')
-        process = subprocess.Popen([sys.executable, '-c', launcher, str(RUNNER), str(self.root), str(stop_wait)],
-                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        self.addCleanup(self.kill_running, process)
+        process = self.start_runner(stop_wait)
         end = time.monotonic() + WAIT_SECONDS
         while not all((markers / name).exists() for name in ('one', 'two')) and time.monotonic() < end:
             time.sleep(POLL_SECONDS)
@@ -465,6 +470,56 @@ class ParallelRunner(unittest.TestCase):
             self.assertTrue((markers / ('cleaned-' + name)).exists(), name)
         for pid in pids:
             self.assert_process_stopped(pid)
+
+    def test_stop_signal_during_listing_stops_listing_and_descendants(self):
+        markers = Path(tempfile.mkdtemp(dir=self.root))
+        self.addCleanup(self.kill_remaining, markers)
+        grandchild = 'import time\ntime.sleep(%r)  # %s' % (LONG_SLEEP_SECONDS, markers)
+        # import の最中に孫を起動して止まるモジュールで、列挙の途中に割り込む。
+        self.package(test_a='''
+            import os, subprocess, sys, time
+            from pathlib import Path
+            MARKERS = Path(%r)
+            (MARKERS / ('listing-%%d' %% os.getpid())).write_text(str(os.getpid()))
+            child = subprocess.Popen([sys.executable, '-c', %r])
+            (MARKERS / ('grandchild-%%d' %% child.pid)).write_text(str(child.pid))
+            (MARKERS / 'ready.tmp').write_text('%%d %%d' %% (os.getpid(), child.pid))
+            (MARKERS / 'ready.tmp').rename(MARKERS / 'ready')
+            time.sleep(%r)
+            ''' % (str(markers), grandchild, LONG_SLEEP_SECONDS))
+        process = self.start_runner()
+        end = time.monotonic() + WAIT_SECONDS
+        while not (markers / 'ready').exists() and time.monotonic() < end:
+            time.sleep(POLL_SECONDS)
+        pids = [int(pid) for pid in (markers / 'ready').read_text().split()]
+        process.send_signal(signal.SIGTERM)
+        stdout, stderr = process.communicate(timeout=WAIT_SECONDS)
+        self.assertEqual(process.returncode, 128 + signal.SIGTERM, stdout + stderr)
+        self.assertIn('interrupted by SIGTERM', stdout + stderr)
+        for pid in pids:
+            self.assert_process_stopped(pid)
+
+    def test_descendants_of_unfinished_group_are_killed(self):
+        markers = Path(tempfile.mkdtemp(dir=self.root))
+        self.addCleanup(self.kill_remaining, markers)
+        grandchild = 'import time\ntime.sleep(%r)  # %s' % (LONG_SLEEP_SECONDS, markers)
+        self.package(test_a='''
+            import os, subprocess, sys, unittest
+            from pathlib import Path
+            MARKERS = Path(%r)
+            class Case(unittest.TestCase):
+                def test_exit(self):
+                    child = subprocess.Popen([sys.executable, '-c', %r])
+                    (MARKERS / ('grandchild-%%d' %% child.pid)).write_text(str(child.pid))
+                    os._exit(3)
+            ''' % (str(markers), grandchild))
+        code, output = self.run_main('-j', '1')
+        self.assertEqual(code, 1, output)
+        self.assertIn('group 1: no valid result file', output)
+        self.assertIn('group 1: exited with code 3', output)
+        pids = [int(marker.read_text()) for marker in markers.glob('grandchild-*')]
+        self.assertEqual(len(pids), 1)
+        self.assert_process_stopped(pids[0])
 
 
 if __name__ == '__main__':
