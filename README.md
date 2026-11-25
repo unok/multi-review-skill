@@ -17,6 +17,8 @@ TypeScript の解析は `createSourceFile` を持つコンパイラ API 版（Ty
 
 テスト実行には node・typescript・go が必要。TypeScript 5.x・6.x は `MR_TEST_TYPESCRIPT`（未設定なら直下の `node_modules/typescript`）、7.x は `MR_TEST_TYPESCRIPT7` に既存のパッケージディレクトリを指定し、`MR_TEST_TYPESCRIPT=/path/to/typescript5 MR_TEST_TYPESCRIPT7=/path/to/typescript7 python3 -m unittest` で実行する。どちらかが見つからなければ、設定方法を表示してテストを失敗させる。
 
+同じ環境変数で `python3 tests/parallel.py [-j N]` を実行すると、テストを最大 N 組（既定は使える CPU 数）に分けて別プロセスで並列に流す。`python3 -m unittest` では成功扱いのスキップ・expected failure も、unexpected success・件数の不一致と同じく失敗にする。組は別プロセスなので、`setUpClass`・`setUpModule` は組ごとに実行される。CPU 数を超える並列は速くならず、時間制限に依存するテストが落ちることがある。
+
 ## インストール
 
 ```bash
@@ -48,7 +50,7 @@ Claude Code では `/multi-review` または「複眼レビューして」、Cod
 - `scripts/mr.py` — 差分・プロンプト・並列実行・台帳・決定事項・既存の一覧の生成・rules・ゲートの機械的処理
 - `scripts/inventory_ts.cjs` — TypeScript コンパイラ API による既存の一覧の解析
 - `scripts/inventory_go.go` — Go の構文解析による既存の一覧の解析
-- `tests/` — `python3 -m unittest` で実行するテスト（外部レビュアーとゲートは偽 CLI、inventory は実物の node・typescript・go を使用）
+- `tests/` — `python3 -m unittest` で実行するテストと、並列に流す入口 `parallel.py`（外部レビュアーとゲートは偽 CLI、inventory は実物の node・typescript・go を使用）
 - `CONTEXT.md` — 用語集
 
 ## ライセンス
