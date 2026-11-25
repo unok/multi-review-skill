@@ -1871,6 +1871,10 @@ def optional_str(obj, key, label):
     require(key not in obj or isinstance(obj[key], str), 'invalid ' + label)
 
 
+def is_id_list(value):
+    return isinstance(value, list) and all(nonempty(i) for i in value)
+
+
 def validate_verdict(value):
     require(isinstance(value, dict), 'gate JSON must be object')
     require(value.get('verdict') in ('needed', 'skippable') and nonempty(value.get('verdictId')),
@@ -1889,9 +1893,8 @@ def validate_verdict(value):
     optional_str(risk, 'rationale', 'newRisk rationale')
     for section in value['sections']:
         require(isinstance(section, dict) and nonempty(section.get('path')), 'invalid section')
-        if 'findingIds' in section:
-            require(isinstance(section['findingIds'], list) and all(nonempty(i) for i in section['findingIds']),
-                    'invalid section findingIds')
+        for key in ('findingIds', 'ownedFindingIds'):
+            require(key not in section or is_id_list(section[key]), 'invalid section ' + key)
         optional_str(section, 'error', 'section error')
         if 'newRiskProbability' in section:
             probability = section['newRiskProbability']
@@ -1901,8 +1904,8 @@ def validate_verdict(value):
     if 'rechecks' in value:
         require(isinstance(value['rechecks'], list), 'invalid rechecks')
         for recheck in value['rechecks']:
-            require(isinstance(recheck, dict) and isinstance(recheck.get('findingIds'), list)
-                    and all(nonempty(i) for i in recheck['findingIds']), 'invalid recheck evidence')
+            require(isinstance(recheck, dict) and is_id_list(recheck.get('findingIds')), 'invalid recheck evidence')
+    require('unmatchedFindings' not in value or is_id_list(value['unmatchedFindings']), 'invalid unmatchedFindings')
     key = 'reason' if value['verdict'] == 'needed' else 'reviewPrompt'
     require(nonempty(value.get(key)), 'missing gate ' + key)
     return value
@@ -1920,33 +1923,60 @@ def low_confidence_evidence(value, probability_key='probability'):
     return {'confidence': confidence} if confidence is not None and confidence < GATE_MIN_CONFIDENCE else {}
 
 
+# 判定理由ごとに、その理由を表す根拠の種類。low_confidence は種類によらず confidence の付いた根拠を求める。
+REASON_GROUND_KINDS = {'fix_not_resolved': ('finding', 'unmatched'), 'new_risk': ('newRisk', 'section')}
+
+
 def evaluate_verdict(verdict):
     low_confidence = verdict.get('reason') == 'low_confidence'
+    unmatched = verdict.get('unmatchedFindings', [])
+    # 未対応があると jev-guard は確信度不足より先に fix_not_resolved を返し、再判定もしない。
+    # 隠れた確信度不足を確かめずに覆さないよう、確信度の根拠と担当区画の検査を同じく適用する。
+    confidence_checked = low_confidence or (verdict.get('reason') == 'fix_not_resolved' and bool(unmatched))
     eligible = verdict['verdict'] == 'needed' and \
         verdict['reason'] in ('fix_not_resolved', 'new_risk', 'low_confidence') and \
         all('error' not in s for s in verdict['sections']) and \
-        all(type(f['resolved']) is bool for f in verdict['findings'])
+        all(type(f['resolved']) is bool or f['id'] in unmatched for f in verdict['findings'])
+    # 未対応で判定されなかった指摘は、kind: unmatched の反証対象として扱う。
+    judged = [f for f in verdict['findings'] if type(f['resolved']) is bool]
     grounds = []
     for finding in verdict['findings']:
-        evidence = low_confidence_evidence(finding) if low_confidence else {}
+        evidence = low_confidence_evidence(finding) if confidence_checked else {}
         if finding['resolved'] is False or evidence:
             grounds.append({'kind': 'finding', 'id': finding['id'], 'rationale': finding.get('rationale'),
                 'rechecks': [r for r in verdict.get('rechecks', []) if finding['id'] in r.get('findingIds', [])],
                 **evidence})
+    # 位置に一意に対応する区画がない指摘は、解消と判定されていても jev-guard が needed にするため根拠に出す。
+    grounds.extend({'kind': 'unmatched', 'id': fid, 'rationale': None} for fid in unmatched)
     risk = verdict['newRisk']
-    evidence = low_confidence_evidence(risk) if low_confidence else {}
+    evidence = low_confidence_evidence(risk) if confidence_checked else {}
     if risk['value'] is True or evidence:
         grounds.append({'kind': 'newRisk', 'rationale': risk.get('rationale'), **evidence})
     for section in verdict['sections']:
-        evidence = low_confidence_evidence(section, 'newRiskProbability') if low_confidence else {}
+        evidence = low_confidence_evidence(section, 'newRiskProbability') if confidence_checked else {}
         if section.get('newRiskProbability', 0) >= SECTION_RISK_THRESHOLD or evidence:
             grounds.append({'kind': 'section', 'path': section['path'],
                             'rationale': section.get('newRiskRationale'), **evidence})
+    if confidence_checked:
+        sections = verdict['sections']
+        if not sections:
+            # 区画がなければ、判定済みの指摘の担当区画を確かめられない。
+            eligible = eligible and not judged
+        elif all('ownedFindingIds' in s for s in sections):
+            # 解消は担当区画 1 か所で尋ねる。担当区画がない・複数ある判定済みの指摘は、判定の根拠を確かめられない。
+            counts = Counter(fid for section in sections for fid in set(section['ownedFindingIds']))
+            eligible = eligible and all(counts[finding['id']] == 1 for finding in judged)
+        else:
+            # ownedFindingIds のない区画がある（古い jev-guard）と、どの区画で尋ねたか分からず、
+            # 複数区画に載る指摘は確かめられない。
+            counts = Counter(fid for section in sections for fid in set(section.get('findingIds', [])))
+            eligible = eligible and all(count == 1 for count in counts.values())
+    # needed の理由を特定できないまま反証の手順に進めないよう、判定理由に対応する根拠を求める。
     if low_confidence:
-        # 複数区画の指摘は最後の判定しか残らず、下限未満の根拠が欠けていないと確認できない。
-        counts = Counter(fid for section in verdict['sections'] for fid in set(section.get('findingIds', [])))
-        eligible = eligible and all(count == 1 for count in counts.values()) and \
-            any('confidence' in ground for ground in grounds)
+        eligible = eligible and any('confidence' in ground for ground in grounds)
+    elif verdict.get('reason') in REASON_GROUND_KINDS:
+        kinds = REASON_GROUND_KINDS[verdict['reason']]
+        eligible = eligible and any(ground['kind'] in kinds for ground in grounds)
     return {'status': 'evaluated', 'verdict': verdict, 'overruleEligible': eligible,
             'grounds': grounds, 'next': NEXT['caller_decision']}
 

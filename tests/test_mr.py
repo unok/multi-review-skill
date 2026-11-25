@@ -1575,7 +1575,7 @@ with patch.object(pwd, 'getpwuid', side_effect=KeyError('no home')):
                   'newRisk': {'value': False, 'confidence': 1, 'probability': 0},
                   'rechecks': [{'findingIds': ['F1'], 'paths': ['a.txt'], 'mode': 'full'},
                                {'findingIds': ['F2'], 'paths': ['b.txt'], 'mode': 'full'}],
-                  'sections': []}, True),
+                  'sections': [{'path': 'a.txt', 'ownedFindingIds': ['F1']}]}, True),
                 ({'reason': 'oversized', 'oversized': True}, False)]:
             with self.subTest(changes=changes):
                 (self.root / 'gate-argv.json').unlink(missing_ok=True)
@@ -1606,7 +1606,7 @@ with patch.object(pwd, 'getpwuid', side_effect=KeyError('no home')):
                 finding = {'id': 'F1', 'resolved': True, 'confidence': confidence,
                            'probability': probability, 'rationale': 'uncertain'}
                 self.fake_gate(self.verdict(reason='low_confidence', findings=[finding],
-                    newRisk={'value': False, 'confidence': 1, 'probability': 0}, sections=[]))
+                    newRisk={'value': False, 'confidence': 1, 'probability': 0}, sections=[{'path': 'a.txt', 'ownedFindingIds': ['F1']}]))
                 result = self.call('gate', self.iter)
                 self.assertEqual(result['status'], 'evaluated')
                 self.assertEqual(result['grounds'], [] if expected is None else [
@@ -1655,6 +1655,122 @@ with patch.object(pwd, 'getpwuid', side_effect=KeyError('no home')):
                     if reason == 'low_confidence' else [
                     {'kind': 'finding', 'id': 'F1', 'rationale': None, 'rechecks': []}])
 
+    def test_gate_low_confidence_owned_finding_ids(self):
+        self.ready_diff()
+        for sections, eligible in [
+                # 担当区画が分かれば、findingIds に重複があっても覆せる。
+                ([{'path': 'a.txt', 'findingIds': ['F1'], 'ownedFindingIds': ['F1']},
+                  {'path': 'b.txt', 'findingIds': ['F1', 'F2'], 'ownedFindingIds': ['F2']}], True),
+                ([{'path': 'a.txt', 'findingIds': ['F1'], 'ownedFindingIds': ['F1']},
+                  {'path': 'b.txt', 'findingIds': ['F1', 'F2'], 'ownedFindingIds': ['F1', 'F2']}], False),
+                # findings[] にない ID の重複は検査しない。
+                ([{'path': 'a.txt', 'findingIds': ['F1', 'F3'], 'ownedFindingIds': ['F1', 'F3']},
+                  {'path': 'b.txt', 'findingIds': ['F2', 'F3'], 'ownedFindingIds': ['F2', 'F3']}], True),
+                ([{'path': 'a.txt', 'findingIds': ['F1'], 'ownedFindingIds': ['F1']},
+                  {'path': 'b.txt', 'findingIds': ['F1']}], False),
+                # 持たない区画が混ざっても、findingIds に重複がなければ覆せる。
+                ([{'path': 'a.txt', 'findingIds': ['F1'], 'ownedFindingIds': ['F1']},
+                  {'path': 'b.txt', 'findingIds': ['F2']}], True),
+                # 担当区画のない指摘は、解消を尋ねた区画が分からず確かめられない。
+                ([{'path': 'a.txt', 'findingIds': ['F1'], 'ownedFindingIds': []},
+                  {'path': 'b.txt', 'findingIds': ['F1'], 'ownedFindingIds': []}], False),
+                ([{'path': 'a.txt', 'findingIds': ['F1', 'F2'], 'ownedFindingIds': ['F1']},
+                  {'path': 'b.txt', 'findingIds': ['F2'], 'ownedFindingIds': []}], False),
+                ([{'path': 'a.txt', 'findingIds': ['F1', 'F2'], 'ownedFindingIds': ['F1', 'F1', 'F2']}], True)]:
+            with self.subTest(sections=sections):
+                self.fake_gate(self.verdict(reason='low_confidence',
+                    findings=[{'id': 'F1', 'resolved': True}, {'id': 'F2', 'resolved': True, 'confidence': .1}],
+                    newRisk={'value': False}, sections=sections))
+                result = self.call('gate', self.iter)
+                self.assertEqual(result['status'], 'evaluated')
+                self.assertEqual(result['overruleEligible'], eligible)
+                self.assertEqual(result['grounds'], [
+                    {'kind': 'finding', 'id': 'F2', 'confidence': .1, 'rationale': None, 'rechecks': []}])
+        # 確信度不足の根拠がなければ、担当区画が分かっていても覆せない。
+        self.fake_gate(self.verdict(reason='low_confidence', findings=[{'id': 'F1', 'resolved': True}],
+            newRisk={'value': False}, sections=[{'path': 'a.txt', 'findingIds': ['F1'], 'ownedFindingIds': ['F1']}]))
+        result = self.call('gate', self.iter)
+        self.assertFalse(result['overruleEligible'])
+        self.assertEqual(result['grounds'], [])
+
+    def test_gate_unmatched_findings_grounds(self):
+        self.ready_diff()
+        resolved = [{'id': 'F1', 'resolved': True}, {'id': 'F3', 'resolved': True}]
+        uncertain = [{'id': 'F1', 'resolved': True}, {'id': 'F2', 'resolved': True, 'confidence': .1}]
+        f2_ground = {'kind': 'finding', 'id': 'F2', 'confidence': .1, 'rationale': None, 'rechecks': []}
+        for changes, grounds, eligible in [
+                # jev-guard は対応する区画のない指摘を判定せず resolved: null で返す。未対応の反証対象として覆せる。
+                ({'reason': 'fix_not_resolved', 'findings': [{'id': 'F1', 'resolved': None},
+                  {'id': 'F2', 'resolved': True}, {'id': 'F3', 'resolved': None}],
+                  'newRisk': {'value': False}, 'unmatchedFindings': ['F1', 'F3'],
+                  'sections': [{'path': 'a.txt', 'ownedFindingIds': ['F2']}]},
+                 [{'kind': 'unmatched', 'id': 'F1', 'rationale': None},
+                  {'kind': 'unmatched', 'id': 'F3', 'rationale': None}], True),
+                # 未対応に載らない指摘が未判定なら覆せない。
+                ({'reason': 'fix_not_resolved', 'findings': [{'id': 'F1', 'resolved': None},
+                  {'id': 'F2', 'resolved': True}, {'id': 'F3', 'resolved': None}],
+                  'newRisk': {'value': False}, 'unmatchedFindings': ['F1'],
+                  'sections': [{'path': 'a.txt', 'ownedFindingIds': ['F2']}]},
+                 [{'kind': 'unmatched', 'id': 'F1', 'rationale': None}], False),
+                # 一部の位置だけ区画に対応した未対応の指摘は、担当区画で判定される。
+                ({'reason': 'fix_not_resolved',
+                  'findings': [{'id': 'F1', 'resolved': True}, {'id': 'F2', 'resolved': False, 'rationale': 'not fixed'}],
+                  'newRisk': {'value': True, 'rationale': 'risk'}, 'unmatchedFindings': ['F1'],
+                  'sections': [{'path': 'a.txt', 'ownedFindingIds': ['F1', 'F2']}]},
+                 [{'kind': 'finding', 'id': 'F2', 'rationale': 'not fixed', 'rechecks': []},
+                  {'kind': 'unmatched', 'id': 'F1', 'rationale': None}, {'kind': 'newRisk', 'rationale': 'risk'}], True),
+                # 区画がない出力で判定済みの指摘があれば、担当区画を確かめられない。
+                ({'reason': 'fix_not_resolved', 'findings': resolved, 'newRisk': {'value': False},
+                  'unmatchedFindings': ['F1', 'F3']},
+                 [{'kind': 'unmatched', 'id': 'F1', 'rationale': None},
+                  {'kind': 'unmatched', 'id': 'F3', 'rationale': None}], False),
+                # 未解消かつ未対応の指摘は、両方の根拠になる。
+                ({'reason': 'fix_not_resolved', 'findings': [{'id': 'F1', 'resolved': False}],
+                  'newRisk': {'value': False}, 'unmatchedFindings': ['F1'],
+                  'sections': [{'path': 'a.txt', 'ownedFindingIds': ['F1']}]},
+                 [{'kind': 'finding', 'id': 'F1', 'rationale': None, 'rechecks': []},
+                  {'kind': 'unmatched', 'id': 'F1', 'rationale': None}], True),
+                # 判定理由に対応する根拠（指摘・未対応）がなく、新リスクの根拠だけでは覆せない。
+                ({'reason': 'fix_not_resolved', 'findings': resolved,
+                  'newRisk': {'value': True, 'rationale': 'risk'}},
+                 [{'kind': 'newRisk', 'rationale': 'risk'}], False),
+                # 未対応が空なら確信度の検査は広げない。
+                ({'reason': 'fix_not_resolved', 'findings': uncertain, 'newRisk': {'value': False},
+                  'unmatchedFindings': []}, [], False),
+                # 未対応がある fix_not_resolved では、newRisk と区画の確率からも確信度不足の根拠を出す。
+                ({'reason': 'fix_not_resolved', 'findings': [{'id': 'F1', 'resolved': None}, {'id': 'F2', 'resolved': True}],
+                  'newRisk': {'value': False, 'probability': .45}, 'unmatchedFindings': ['F1'],
+                  'sections': [{'path': 'a.txt', 'ownedFindingIds': ['F2'], 'newRiskProbability': .45}]},
+                 [{'kind': 'unmatched', 'id': 'F1', 'rationale': None},
+                  {'kind': 'newRisk', 'confidence': .1, 'rationale': None},
+                  {'kind': 'section', 'path': 'a.txt', 'confidence': .1, 'rationale': None}], True),
+                # needed の理由を特定できない fix_not_resolved は覆せない。
+                ({'reason': 'fix_not_resolved', 'findings': resolved, 'newRisk': {'value': False},
+                  'unmatchedFindings': []}, [], False),
+                ({'reason': 'fix_not_resolved', 'findings': resolved, 'newRisk': {'value': False}}, [], False),
+                # 未対応があると jev-guard は確信度不足より先に fix_not_resolved を返すので、
+                # 確信度の根拠と担当区画の検査を同じく適用する。
+                ({'reason': 'fix_not_resolved', 'findings': uncertain, 'newRisk': {'value': False},
+                  'unmatchedFindings': ['F1'],
+                  'sections': [{'path': 'a.txt', 'ownedFindingIds': ['F1']}, {'path': 'b.txt', 'ownedFindingIds': ['F2']}]},
+                 [f2_ground, {'kind': 'unmatched', 'id': 'F1', 'rationale': None}], True),
+                ({'reason': 'fix_not_resolved', 'findings': uncertain, 'newRisk': {'value': False},
+                  'unmatchedFindings': ['F1'],
+                  'sections': [{'path': 'a.txt', 'ownedFindingIds': ['F1', 'F2']}, {'path': 'b.txt', 'ownedFindingIds': ['F2']}]},
+                 [f2_ground, {'kind': 'unmatched', 'id': 'F1', 'rationale': None}], False),
+                ({'reason': 'fix_not_resolved', 'findings': uncertain, 'newRisk': {'value': False},
+                  'unmatchedFindings': ['F1'],
+                  'sections': [{'path': 'a.txt', 'findingIds': ['F1', 'F2']}, {'path': 'b.txt', 'findingIds': ['F2']}]},
+                 [f2_ground, {'kind': 'unmatched', 'id': 'F1', 'rationale': None}], False),
+                ({'verdict': 'skippable', 'reviewPrompt': 'confirm', 'findings': resolved,
+                  'newRisk': {'value': False}}, [], False)]:
+            with self.subTest(changes=changes):
+                self.fake_gate(self.verdict(**dict({'sections': []}, **changes)))
+                result = self.call('gate', self.iter)
+                self.assertEqual(result['status'], 'evaluated')
+                self.assertEqual(result['grounds'], grounds)
+                self.assertEqual(result['overruleEligible'], eligible)
+
     def test_gate_low_confidence_risk_and_section_grounds(self):
         self.ready_diff()
         self.fake_gate(self.verdict(reason='low_confidence',
@@ -1676,7 +1792,7 @@ with patch.object(pwd, 'getpwuid', side_effect=KeyError('no home')):
             {'kind': 'section', 'path': 'd.txt', 'confidence': 0, 'rationale': None},
             {'kind': 'section', 'path': 'e.txt', 'rationale': None}])
         self.fake_gate(self.verdict(reason='low_confidence', newRisk={'value': False, 'confidence': .1},
-                                    sections=[]))
+                                    sections=[{'path': 'a.txt', 'ownedFindingIds': ['F1']}]))
         result = self.call('gate', self.iter)
         self.assertTrue(result['overruleEligible'])
         self.assertEqual(result['grounds'], [{'kind': 'newRisk', 'confidence': .1, 'rationale': None}])
@@ -1692,7 +1808,21 @@ with patch.object(pwd, 'getpwuid', side_effect=KeyError('no home')):
                     newRisk={'value': False, 'probability': .45}, sections=[]))
                 result = self.call('gate', self.iter)
                 self.assertEqual(result['grounds'], [])
-                self.assertTrue(result['overruleEligible'])
+                # 判定理由に対応する根拠がなければ、needed の理由を特定できないので覆せない。
+                self.assertFalse(result['overruleEligible'])
+        for findings, sections, grounds, eligible in [
+                # new_risk の根拠にならない指摘の根拠だけでは覆せない。
+                ([{'id': 'F1', 'resolved': False}], [],
+                 [{'kind': 'finding', 'id': 'F1', 'rationale': None, 'rechecks': []}], False),
+                # しきい値ちょうどの区画の根拠だけでも覆せる。
+                ([{'id': 'F1', 'resolved': True}], [{'path': 'a.txt', 'newRiskProbability': .5}],
+                 [{'kind': 'section', 'path': 'a.txt', 'rationale': None}], True)]:
+            with self.subTest(findings=findings, sections=sections):
+                self.fake_gate(self.verdict(reason='new_risk', findings=findings, newRisk={'value': False},
+                                            sections=sections))
+                result = self.call('gate', self.iter)
+                self.assertEqual(result['grounds'], grounds)
+                self.assertEqual(result['overruleEligible'], eligible)
 
     def ja_skill(self):
         skill = self.root / 'ja-skill'
@@ -2310,8 +2440,9 @@ with patch.object(mr.os, 'write', write):
         self.assertTrue(result['overruleEligible'])
         self.assertEqual(len(result['grounds']), 2)
         self.assertEqual([g['kind'] for g in result['grounds']], ['newRisk', 'section'])
+        # fix_not_resolved なのに指摘・未対応の根拠がなく、新リスクの根拠だけなので覆せない。
         self.fake_gate(self.verdict(reason='fix_not_resolved'))
-        self.assertTrue(self.call('gate', self.iter)['overruleEligible'])
+        self.assertFalse(self.call('gate', self.iter)['overruleEligible'])
         self.fake_gate(self.verdict(reason='no_fixed_findings'))
         self.assertFalse(self.call('gate', self.iter)['overruleEligible'])
         self.fake_gate({}, code=2)
@@ -3328,6 +3459,10 @@ Path('leaked').touch()
                 ({'reason': 'low_confidence', 'sections': [{'path': 'a', 'findingIds': [1]}]}, 'invalid section findingIds'),
                 ({'reason': 'low_confidence', 'sections': [{'path': 'a', 'findingIds': [' ']}]}, 'invalid section findingIds'),
                 ({'reason': 'low_confidence', 'sections': [{'path': 'a', 'findingIds': [False]}]}, 'invalid section findingIds'),
+                *[({'reason': 'low_confidence', 'sections': [{'path': 'a', 'findingIds': ['F1'], 'ownedFindingIds': value}]},
+                   'invalid section ownedFindingIds') for value in (None, 'F1', [['F1']], [{}], [''], [1], [' '], [False])],
+                *[({'unmatchedFindings': value}, 'invalid unmatchedFindings')
+                  for value in (None, 'F1', [['F1']], [{}], [''], [1], [' '], [False])],
                 ({'sections': [{'path': 'a', 'error': 1}]}, 'invalid section error'),
                 ({'sections': [{'path': 'a', 'newRiskRationale': 1}]}, 'invalid section rationale'),
                 ({'sections': [{'path': 'a', 'newRiskProbability': True}]}, 'invalid section risk probability'),
