@@ -128,16 +128,16 @@ def collect(root, requests):
                                               start_new_session=True))
             requests.release()
             returncode = processes[0].wait()
+            if returncode != 0 or not output.is_file():
+                stdout.seek(0)
+                stderr.seek(0)
+                text = (stdout.read() + stderr.read()).decode('utf-8', 'replace')
+                return [], [f'listing exited with code {returncode}\n' + text]
+            value = json.loads(output.read_text(encoding='utf-8'))
         except BaseException:
             requests.hold()
             stop_groups(processes)
             raise
-        if returncode != 0 or not output.is_file():
-            stdout.seek(0)
-            stderr.seek(0)
-            text = (stdout.read() + stderr.read()).decode('utf-8', 'replace')
-            return [], [f'listing exited with code {returncode}\n' + text]
-        value = json.loads(output.read_text(encoding='utf-8'))
     return value['ids'], value['errors']
 
 
