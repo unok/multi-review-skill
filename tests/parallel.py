@@ -117,10 +117,10 @@ def split(ids, jobs):
 
 def collect(root, requests):
     processes = []
-    with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryFile() as stdout, \
-            tempfile.TemporaryFile() as stderr:
-        output = Path(temporary) / 'ids.json'
-        try:
+    try:
+        with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryFile() as stdout, \
+                tempfile.TemporaryFile() as stderr:
+            output = Path(temporary) / 'ids.json'
             # ワーカーと同じく別のプロセスグループで起動し、中断時は import 中に起動された子孫ごと止める。
             requests.hold()
             processes.append(subprocess.Popen([sys.executable, '-c', LIST_SCRIPT, str(root), PATTERN, str(output)],
@@ -134,11 +134,11 @@ def collect(root, requests):
                 text = (stdout.read() + stderr.read()).decode('utf-8', 'replace')
                 return [], [f'listing exited with code {returncode}\n' + text]
             value = json.loads(output.read_text(encoding='utf-8'))
-        except BaseException:
-            requests.hold()
-            stop_groups(processes)
-            raise
-    return value['ids'], value['errors']
+        return value['ids'], value['errors']
+    except BaseException:
+        requests.hold()
+        stop_groups(processes)
+        raise
 
 
 def signal_group(process, signum):
