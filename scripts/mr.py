@@ -2725,8 +2725,9 @@ def archive(args, root, run):
     try:
         for name, data in files.items():
             file = target / name
-            if file == meta_path and originals[file] is None:
-                # 確認の後に別のレビューが同じ保存先へ要約を置いていれば、上書きせずに所有を確かめ直す。
+            if file == meta_path:
+                # 確認や控えの後に別のレビューが同じ保存先へ要約を置いていることがあるため、控えの有無によらず
+                # 毎回まず排他的に作り、既にあれば上書きせずに、その時点の要約で所有を確かめ直してから控える。
                 try:
                     write_atomic(file, data, exclusive=True)
                 except FileExistsError:

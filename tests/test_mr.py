@@ -4265,6 +4265,52 @@ mr.os.replace = failing""")
         self.assertEqual(sorted(p.name for p in target.iterdir()), ['carry-meta.json'])
         self.assertEqual((target / 'carry-meta.json').read_text(), placed)
 
+    def test_archive_refuses_copy_written_before_originals_are_saved(self):
+        self.changed_repository()
+        self.exclude_multi_review()
+        self.add()
+        # 空の保存先で所有の確認を通った後、元の内容を控える前に、別のレビューが 3 ファイルを書いた状況を作る。
+        # 要約を組み立てる current_branch の呼び出しが、確認と控えの間にあることを使う。
+        launcher = """import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv.pop(1))
+import mr
+original = mr.current_branch
+target = Path(sys.argv.pop(1))
+review = sys.argv.pop(1)
+def current_branch(cwd):
+    target.mkdir(parents=True, exist_ok=True)
+    (target / 'carry-meta.json').write_text(json.dumps({'version': 1, 'reviewId': review}))
+    (target / 'findings.json').write_text('他のレビューの台帳')
+    (target / 'decisions.json').write_text('他のレビューの決定事項')
+    return original(cwd)
+mr.current_branch = current_branch
+sys.exit(mr.main())
+"""
+
+        def archive(target, review, code):
+            result = subprocess.run([sys.executable, '-c', launcher, str(CLI.parent), str(target), review,
+                                     'archive', str(self.run), '--to', str(target)],
+                                    env=self.env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+            self.assertNotIn('Traceback', result.stderr)
+            return result
+        target = self.archive_dir('other')
+        result = archive(target, 'other-review', 1)
+        self.assertIn('archive directory holds another review', result.stderr)
+        # 別のレビューの写しは 3 ファイルとも変えず、要約より先にほかのファイルも置き換えない。
+        self.assertEqual(self.read_json(target / 'carry-meta.json'), {'version': 1, 'reviewId': 'other-review'})
+        self.assertEqual((target / 'findings.json').read_text(), '他のレビューの台帳')
+        self.assertEqual((target / 'decisions.json').read_text(), '他のレビューの決定事項')
+        self.assertEqual(sorted(p.name for p in target.iterdir()),
+                         ['carry-meta.json', 'decisions.json', 'findings.json'])
+        # 同じレビューが先に書いていたなら、上書きして写しを作る。
+        target = self.archive_dir('same')
+        archive(target, self.run.name, 0)
+        self.assertEqual((target / 'findings.json').read_bytes(), (self.run / 'findings.json').read_bytes())
+        self.assertEqual(self.read_json(target / 'carry-meta.json')['reviewId'], self.run.name)
+        self.assertEqual(self.read_json(target / 'carry-meta.json')['ledger']['unresolved'], 1)
+
     def test_full_lifecycle_with_fake_guard(self):
         self.repository()
         (self.repo / 'a.txt').write_text('initial review change\n')
