@@ -69,13 +69,15 @@ from pathlib import Path
 from unittest.mock import patch
 sys.path.insert(0, sys.argv.pop(1))
 import mr
-original = mr.os.replace
 target = Path(sys.argv.pop(1))
-def replace(source, destination):
-    if Path(destination) == target:
-        raise OSError('injected replacement failure')
-    return original(source, destination)
-with patch.object(mr.os, 'replace', replace):
+# 既存のファイルを置き換える os.replace と、排他的に作る os.link のどちらで置いても失敗させる。
+def failing(original):
+    def place(source, destination):
+        if Path(destination) == target:
+            raise OSError('injected replacement failure')
+        return original(source, destination)
+    return place
+with patch.object(mr.os, 'replace', failing(mr.os.replace)), patch.object(mr.os, 'link', failing(mr.os.link)):
     sys.exit(mr.main())
 """
         result = subprocess.run([sys.executable, '-c', launcher, str(CLI.parent), str(target), *map(str, args)],
@@ -3923,6 +3925,37 @@ Path('leaked').touch()
         self.assertIn('archive requires a git target', self.last_stderr)
         self.assertFalse(target.parent.exists())
 
+    def test_archive_refuses_review_state_links(self):
+        self.changed_repository()
+        self.exclude_multi_review()
+        self.add()
+        target = self.archive_dir()
+        # R の外の有効な状態へのリンクをたどると、R の外の内容を写しとして公開してしまう。
+        # 壊れた run.json は全コマンド共通の読み込みで拒否されるため、切れたリンクは台帳だけで確かめる。
+        for name, message, cases in (('findings.json', 'ledger file must not be a link', (False, True)),
+                                     ('run.json', 'run file must not be a link', (False,))):
+            for dangling in cases:
+                with self.subTest(name=name, dangling=dangling):
+                    path = self.run / name
+                    outside = self.root / ('linked-' + name)
+                    path.rename(outside)
+                    original = outside.read_bytes()
+                    if dangling:
+                        outside.rename(self.root / 'moved.json')
+                    path.symlink_to(outside)
+                    self.call('archive', self.run, '--to', target, code=1)
+                    self.assertEqual(self.last_stderr.strip(), mr.display_path(str(path)) + ': ' + message)
+                    self.assertFalse(target.parent.exists())
+                    if dangling:
+                        self.assertFalse(outside.exists())
+                        (self.root / 'moved.json').rename(outside)
+                    self.assertEqual(outside.read_bytes(), original)
+                    path.unlink()
+                    outside.rename(path)
+        # リンクでなければ同じ状態をそのまま写す。
+        self.call('archive', self.run, '--to', target)
+        self.assertEqual((target / 'findings.json').read_bytes(), (self.run / 'findings.json').read_bytes())
+
     def test_archive_tree_is_from_last_attempted_snapshot(self):
         self.changed_repository()
         self.exclude_multi_review()
@@ -3938,6 +3971,24 @@ Path('leaked').touch()
         self.call('prompts', second)
         # (a) 後の回に snapshot がなければ、修正を確かめた回の木。
         self.assertEqual(tree(), first)
+        # (f) 後の回に snapshot の成果物が 1 つでもあれば、snapshot.mode がなくても試みた回として null。
+        for name in ('snapshot.tree', 'snapshot.index', 'snapshot.files', 'snapshot.json', 'snapshot.mode'):
+            with self.subTest(name=name):
+                (second / name).write_text('')
+                self.assertIsNone(tree())
+                (second / name).unlink()
+        (second / 'snapshot').mkdir()
+        self.assertIsNone(tree())
+        (second / 'snapshot').rmdir()
+        (second / 'snapshot.tree').symlink_to(self.root / 'missing')
+        self.assertIsNone(tree())
+        (second / 'snapshot.tree').unlink()
+        self.assertEqual(tree(), first)
+        # snapshot.tree を書いた後に snapshot.mode の書き込みが失敗した回も、試みた回として null。
+        self.fail_replacement(second / 'snapshot.mode', 'snapshot', second)
+        self.assertTrue((second / 'snapshot.tree').is_file())
+        self.assertFalse((second / 'snapshot.mode').exists())
+        self.assertIsNone(tree())
         # (c) 後の回が snapshot 済みで fixdiff 前なら、古い回の木を使わない。
         self.call('snapshot', second)
         self.assertIsNone(tree())
@@ -4062,6 +4113,9 @@ Path('leaked').touch()
         # 初回の書き込み失敗では、作った DIR も .multi-review/ も残さない。
         self.fail_replacement(target / 'carry-meta.json', 'archive', self.run, '--to', target)
         self.assertFalse(target.parent.exists())
+        # 要約を作った後の書き込みが失敗しても、今回作った要約ごと消す。
+        self.fail_replacement(target / 'findings.json', 'archive', self.run, '--to', target)
+        self.assertFalse(target.parent.exists())
         target.mkdir(parents=True)
         (target / 'report.md').write_text('レポート\n')
         self.fail_replacement(target / 'decisions.json', 'archive', self.run, '--to', target)
@@ -4107,11 +4161,11 @@ sys.exit(mr.main())
         stop = """import os, sys
 sys.path.insert(0, sys.argv.pop(1))
 import mr
-original = mr.os.replace
-def replace(source, destination):
-    original(source, destination)
+original = mr.write_atomic
+def write_atomic(*args, **kwargs):
+    original(*args, **kwargs)
     os._exit(9)
-mr.os.replace = replace
+mr.write_atomic = write_atomic
 sys.exit(mr.main())
 """
         result = subprocess.run([sys.executable, '-c', stop, str(CLI.parent), 'archive', str(self.run), '--to', str(resumed)],
@@ -4129,15 +4183,17 @@ from pathlib import Path
 from unittest.mock import patch
 sys.path.insert(0, sys.argv.pop(1))
 import mr
-original = mr.os.replace
 target = Path(sys.argv.pop(1))
-def replace(source, destination):
-    if Path(destination) == target:
-        raise OSError('injected replacement failure')
-    return original(source, destination)
+def failing(original):
+    def place(source, destination):
+        if Path(destination) == target:
+            raise OSError('injected replacement failure')
+        return original(source, destination)
+    return place
 def rmdir(self):
     raise OSError('injected rmdir failure')
-with patch.object(mr.os, 'replace', replace), patch.object(mr.Path, 'rmdir', rmdir):
+with patch.object(mr.os, 'replace', failing(mr.os.replace)), patch.object(mr.os, 'link', failing(mr.os.link)), \\
+        patch.object(mr.Path, 'rmdir', rmdir):
     sys.exit(mr.main())
 """
         result = subprocess.run([sys.executable, '-c', launcher, str(CLI.parent), str(fresh / 'carry-meta.json'),
@@ -4147,6 +4203,67 @@ with patch.object(mr.os, 'replace', replace), patch.object(mr.Path, 'rmdir', rmd
         self.assertIn('injected replacement failure', result.stderr)
         self.assertIn('injected rmdir failure', result.stderr)
         self.assertEqual(list(fresh.iterdir()), [])
+
+    def test_archive_refuses_summary_created_after_ownership_check(self):
+        self.changed_repository()
+        self.exclude_multi_review()
+        self.add()
+        # 所有の確認の後、要約を置く直前に別の実行が保存先へ要約を置いた状況を作る。
+        launcher = """import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv.pop(1))
+import mr
+original = mr.os.link
+meta = Path(sys.argv.pop(1))
+text = sys.argv.pop(1)
+def link(source, destination):
+    if Path(destination) == meta:
+        meta.write_text(text)
+    return original(source, destination)
+mr.os.link = link
+sys.exit(mr.main())
+"""
+
+        def archive(target, text, code):
+            result = subprocess.run([sys.executable, '-c', launcher, str(CLI.parent), str(target / 'carry-meta.json'),
+                                     text, 'archive', str(self.run), '--to', str(target)],
+                                    env=self.env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+            self.assertNotIn('Traceback', result.stderr)
+            return result
+        other = json.dumps({'version': 1, 'reviewId': 'other-review'})
+        for name, text, message in (('other', other, 'archive directory holds another review'),
+                                    ('broken', '{', 'carry-meta.json: ')):
+            with self.subTest(name=name):
+                target = self.archive_dir(name)
+                result = archive(target, text, 1)
+                self.assertIn(message, result.stderr)
+                # 別の実行の要約を上書きも削除もせず、台帳と決定事項も書かない。
+                self.assertEqual(sorted(p.name for p in target.iterdir()), ['carry-meta.json'])
+                self.assertEqual((target / 'carry-meta.json').read_text(), text)
+        # 同じレビューの要約なら、従来どおり上書きして写しを作る。
+        target = self.archive_dir('same')
+        archive(target, json.dumps({'version': 1, 'reviewId': self.run.name}), 0)
+        self.assertEqual(sorted(p.name for p in target.iterdir()),
+                         ['carry-meta.json', 'decisions.json', 'findings.json'])
+        self.assertEqual(self.read_json(target / 'carry-meta.json')['ledger']['unresolved'], 1)
+        # その後の書き込みが失敗したら、上書きした同じレビューの要約は元の内容に戻す。
+        target = self.archive_dir('same-failure')
+        placed = json.dumps({'version': 1, 'reviewId': self.run.name})
+        failure = launcher.replace('mr.os.link = link', """mr.os.link = link
+replace = mr.os.replace
+def failing(source, destination):
+    if Path(destination).name == 'findings.json':
+        raise OSError('injected replacement failure')
+    return replace(source, destination)
+mr.os.replace = failing""")
+        result = subprocess.run([sys.executable, '-c', failure, str(CLI.parent), str(target / 'carry-meta.json'),
+                                 placed, 'archive', str(self.run), '--to', str(target)],
+                                env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('injected replacement failure', result.stderr)
+        self.assertEqual(sorted(p.name for p in target.iterdir()), ['carry-meta.json'])
+        self.assertEqual((target / 'carry-meta.json').read_text(), placed)
 
     def test_full_lifecycle_with_fake_guard(self):
         self.repository()

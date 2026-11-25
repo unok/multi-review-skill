@@ -73,6 +73,9 @@ RUN_FILE = 'run.json'
 FIXDIFF_FILE = 'fixdiff.json'
 FIX_DIFF_FILE = 'fix.diff'
 SNAPSHOT_MODE_FILE = 'snapshot.mode'
+# mr snapshot がイテレーションディレクトリに作る成果物。snapshot/ は複製モードの写しのディレクトリ。
+SNAPSHOT_ARTIFACTS = ('snapshot.index', 'snapshot.tree', 'snapshot', 'snapshot.files', 'snapshot.json',
+                      SNAPSHOT_MODE_FILE)
 LEDGER_MD_FILE = 'ledger.md'
 DECISIONS_FILE = 'decisions.json'
 DECISIONS_MD_FILE = 'decisions.md'
@@ -226,7 +229,7 @@ def load_review_state(directory, filename):
     return state
 
 
-def write_atomic(path, data):
+def write_atomic(path, data, *, exclusive=False):
     path.parent.mkdir(parents=True, exist_ok=True)
     data = data.encode('utf-8') if isinstance(data, str) else data
     name = None
@@ -236,7 +239,11 @@ def write_atomic(path, data):
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(name, path)
+        if exclusive:
+            # 書き終えた内容を、既にファイルがあれば FileExistsError で失敗する形で置く。
+            os.link(name, path)
+        else:
+            os.replace(name, path)
     finally:
         if name and os.path.exists(name):
             os.unlink(name)
@@ -2634,9 +2641,10 @@ def always_zero(result):
 
 def last_checked_tree(root, iteration):
     # snapshot を試みた最後の回だけを見る。その回が複製モード・fixdiff 前・失効なら、古い回の木を終わりの状態としない。
+    # snapshot.mode を書く前に止まった回も試みた回なので、snapshot が作る成果物のどれか 1 つでもあれば試みた回とする。
     for number in range(iteration, 0, -1):
         directory = iteration_dir(root, number)
-        if not any((directory / name).exists() for name in ('snapshot.json', SNAPSHOT_MODE_FILE)):
+        if not any((directory / name).exists() or (directory / name).is_symlink() for name in SNAPSHOT_ARTIFACTS):
             continue
         try:
             state = valid_diff(directory)
@@ -2651,6 +2659,15 @@ def current_branch(cwd):
     # ブランチ名に含まれる空白を保つため、末尾の改行だけを除く。
     ref = os.fsdecode(run_command(['git', 'symbolic-ref', '-q', 'HEAD'], cwd, allowed=(0, 1)).stdout).removesuffix('\n')
     return ref[len('refs/heads/'):] if ref.startswith('refs/heads/') else None
+
+
+def require_archive_owner(meta_path, review_id):
+    try:
+        existing = read_json(meta_path)
+    except EXPECTED_ERRORS as error:
+        raise Failure(display_path(str(meta_path)) + ': ' + str(error)) from error
+    require(isinstance(existing, dict) and existing.get('reviewId') == review_id,
+            'archive directory holds another review')
 
 
 def archive(args, root, run):
@@ -2677,6 +2694,11 @@ def archive(args, root, run):
         ignored = run_command(['git', 'check-ignore', '-q', '--', str(path.relative_to(base.parent))], cwd,
                               allowed=(0, 1))
         require(ignored.returncode == 0, 'archive file is not ignored by git: ' + display_path(str(path)))
+    # 台帳と要約に使う run.json は R に属し、リンクをたどると R の外の内容を写しとして公開することになる。
+    # 決定事項のリンクは load_decisions が拒否する。
+    for name, label in ((RUN_FILE, 'run'), (LEDGER_FILE, 'ledger')):
+        if (root / name).is_symlink():
+            raise Failure(display_path(str(root / name)) + ': ' + label + ' file must not be a link')
     path = root / DECISIONS_FILE
     # 検証した版と別の版を写さないよう、写すバイト列を先に読み、検証の後も変わっていないことを確かめる。
     contents = [(root / LEDGER_FILE).read_bytes(), path.read_bytes() if path.exists() else None]
@@ -2684,16 +2706,11 @@ def archive(args, root, run):
     decisions = load_decisions_reported(root, ledger, run)
     require([(root / LEDGER_FILE).read_bytes(), path.read_bytes() if path.exists() else None] == contents,
             'review state changed during archive')
+    meta_path = target / CARRY_META_FILE
     # 所有元を確かめられない写しは上書きしない。
     if any(path.exists() for path in paths):
-        meta_path = target / CARRY_META_FILE
         require(meta_path.exists(), 'archive directory holds another review')
-        try:
-            existing = read_json(meta_path)
-        except EXPECTED_ERRORS as error:
-            raise Failure(display_path(str(meta_path)) + ': ' + str(error)) from error
-        require(isinstance(existing, dict) and existing.get('reviewId') == ledger['reviewId'],
-                'archive directory holds another review')
+        require_archive_owner(meta_path, ledger['reviewId'])
     meta = {'version': CARRY_META_VERSION, 'reviewId': ledger['reviewId'], 'cwd': run['cwd'],
             'branch': current_branch(cwd), 'mode': run['mode'], 'base': run.get('base'), 'paths': run['paths'],
             'tree': last_checked_tree(root, ledger['iteration']), 'iteration': ledger['iteration'],
@@ -2707,8 +2724,19 @@ def archive(args, root, run):
     replaced = []
     try:
         for name, data in files.items():
-            write_atomic(target / name, data)
-            replaced.append(target / name)
+            file = target / name
+            if file == meta_path and originals[file] is None:
+                # 確認の後に別のレビューが同じ保存先へ要約を置いていれば、上書きせずに所有を確かめ直す。
+                try:
+                    write_atomic(file, data, exclusive=True)
+                except FileExistsError:
+                    require(not file.is_symlink() and file.is_file(), 'archive file must be a regular file')
+                    require_archive_owner(file, ledger['reviewId'])
+                    originals[file] = file.read_bytes()
+                    write_atomic(file, data)
+            else:
+                write_atomic(file, data)
+            replaced.append(file)
     except BaseException as error:
         # 置き換えたファイルだけを戻す。1つの復元に失敗しても残りを続け、元のエラーに追記する。
         for file in replaced:
