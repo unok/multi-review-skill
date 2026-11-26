@@ -2327,6 +2327,76 @@ print('挨拶' if n==1 else '### 指摘1（重要度: 低）\\n- ファイル: �
         self.assertEqual(output, self.read_json(directory / 'gate.json'))
         return output
 
+    def test_stats_carried_legacy_prompts_and_decision_sources(self):
+        path = self.write_empty_carried()
+        plan = self.call('prompts', self.iter)
+        plan.pop('carried', None)
+        self.write_json(self.iter / 'prompts.json', plan)
+        self.add_decisions([self.decision(), self.decision(type='triage')])
+        decisions_path = self.run / 'decisions.json'
+        value = self.read_json(decisions_path)
+        value['decisions'][0]['sources'] = ['user', 'carried']
+        value['decisions'][1]['sources'] = ['carried']
+        self.write_json(decisions_path, value)
+        expected = {'from': self.read_json(path)['from'], 'rejected': 0, 'onHold': 0,
+                    'shown': None, 'omitted': None, 'decisions': 2}
+        self.stats_gate()
+        row = self.stats_rows()[-1]
+        self.assertEqual(row['carried'], expected)
+        self.assertEqual(row['decisions'], {'policy': 1, 'triage': 0, 'withSources': 1})
+        _, carried = self.write_carried_pair()
+        carried['findings'].append(dict(carried['findings'][1], id='P3', originalId='F3'))
+        self.write_json(path, carried)
+        expected.update(rejected=1, onHold=2)
+        self.stats_gate()
+        self.assertEqual(self.stats_rows()[-1]['carried'], expected)
+        (self.iter / 'prompts.json').unlink()
+        count = len(self.stats_rows())
+        self.stats_gate()
+        rows = self.stats_rows()
+        self.assertEqual(len(rows), count + 1)
+        self.assertEqual(rows[-1]['carried'], expected)
+        path.unlink()
+        self.stats_gate()
+        row = self.stats_rows()[-1]
+        self.assertIsNone(row['carried'])
+        self.assertEqual(row['decisions'], {'policy': 1, 'triage': 1, 'withSources': 2})
+
+    def test_stats_invalid_carried_record_and_disabled(self):
+        plan = self.call('prompts', self.iter)
+        baseline = self.stats_gate()
+        rows = self.stats_rows()
+        self.assertIsNone(rows[-1]['carried'])
+        del baseline['statsPath']
+        path, value = self.write_carried_pair()
+        record = {'from': value['from'], 'rejected': 1, 'onHold': 1, 'shown': 2, 'omitted': 0}
+        plan_path = self.iter / 'prompts.json'
+
+        def assert_stats_error(message):
+            result = self.stats_gate()
+            self.assertIn(message, result.pop('statsError'))
+            self.assertEqual(result, baseline)
+            self.assertEqual(self.stats_rows(), rows)
+
+        for changes in ({'rejected': -1, 'shown': 0}, {'onHold': True}, {'shown': 2.0},
+                        {'omitted': 1}, {'from': 'other-review'}, {'shown': None}):
+            with self.subTest(changes=changes):
+                self.write_json(plan_path, dict(plan, carried=dict(record, **changes)))
+                assert_stats_error(f'{plan_path}: invalid carried stats')
+        self.write_json(plan_path, dict(plan, carried=None))
+        assert_stats_error(f'{plan_path}: invalid carried stats')
+        self.write_json(plan_path, dict(plan, carried=record))
+        path.unlink()
+        assert_stats_error(f'{path}: carried file not found')
+        path.write_text('{')
+        assert_stats_error(f'{path}:')
+        self.write_json(plan_path, plan)
+        assert_stats_error(f'{path}:')
+        plan_path.write_text('{')
+        self.env['MR_NO_STATS'] = '1'
+        self.assertEqual(self.stats_gate(), baseline)
+        self.assertEqual(self.stats_rows(), rows)
+
     def test_stats_collected_mixed_empty_and_missing(self):
         patch = '--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+new\n'
         self.collection_fixture(''.join(self.report(n) for n in (1, 2, 20, '-')), patch)
@@ -4108,7 +4178,12 @@ Path('leaked').touch()
                   '--ja-review', '--ja-skill', skill, '--exclude', 'agy')
         (self.bin / 'claude').unlink()
         (self.bin / 'codex').unlink()
-        self.assertIn('ja-review', sources(self.run / 'iter-1'))
+        _, carried = self.write_carried_pair()
+        plan = self.call('prompts', self.run / 'iter-1')
+        self.assertEqual([job['source'] for job in plan['reviewers']], ['claude-general', 'codex-general', 'ja-review'])
+        self.assertNotRegex(Path(plan['reviewers'][-1]['prompt']).read_text(), r'(?m)^P[12] ')
+        self.assertEqual(plan['carried'], {'from': carried['from'], 'rejected': 1, 'onHold': 1,
+                                           'shown': 0, 'omitted': 2})
         self.assertIn('ja-review', sources(self.run / 'iter-2'))
         # agy の総合を選ぶ場合は、claude・codex が未導入でも 2 回目に校閲を起動しない。
         self.run = self.root / 'agy-installed-run'
@@ -4239,6 +4314,37 @@ Path('leaked').touch()
         self.write_json(path, value)
         return path, value
 
+    def test_prompts_without_carried_preserves_json_keys(self):
+        stdout = self.call('prompts', self.iter)
+        saved = self.read_json(self.iter / 'prompts.json')
+        self.assertEqual(set(stdout), {'cwd', 'iteration', 'confirm', 'reviewers'})
+        self.assertEqual(saved, stdout)
+
+    def test_carried_confirmation_stats_keep_generated_counts_until_regeneration(self):
+        _, value = self.write_carried_pair()
+        self.fake_agy()
+        (self.bin / 'claude').unlink()
+        plan = self.call('prompts', self.iter, '--confirm')
+        expected = {'from': value['from'], 'rejected': 1, 'onHold': 1, 'shown': 2, 'omitted': 0}
+        self.assertEqual(plan['carried'], expected)
+        self.assertEqual(self.read_json(self.iter / 'prompts.json'), plan)
+        jobs = {job['source']: job for job in plan['reviewers']}
+        for source in ('agy-general', 'codex-general'):
+            text = Path(jobs[source]['prompt']).read_text()
+            self.assertIn('\nP1 ', text)
+            self.assertIn('\nP2 ', text)
+        self.call('review', self.iter)
+        self.call('collect', self.iter)
+        self.call('carried', self.run, 'remove', 'P1')
+        self.stats_gate()
+        row = self.stats_rows()[-1]
+        self.assertIs(row['confirm'], True)
+        self.assertEqual(row['carried'], dict(expected, decisions=0))
+        plan = self.call('prompts', self.iter, '--confirm')
+        self.assertEqual(plan['carried'], dict(expected, rejected=0, shown=1))
+        self.stats_gate()
+        self.assertEqual(self.stats_rows()[-1]['carried'], dict(plan['carried'], decisions=0))
+
     def test_carried_prompt_finding_sections(self):
         path, value = self.write_carried_pair()
         held = '前回までの実行で保留済み（検討済みのため再報告不要）:\nP2 日本語.py:3 前回の指摘2 理由: 前回の理由'
@@ -4274,10 +4380,24 @@ Path('leaked').touch()
             text = prompt(second)
             self.assertEqual(text[text.index(considered):],
                              considered + f1 + '\n' + f2 + ('\n' + expected if expected else '') + fixes)
+        rejected_item, held_item = value['findings']
+        items = [dict(rejected_item, changed=None), dict(held_item, changed=None),
+                 dict(rejected_item, id='P3', originalId='F3', changed=True)]
+        self.write_json(path, dict(value, findings=items))
+        result = self.call('prompts', second)
+        self.assertEqual(result['carried'], {'from': value['from'], 'rejected': 2, 'onHold': 1,
+                                             'shown': 1, 'omitted': 2})
+        text = Path(result['reviewers'][0]['prompt']).read_text()
+        self.assertRegex(text, r'(?m)^P1 .*（ファイルの変更は判定不能）$')
+        self.assertNotRegex(text, r'(?m)^P[23] ')
 
     def test_carried_prompt_byte_limit_and_empty_input(self):
-        (self.repo / '本文.txt').write_text('校閲対象')
+        target = self.repo / '本文.txt'
+        target.write_text('校閲対象')
         path, value = self.write_carried_pair()
+        self.call('snapshot', self.iter)
+        target.write_text('修正した校閲対象')
+        self.call('fixdiff', self.iter)
         for directory, options in [(self.iter, ()), (self.run / 'iter-2', ()),
                                    (self.run / 'iter-2', ('--confirm',))]:
             path.unlink()
@@ -4286,7 +4406,9 @@ Path('leaked').touch()
             original = prompt()
             self.write_json(path, dict(value, findings=[]))
             self.assertEqual(prompt(), original)
-        value['findings'].append(dict(value['findings'][0], id='P3', originalId='F3', changed=True))
+            self.assertEqual(self.read_json(directory / 'prompts.json')['carried'],
+                             {'from': value['from'], 'rejected': 0, 'onHold': 0, 'shown': 0, 'omitted': 0})
+        value['findings'].append(dict(value['findings'][0], id='P3', originalId='F3', file=target.name))
         self.write_json(path, value)
         def listing():
             text = Path(self.call('prompts', self.run / 'iter-2')['reviewers'][0]['prompt']).read_text()
@@ -4295,9 +4417,13 @@ Path('leaked').touch()
         first['reason'] += 'x' * (8192 - len(listing().encode()))
         self.write_json(path, value)
         self.assertEqual(len(listing().encode()), 8192)
+        expected = {'from': value['from'], 'rejected': 2, 'onHold': 1, 'shown': 2, 'omitted': 1}
+        plan_path = self.run / 'iter-2/prompts.json'
+        self.assertEqual(self.read_json(plan_path)['carried'], expected)
         first['reason'] += 'x'
         self.write_json(path, value)
         self.assertEqual(listing(), '前回までの実行から引き継いだ指摘 2 件は、一覧が上限を超えるため載せていない。')
+        self.assertEqual(self.read_json(plan_path)['carried'], dict(expected, shown=0, omitted=3))
 
     def test_carried_fix_diffs_exclude_findings_from_prompts_and_future_runs(self):
         source = self.carry_source()
@@ -4325,6 +4451,7 @@ Path('leaked').touch()
         prefix = 'このレビューではシェルコマンドを実行できない。ファイルの読み取りと検索のツールだけを使う。\n\n'.encode()
         for options in ((), ('--confirm',)):
             text = prompt(second, *options)
+            self.assertEqual(self.read_json(second / 'prompts.json')['carried']['omitted'], 1)
             self.assertEqual((second / 'agy-general.prompt.md').read_bytes(),
                              prefix + (second / 'claude.prompt.md').read_bytes())
             self.assertNotIn('\nP1 ', text)
@@ -4498,9 +4625,12 @@ Path('leaked').touch()
                 (self.iter, ['--ja-review'], [2, 5], [1, 4]),
                 (self.run / 'iter-2', [], [1, 2, 4, 5, 3], []),
                 (self.run / 'iter-2', ['--confirm'], [], [1, 4, 5])]:
-            jobs = self.call('prompts', directory, *options)['reviewers']
+            plan = self.call('prompts', directory, *options)
+            jobs = plan['reviewers']
             if options == ['--ja-review']:
                 self.assertTrue(any(j['source'].startswith('ja-') for j in jobs))
+                self.assertEqual(plan['carried']['shown'], 2)
+                self.assertEqual(plan['carried']['omitted'], 0)
             for job in jobs:
                 text = Path(job['prompt']).read_text()
                 normal, _, challenge = text.partition('## 異議を出してよい方針')
