@@ -34,11 +34,14 @@ MAX_CONFIRM_REVIEWS = 2
 CONFIRM_SPECIALISTS = ('bug-hunt', 'test-quality')
 CONFIRM_DECISIONS_HEADING = '異議を出してよい方針'
 CONFIRM_DECISIONS_DESCRIPTION = (
-    'この方針は呼び出し元がレビュアーの指摘を却下して決めたもので、誤っている可能性がある。'
-    '具体的な不備を示せるなら決定 ID を書いて指摘してよい。')
-CONFIRM_REJECTED_HEADING = (
-    '却下済み（同じ内容は再報告不要。却下の理由が誤っている具体例を示せる場合だけ、'
+    'この方針は呼び出し元が選別で決めたもので、前回までの実行から引き継いだものを含むことがある。'
+    '誤っている可能性がある。具体的な不備を示せるなら決定 ID を書いて指摘してよい。')
+REJECTED_PROMPT_CONDITION = (
+    '（同じ内容は再報告不要。却下の理由が誤っている具体例を示せる場合だけ、'
     '「問題:」欄に指摘 ID と具体例（入力・手順・結果）を書いて再指摘してよい）:')
+CONFIRM_REJECTED_HEADING = '却下済み' + REJECTED_PROMPT_CONDITION
+CARRIED_HELD_HEADING = '前回までの実行で保留済み（検討済みのため再報告不要）:'
+CARRIED_REJECTED_HEADING = '前回までの実行で却下済み' + REJECTED_PROMPT_CONDITION
 INVENTORY_MAX_BYTES = 32768
 INVENTORY_VALUE_CHARS = 120
 INVENTORY_SIGNATURE_CHARS = 240
@@ -88,6 +91,7 @@ CARRY_META_VERSION = 1
 CARRIED_FILE = 'carried.json'
 CARRIED_VERSION = 1
 CARRIED_STATES = ('rejected', 'on_hold')
+CARRIED_PROMPT_MAX_BYTES = 8192
 CARRY_MAX_GENERATIONS = 3
 CARRIED_FIELDS = ('id', 'reviewId', 'originalId', 'status', 'file', 'line', 'problem', 'reason',
                   'severity', 'source', 'generation', 'changed')
@@ -513,15 +517,16 @@ def load_decisions_reported(root, ledger, run):
         raise Failure(display_path(str(root / DECISIONS_FILE)) + ': ' + str(error)) from error
 
 
-def decisions_markdown(value, iteration=None, field=None, reconsider=(), confirm_rejected=None):
+def decisions_markdown(value, iteration=None, field=None, reconsider=(), *, challenge=False, rejected=()):
     sections = []
     for kind, label in DECISION_TYPES.items():
         if kind == 'triage' and iteration == 1:
             continue
         rows = []
         for item in sorted(value['decisions'], key=lambda i: int(i['id'][1:])):
-            if confirm_rejected is not None and (kind != 'policy' or
-                    not set(item.get('findingIds', [])) & confirm_rejected):
+            if challenge and (kind != 'policy' or
+                    not ('carried' in item.get('sources', []) or
+                         any(i in rejected for i in item.get('findingIds', [])))):
                 continue
             if item['type'] != kind or (kind == 'triage' and
                                         set(item.get('findingIds', [])) & set(reconsider)):
@@ -536,7 +541,7 @@ def decisions_markdown(value, iteration=None, field=None, reconsider=(), confirm
             rows.append(f"- {item['id']}（{metadata}）{body}\n  理由: {reason}")
         if rows:
             sections.append('### ' + label + f'（{kind}）\n' + '\n'.join(rows))
-            if confirm_rejected is not None:
+            if challenge:
                 return '\n\n'.join(['## ' + CONFIRM_DECISIONS_HEADING,
                     CONFIRM_DECISIONS_DESCRIPTION, '\n'.join(rows)]) + '\n'
     if not sections:
@@ -547,15 +552,23 @@ def decisions_markdown(value, iteration=None, field=None, reconsider=(), confirm
     return '\n\n'.join(['## 決定事項', *sections]) + '\n'
 
 
-def bounded_decisions_markdown(value, iteration=None, field='問題', reconsider=(), confirm_rejected=None):
-    text = decisions_markdown(value, field=field)
-    # 確認用の節は通常の節から方針を絞り、固定部分も短い。
-    size = len(text.encode('utf-8'))
+def bounded_decisions_markdown(value, iteration=None, field='問題', reconsider=(), *, confirm=False, rejected=()):
+    full = decisions_markdown(value, field=field)
+    ordinary = dict(value, decisions=[item for item in value['decisions']
+                                      if 'carried' not in item.get('sources', [])])
+    initial = '\n'.join(filter(None, (decisions_markdown(ordinary, 1, field),
+                                      decisions_markdown(value, 1, challenge=True))))
+    if iteration == 1 and not confirm:
+        text = initial
+    else:
+        text = decisions_markdown(value, iteration, field if iteration is not None else None, reconsider,
+                                  challenge=confirm, rejected=rejected)
+    # 保存時も全決定と通常の初回の2節を検査し、プロンプト生成時は実際に載せる節も検査する。
+    size = max(len(section.encode('utf-8')) for section in (full, initial, text))
     require(size <= DECISIONS_MAX_BYTES,
             f'decisions section is {size} bytes (limit {DECISIONS_MAX_BYTES}); '
             'merge or reduce decisions in decisions.json')
-    return decisions_markdown(value, iteration, field if iteration is not None else None,
-                              reconsider, confirm_rejected)
+    return text
 
 
 def save_decisions_and_run(root, value, run):
@@ -619,7 +632,6 @@ def import_decisions(entries, path, value, ledger, run, source):
     for index, raw in entries:
         try:
             ids.add(add_decision(raw, value, ledger, run, source))
-            bounded_decisions_markdown(value)
         except EXPECTED_ERRORS as error:
             raise Failure(display_path(str(path)) + f'[{index}]: ' + str(error)) from error
     return ids
@@ -1045,9 +1057,26 @@ def init(args, root, run):
         path = root / name
         require(not path.is_symlink() and (path.is_file() or not path.exists()),
                 display_path(str(path)) + ': review state file must be a regular file')
-    carried = carry_from(Path(os.path.abspath(requested / args.carry_from)), run, value, ledger) if args.carry_from else None
+    carry_source = Path(os.path.abspath(requested / args.carry_from)) if args.carry_from else None
+    standing_value = dict(value, decisions=[dict(item) for item in value['decisions']])
+    carried = carry_from(carry_source, run, value, ledger) if carry_source else None
     decisions_saved = bool(imported['count'] or carried and carried[1]['decisions'])
     if decisions_saved:
+        validate_decisions(value, ledger, run)
+        # 出所の併合で初回の2節が1節になる場合があるため、全件の取り込みが済んでから検査する。
+        try:
+            decisions_text = bounded_decisions_markdown(value)
+        except Failure as error:
+            if carried and carried[1]['decisions']:
+                try:
+                    bounded_decisions_markdown(standing_value)
+                except Failure as standing_error:
+                    error = standing_error
+                else:
+                    raise Failure(display_path(str(carry_source / DECISIONS_FILE)) +
+                                  f': {error} (remove --carry-from to start without carried findings and decisions)') from error
+            paths = ', '.join(display_path(source['path']) for source in imported['sources'] if source['ids'])
+            raise Failure(f'{paths}: {error}') from error
         names.extend((DECISIONS_FILE, DECISIONS_MD_FILE))
     if carried:
         names.append(CARRIED_FILE)
@@ -1060,17 +1089,17 @@ def init(args, root, run):
         save_json(root / LEDGER_FILE, ledger)
         render(root, ledger)
         if decisions_saved:
-            validate_decisions(value, ledger, run)
             save_json(root / DECISIONS_FILE, value)
-            render_decisions(root, bounded_decisions_markdown(value))
+            render_decisions(root, decisions_text)
         directory.mkdir(exist_ok=True)
         if carried:
             data = validate_carried(carried[0])
             findings = data['findings']
-            names_by_file = {item['file']: str(Path(item['file'])) for item in findings}
-            changes = carried_changes(cwd, data['tree'], set(names_by_file.values()))
+            paths_by_id = {item['id']: carried_finding_paths(cwd, item) for item in findings}
+            changes = carried_changes(cwd, data['tree'],
+                                      {path for paths in paths_by_id.values() for path in paths if path is not None})
             for item in findings:
-                item['changed'] = changes.get(names_by_file[item['file']])
+                item['changed'] = aggregate_flags([changes.get(path) for path in paths_by_id[item['id']]])
             save_json(root / CARRIED_FILE, data)
     except BaseException as error:
         restore_state(originals, [] if existed else [directory], error)
@@ -1084,7 +1113,7 @@ def validate_carried(value):
             type(value['version']) is int and value['version'] == CARRIED_VERSION and nonempty(value['from']) and
             (value['tree'] is None or isinstance(value['tree'], str) and re.fullmatch(TREE_ID, value['tree'])) and
             isinstance(value['findings'], list) and isinstance(value['skipped'], dict) and
-            set(value['skipped']) == {'outOfScope', 'missing', 'generation'} and
+            value['skipped'].keys() - {'changed'} == {'outOfScope', 'missing', 'generation'} and
             all(type(n) is int and n >= 0 for n in (*value['skipped'].values(), value['unresolvedNotCarried'])),
             'invalid carried findings')
     seen = set()
@@ -1106,10 +1135,35 @@ def validate_carried(value):
 
 def load_carried(directory):
     path = directory / CARRIED_FILE
+    require_archive_source(path, 'carried', optional=True)
     try:
         return validate_carried(read_json(path)) if path.exists() else None
     except EXPECTED_ERRORS as error:
         raise Failure(display_path(str(path)) + ': ' + str(error)) from error
+
+
+def carried_action(args, root, run):
+    value = load_carried(root)
+    require(value is not None, display_path(str(root / CARRIED_FILE)) + ': carried file not found')
+    findings = value['findings']
+    ids = []
+    if args.action == 'remove':
+        require(args.ids, 'carried finding IDs required')
+        requested = set(args.ids)
+        require(requested <= {item['id'] for item in findings}, 'unknown carried finding ID')
+        ids = [item['id'] for item in findings if item['id'] in requested]
+        findings = [item for item in findings if item['id'] not in requested]
+        save_json(root / CARRIED_FILE, validate_carried(dict(value, findings=findings)))
+    return {'ids': ids, 'rejected': sum(i['status'] == 'rejected' for i in findings),
+            'onHold': sum(i['status'] == 'on_hold' for i in findings)}
+
+
+def carried_path(cwd, name):
+    try:
+        relative = Path(os.path.abspath(cwd / name)).relative_to(cwd)
+        return safe_relative(cwd, str(relative)).relative_to(cwd)
+    except (Failure, OSError, ValueError, RuntimeError):
+        return None
 
 
 def carried_changes(cwd, tree, files):
@@ -1124,7 +1178,7 @@ def carried_changes(cwd, tree, files):
         changed = set(nul_paths(git(cwd, 'diff-tree', '-r', '-z', '--name-only', '--no-renames', tree, current)))
     except EXPECTED_ERRORS:
         return {}
-    return {name: name in changed for name in files if name in known}
+    return {path: str(path) in changed for path in files if str(path) in known}
 
 
 def read_carry_source(directory):
@@ -1186,12 +1240,16 @@ def carry_from(source, run, value, ledger):
     require(meta['branch'] == branch, prefix + 'carry source is for another branch')
     items = {(meta['reviewId'], item['id']): dict(item, reviewId=meta['reviewId'], originalId=item['id'], generation=1)
              for item in previous['findings'] if item['status'] in CARRIED_STATES}
-    skipped = {'outOfScope': 0, 'missing': 0, 'generation': 0}
+    skipped = {'outOfScope': 0, 'missing': 0, 'generation': 0, 'changed': 0}
     for item in (carried or {'findings': []})['findings']:
         require(item['reviewId'] != meta['reviewId'], prefix + 'carry source review id collides with a carried finding'
                 ' (start again with a different review directory name)')
         if item['generation'] + 1 > CARRY_MAX_GENERATIONS:
             skipped['generation'] += 1
+            continue
+        # 前提を確かめ直していない項目が再報告不要の一覧に戻るのを防ぐ。
+        if item['changed'] is not False:
+            skipped['changed'] += 1
             continue
         items[item['reviewId'], item['originalId']] = dict(item, generation=item['generation'] + 1)
     cwd = Path(run['cwd'])
@@ -1199,14 +1257,13 @@ def carry_from(source, run, value, ledger):
     kept = []
     for key in sorted(items, key=lambda key: (key[0], natural_id_key(key[1]))):
         item = items[key]
-        try:
-            path = safe_relative(cwd, item['file'])
-        except (Failure, OSError, ValueError, RuntimeError):
-            path = None
-        if path is None or str(path.relative_to(cwd)) not in scope:
+        relative = carried_path(cwd, item['file'])
+        if relative is None or str(relative) not in scope:
             skipped['outOfScope'] += 1
+            continue
+        path = cwd / relative
         # 対象範囲と同じくリンク自体をファイルとして扱い、切れたリンクも存在するとみなす。
-        elif not path.is_symlink() and not path.exists():
+        if not path.is_symlink() and not path.exists():
             skipped['missing'] += 1
         else:
             kept.append(item)
@@ -1274,7 +1331,7 @@ def target_patch(run):
     return b'\n'.join(parts)
 
 
-def rereview_changes(directory, run):
+def rereview_changes(directory, run, touched=None):
     files = set()
     cwd = Path(run['cwd'])
     scoped = set(scope_files(run))
@@ -1284,7 +1341,7 @@ def rereview_changes(directory, run):
         previous = iteration_dir(directory.parent, number)
         if not (previous / FIXDIFF_FILE).exists():
             continue
-        state = valid_diff(previous)
+        state = valid_diff(previous, touched=touched)
         if state['mode'] != 'tree':
             for name in state['state']['files']:
                 # Parent Git cannot express the contents of a nested repository.
@@ -1315,8 +1372,8 @@ def rereview_changes(directory, run):
     return files, patches
 
 
-def iteration_files(directory, run, iteration):
-    extra_files, fixes = rereview_changes(directory, run) if iteration > 1 else (set(), [])
+def iteration_files(directory, run, iteration, *, touched=None):
+    extra_files, fixes = rereview_changes(directory, run, touched) if iteration > 1 else (set(), [])
     files = sorted(set(scope_files(run, include_changes=iteration > 1)) | extra_files)
     return files, extra_files, fixes
 
@@ -1360,10 +1417,11 @@ def diff_header_path(raw, prefix):
     return name[2:] if name.startswith(prefix) else name
 
 
-def diff_lines(patch):
+def diff_lines(patch, *, git_headers=False):
     """Yield (path, line, kind) with the new filename (old for a deleted file).
 
-    kind is '+', '-', 'header', or 'binary'. line is the new-side line number
+    kind is '+', '-', 'header', or 'binary'. With git_headers, also yield
+    'header' for diff --git so that mode-only changes are seen. line is the new-side line number
     (at least 1), including for '-'; header and binary use 0.
     Track hunk counts so body lines cannot become file headers.
     """
@@ -1396,6 +1454,8 @@ def diff_lines(patch):
                     split = re.search(r' (?:b/|"b/)', header)
                     if split:
                         path = git_path(header[split.start() + 1:])[2:]
+            if git_headers and path is not None:
+                yield path, 0, 'header'
         elif raw.startswith('--- '):
             path = None
             old_path = diff_header_path(raw, 'a/')
@@ -1558,12 +1618,50 @@ def iteration_dir(root, number):
     return root / f'iter-{number}'
 
 
-def prompt_finding_lines(ledger, statuses, reconsider):
+def prompt_finding_lines(findings, statuses, reconsider=()):
     return '\n'.join(f"{i['id']} {display_path(i['file'])}:{i['line']} {i['problem']} 理由: {i['reason']}"
-                     for i in ledger['findings'] if i['status'] in statuses and i['id'] not in reconsider)
+                     for i in findings if i['status'] in statuses and i['id'] not in reconsider)
 
 
-def prompt_target(directory, run, ledger, iteration, files, reconsider, fixes=(), confirm=False):
+def carried_finding_paths(cwd, item):
+    paths = [carried_path(cwd, item['file'])]
+    for position in other_locations(item['problem'])[1]:
+        try:
+            name, _ = location(position)
+        except (Failure, ValueError):
+            # 手入力の本文で位置として読めない箇所は、変更の有無を判定できない。
+            paths.append(None)
+        else:
+            paths.append(carried_path(cwd, name))
+    return paths
+
+
+def carried_finding_touched(cwd, item, touched):
+    return not touched.isdisjoint(carried_finding_paths(cwd, item))
+
+
+def prompt_carried(cwd, carried, touched):
+    findings = carried['findings'] if carried else []
+    if touched:
+        findings = [item for item in findings if not carried_finding_touched(cwd, item, touched)]
+    # 保留は前提が変わっていないと確かめられたものだけを載せる。
+    # 却下は判定不能でも注記を付ければ具体例を添えて再指摘できるため残す。
+    held = [i for i in findings if i['status'] == 'on_hold' and i['changed'] is False]
+    rejected = [i if i['changed'] is False else dict(i, reason=i['reason'] + '（ファイルの変更は判定不能）')
+                for i in findings if i['status'] == 'rejected' and i['changed'] is not True]
+    sections = []
+    if held:
+        sections.append(CARRIED_HELD_HEADING + '\n' + prompt_finding_lines(held, ('on_hold',)))
+    if rejected:
+        sections.append(CARRIED_REJECTED_HEADING + '\n' + prompt_finding_lines(rejected, ('rejected',)))
+    text = '\n'.join(sections)
+    if len(text.encode('utf-8')) > CARRIED_PROMPT_MAX_BYTES:
+        # 一覧がなくてもレビューは成立し、再報告が増えるだけなので件数を示して続ける。
+        return f'前回までの実行から引き継いだ指摘 {len(held) + len(rejected)} 件は、一覧が上限を超えるため載せていない。'
+    return text
+
+
+def prompt_target(directory, run, ledger, iteration, files, reconsider, fixes=(), confirm=False, carried=''):
     target = 'レビュー対象（git 差分では変更行だけ）:\n' + '\n'.join(map(display_path, files)) + '\n'
     if run['mode'] == 'paths':
         target += '\n指定パス:\n' + '\n'.join(map(display_path, run['paths'])) + '\n'
@@ -1578,11 +1676,13 @@ def prompt_target(directory, run, ledger, iteration, files, reconsider, fixes=()
     if iteration > 1 or confirm:
         target += '\n検討済みのため再報告不要（前提変更で再評価する項目を除く）:\n'
         statuses = ('on_hold',) if confirm else ('rejected', 'on_hold')
-        target += prompt_finding_lines(ledger, statuses, reconsider)
+        target += prompt_finding_lines(ledger['findings'], statuses, reconsider)
     if confirm:
-        rejected = prompt_finding_lines(ledger, ('rejected',), reconsider)
+        rejected = prompt_finding_lines(ledger['findings'], ('rejected',), reconsider)
         if rejected:
             target += '\n' + CONFIRM_REJECTED_HEADING + '\n' + rejected
+    if carried:
+        target += '\n' + carried
     if iteration > 1:
         target += '\n前回の修正概要:\n' + '\n'.join(
             f"{i['id']} {i['fixSummary']}" for i in ledger['findings']
@@ -1634,9 +1734,11 @@ def prompts(args, root, run):
         run['roles'] = role_list(args.roles)
     reconsider = set(args.reconsider.split(',')) if args.reconsider else set()
     require(reconsider <= {i['id'] for i in ledger['findings']}, 'unknown reconsider ID')
+    carried = load_carried(root)
     value = load_decisions_reported(root, ledger, run)
-    rejected = {i['id'] for i in ledger['findings'] if i['status'] == 'rejected'} if args.confirm else None
-    decisions = bounded_decisions_markdown(value, iteration, reconsider=reconsider, confirm_rejected=rejected)
+    rejected = {i['id'] for i in ledger['findings'] if i['status'] == 'rejected'} if args.confirm else ()
+    decisions = bounded_decisions_markdown(value, iteration, reconsider=reconsider,
+                                          confirm=args.confirm, rejected=rejected)
     # 2回目以降の ja-review は採用が少なく時間がかかるため、省略時は初回だけ init の設定に従う。
     # ja-review 以外のレビュアーが除外か未導入で 1 つも起動できない実行は、2回目以降にレビュアーなしで
     # 止まらないよう init の設定に従う（claude・codex はレビュアー名と CLI 名が同じ）。
@@ -1644,8 +1746,12 @@ def prompts(args, root, run):
                              for name in REVIEWERS if name != 'ja-review')
     ja_default = run['jaReview'] and (iteration == 1 or only_ja_review)
     ja_review = not args.confirm and (ja_default if args.ja_review is None else args.ja_review)
-    files, extra_files, fixes = iteration_files(directory, run, iteration)
+    touched = set()
+    files, extra_files, fixes = iteration_files(directory, run, iteration,
+                                               touched=touched if carried and carried['findings'] else None)
+    carried_text = prompt_carried(Path(run['cwd']), carried, touched)
     if ja_review and 'ja-review' not in run['excluded']:
+        ja_decisions = bounded_decisions_markdown(value, iteration, field='理由', reconsider=reconsider)
         cwd = Path(run['cwd'])
         ranges = {}
         try:
@@ -1667,13 +1773,12 @@ def prompts(args, root, run):
                 ranges.pop(name, None)
         elif extra_files:
             ranges = {name: extra_additions.get(name, set()) for name in extra_files}
-    # 既存の成果物を残す保証は範囲計算の失敗に限り、計算後に失効させる。
+    # 引き継ぎ・決定事項の検証と範囲計算が済んでから既存の成果物を失効させる。
     invalidate(directory, 'prompts')
-    target = prompt_target(directory, run, ledger, iteration, files, reconsider, fixes, args.confirm)
+    target = prompt_target(directory, run, ledger, iteration, files, reconsider, fixes, args.confirm, carried_text)
     jobs = review_jobs(directory, dict(run, roles=CONFIRM_SPECIALISTS) if args.confirm else run, target, decisions)
     if ja_review and 'ja-review' not in run['excluded']:
-        jobs.extend(ja_batches(directory, run, files, ranges,
-                               bounded_decisions_markdown(value, iteration, field='理由', reconsider=reconsider)))
+        jobs.extend(ja_batches(directory, run, files, ranges, ja_decisions))
     require(jobs, 'no reviewer selected')
     require(any(shutil.which(job['cli']) for job in jobs), 'no installed reviewer selected')
     originals = {root / name: (root / name).read_bytes() for name in (LEDGER_FILE, RUN_FILE)}
@@ -1917,7 +2022,7 @@ def review(args, root, run):
     return result
 
 
-def aggregate_near(flags):
+def aggregate_flags(flags):
     if True in flags:
         return True
     if not flags or None in flags:
@@ -1960,7 +2065,7 @@ def collect(args, root, run):
                 pos['nearPreviousFix'] = near
                 flags.append(near)
             finding.update(source=job['source'], output=str(output),
-                           nearPreviousFix=aggregate_near(flags))
+                           nearPreviousFix=aggregate_flags(flags))
             items.append(finding)
     items.sort(key=lambda i: (i['file'], i['line'] is None, i['line'] or 0, i['source']))
     result = dict(reviewer_failures(results), findings=items)
@@ -2011,12 +2116,17 @@ def load_fixdiff_state(directory):
     return state
 
 
-def valid_diff(directory):
+def valid_diff(directory, *, touched=None):
     state = load_fixdiff_state(directory)
     require(state['mode'] == saved_mode(directory), 'diff mode changed')
-    require(digest((directory / FIX_DIFF_FILE).read_bytes()) == state['diffHash'], 'diff changed after generation')
+    patch = (directory / FIX_DIFF_FILE).read_bytes()
+    require(digest(patch) == state['diffHash'], 'diff changed after generation')
     if state['mode'] == 'tree':
         require((directory / 'after.tree').read_text(encoding='utf-8').strip() == state['state']['tree'], 'after tree changed')
+    if touched is not None:
+        # 後の回で元に戻ったファイルも除外するため、累積差分ではなく各回の修正 diff から拾う。
+        touched.update(Path(name) for name, _, _ in
+                       diff_lines(patch.decode('utf-8', 'surrogateescape'), git_headers=True))
     return state
 
 
@@ -2892,7 +3002,7 @@ def archive(args, root, run):
             'archive file must be a regular file')
     ledger = load_ledger(root)
     decisions = load_decisions_reported(root, ledger, run)
-    load_carried(root)
+    carried = load_carried(root)
     require(not any(source.is_symlink() for source in sources) and
             [source.read_bytes() if source.exists() else None for source in sources] == contents,
             'review state changed during archive')
@@ -2905,6 +3015,22 @@ def archive(args, root, run):
     reviewed_branch = run.get('branch', branch)
     require(branch == reviewed_branch, 'archive must run on the reviewed branch '
             f'(reviewed: {reviewed_branch or "detached HEAD"}, current: {branch or "detached HEAD"})')
+    if carried and carried['findings']:
+        touched = set()
+        unknown = False
+        try:
+            for number in range(1, ledger['iteration'] + 1):
+                directory = iteration_dir(root, number)
+                if (directory / FIXDIFF_FILE).exists():
+                    valid_diff(directory, touched=touched)
+        except EXPECTED_ERRORS:
+            # 判定できない修正があれば、次の実行で全項目を見直せるようにする。
+            unknown = True
+        if unknown or touched:
+            findings = [dict(item, changed=True) if unknown or carried_finding_touched(cwd, item, touched) else item
+                        for item in carried['findings']]
+            if findings != carried['findings']:
+                carried_data = (json.dumps(dict(carried, findings=findings), indent=2) + '\n').encode('utf-8')
     meta = {'version': CARRY_META_VERSION, 'reviewId': ledger['reviewId'], 'cwd': run['cwd'],
             'branch': reviewed_branch,
             'mode': run['mode'], 'base': run.get('base'), 'paths': run['paths'],
@@ -2965,6 +3091,7 @@ COMMANDS = {
     'fixdiff': (fixdiff, 'iteration', always_zero),
     'ledger': (ledger_action, 'root', always_zero),
     'decisions': (decisions_action, 'root', always_zero),
+    'carried': (carried_action, 'root', always_zero),
     'archive': (archive, 'root', always_zero),
     'rules': (rules, 'iteration', lambda result: EXIT_CANDIDATES if result.get('exitCode') == EXIT_CANDIDATES else 0),
     'gate': (gate, 'iteration', lambda result: EXIT_AWAITING if result.get('status') == STATUS_AWAITING else 0),
@@ -3015,6 +3142,9 @@ def parser():
     decisions_parser.add_argument('action', choices=('add', 'remove', 'render'))
     decisions_parser.add_argument('ids', nargs='*')
     decisions_parser.add_argument('--input', type=Path)
+    carried_parser = parsers['carried']
+    carried_parser.add_argument('action', choices=('remove',))
+    carried_parser.add_argument('ids', nargs='*')
     parsers['archive'].add_argument('--to', type=Path, required=True)
     return p
 
