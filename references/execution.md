@@ -9,7 +9,7 @@
 
 | コマンド・引数 | 入出力・契約 |
 | --- | --- |
-| `mr init R --cwd PATH [--path PATH]... [--profile default\|codex] [--roles SLUG,...] [--exclude CLI]... [--only CLI]... [--ja-review] [--ja-skill PATH] [--base-summary TEXT] [--no-standing-decisions] [--carry-from DIR]` | `run.json`、空の `findings.json`・`ledger.md`、`iter-1/`。常設の決定事項を取り込む（停止は `--no-standing-decisions`、「決定事項」を参照）。`--carry-from` は写しから前回の却下・保留と決定事項を取り込む（「引き継ぎ」を参照）。対象省略なら未コミット変更→デフォルトブランチとの差分。デフォルトブランチは origin/HEAD→main→master。空範囲・未検出・非 git の対象省略・複数リポジトリは中断。`--cwd` は必須、パスはそこから解釈する。対象の1行要約は `--base-summary` で保存し、省略時はブランチ名・比較元または指定パス・ファイル数を使う |
+| `mr init R --cwd PATH [--path PATH]... [--profile default\|codex] [--roles SLUG,...] [--exclude REVIEWER]... [--only REVIEWER]... [--ja-review] [--ja-skill PATH] [--base-summary TEXT] [--no-standing-decisions] [--carry-from DIR]` | `run.json`、空の `findings.json`・`ledger.md`、`iter-1/`。常設の決定事項を取り込む（停止は `--no-standing-decisions`、「決定事項」を参照）。`--carry-from` は写しから前回の却下・保留と決定事項を取り込む（「引き継ぎ」を参照）。対象省略なら未コミット変更→デフォルトブランチとの差分。デフォルトブランチは origin/HEAD→main→master。空範囲・未検出・非 git の対象省略・複数リポジトリは中断。`--cwd` は必須、パスはそこから解釈する。`REVIEWER` は `claude`・`codex`・`agy`・`ja-review` のいずれかで、`agy` は総合だけを指す。対象の1行要約は `--base-summary` で保存し、省略時はブランチ名・比較元または指定パス・ファイル数を使う |
 | `mr prompts I [--confirm] [--roles SLUG,...] [--reconsider F1,F2,...] [--ja-review\|--no-ja-review]` | 正本から `*.prompt.md`、`target.json`、`prompts.json` を生成。巨大差分は `target.diff`。次のイテレーションの準備と台帳の iteration 更新も担当。役割変更・再評価・ja-review 実行の判断を引数で渡す。ja-review の指定を省略したときの既定は「レビュアー実行と収集」を参照。確認時の契約は「確認レビュー」を参照 |
 | `mr review I` | 呼び出し元がバックグラウンドで起動する。mr は全レビュアーの完了まで待つ。同時実行は最大8ジョブ。生成済みプロンプトで並列実行し、既存名の出力・試行別 stdout/stderr・`review.json` を保存。全レビュアー失敗なら終了1。一部欠席は結果に残して続行 |
 | `mr collect I` | 完了した成功出力だけを解析し、位置順の `collected.json`・`collected.md` を生成。意味による重複統合・選別・台帳登録はしない |
@@ -35,7 +35,7 @@
 
 ## 作業ディレクトリと絶対パス（Step 4）
 
-git ではリポジトリルート、非 git では `--cwd` を共通 cwd にする。`R` はその外に置く。パス指定が複数ルートにまたがり cwd を一意に決められなければ、呼び出し元がユーザーに確認する。プロンプト・出力は I 配下の絶対パスとし、claude / codex には stdin、agy には上限内の引数で渡す。
+git ではリポジトリルート、非 git では `--cwd` を共通 cwd にする。`R` はその外に置く。パス指定が複数ルートにまたがり cwd を一意に決められなければ、呼び出し元がユーザーに確認する。プロンプトと出力は I 配下の絶対パスとする。総合と専門役割のプロンプトは標準入力、ja-review のプロンプトは上限内の引数で渡す。
 
 ## 対象埋め込みの生成（Step 4）
 
@@ -48,7 +48,7 @@ ja-review の範囲計算は既存成果物の失効より前に行う。失敗�
 
 `mr review I` は Claude Code の Bash では `run_in_background: true` で起動し、完了通知後に終了コードを確認する。Codex では `exec_command` の短い `yield_time_ms` で起動し、返された `session_id` を `write_stdin` に渡して終了まで待つ。完了後に `mr collect I` を実行する。
 
-モデル・effort は SKILL.md Step 3 の表どおり明示する。claude は Read/Glob/Grep、codex は read-only の exec を使い、総合は同じプロンプトにする。総合出力は `claude.md` / `role-general.md`、専門役割は `role-<slug>.md`、source は `<cli>-<slug>`。時間制限は Python が子プロセス群に適用し、外部 timeout コマンドに依存しない。
+モデル・effort は SKILL.md Step 3 の表どおり明示する。claude は Read/Glob/Grep、codex は read-only の exec を使い、agy の総合は `agy --model gemini-4-neon-medium --mode plan --input-format text` に `--settings` で権限の JSON を渡し、`command(*)`・`write_file(*)`・`mcp(*)` を拒否して `read_file(<イテレーションディレクトリの絶対パス>)` を許可する。結果は標準出力から保存する。総合出力は `claude.md` / `role-general.md` / `agy-general.md`、専門役割は `role-<slug>.md`、source は `<cli>-<slug>`。時間制限は Python が子プロセス群に適用し、外部 timeout コマンドに依存しない。未導入の agy の総合は構成から外す。`init` が記録した `reviewerSelectionVersion` がない旧実行は従来のレビュアー構成を使う。
 成功条件は終了0かつ指摘形式または「問題なし」。空・挨拶だけ・解析できる指摘がない形式不正・タイムアウト・非ゼロは一度だけ再実行し、再失敗は欠席とする。空の報告は共通形式では「問題なし」、ja-review では「指摘なし」だけの行（前後の空白・句点は許容）を見出しの前で受け入れる。前置きは許容するが、指摘らしい見出しとの混在は拒否する。位置の範囲表記は先頭行を使い、余分なまとめ見出しは無視する。一部の指摘だけ解析できない場合は、その生出力と解析不能の理由も収集結果に残す。全出力が確定するまで収集しない。収集時は成功ジョブの出力ハッシュを必須とし、欠落・不一致を拒否する。試行別ログを保持し、古い出力は成功として使わない。
 ja-review は呼び出し元が実行を指定し、agy と設定先スキルが存在するときだけ追加する。`prompts` の実行指定はそのイテレーションだけに適用する。省略時は iter-1 だけ `init` の設定を使い、iter-2 以降は起動しない。2回目以降の ja-review は採用が少なく、1回に数分かかるためである。ただし、ja-review 以外のレビュアーが除外か未導入で1つも起動できない実行（`--only ja-review` など）は、レビュアーなしで止まらないよう iter-2 以降も `init` の設定を使う。外部スキルの prompt 正本を読み、追加行に日本語があるファイルだけを校閲対象にする。untracked は全行を対象とし、削除だけの変更・純粋な改名・非 UTF-8 のファイルは除く。100000 bytes 以下の引数バッチに分割し、元行番号を保つ。対象の1行だけで上限を超える場合は切り捨てずエラーにし、対象外の超過行は読み飛ばす。`jaTimeout` の時間制限（既定値・設定方法は「CLI の呼び出し」参照）、終了0かつ `### high|medium|low` または「指摘なし」の成功条件、一度の再試行を適用し、全バッチ失敗で欠席とする。選別は SKILL.md Step 5 と ja-review Step 4 に従い、同スキルの修正・報告工程は起動しない。
 `collect` は元出力への参照と全位置を保持し、直前 `fix.diff` の実変更行の変更後番号±5に印を付ける。削除だけは削除境界が基準。直前 diff の完了記録とハッシュを検証し、検証失敗・初回・行不明・バイナリは「判定不能」（JSON null）で、近傍外（false）と区別する。
@@ -223,7 +223,7 @@ init の stdout は run.json のキー（取り込みがあれば `decisionSeque
 
 ## 確認レビュー（Step 7）
 
-`mr prompts I --confirm` は通常の終了前にもう一度見るプロンプトを作る。総合2インスタンスと専門役割 `bug-hunt`・`test-quality` だけを使い、プロファイル・CLI単位の除外・専門担当CLI未導入時の扱いは通常と同じ。ja-review は追加せず、run.json の役割・ja-review設定も変えない。`--roles`・`--ja-review`・`--no-ja-review`・`--reconsider` との同時指定は、空文字の指定も含め終了2。
+`mr prompts I --confirm` は通常の終了前にもう一度見るプロンプトを作る。通常回と同じ総合の構成に、専門役割 `bug-hunt`・`test-quality` を加える。プロファイル・レビュアー名での除外・CLI 未導入時の扱いは通常回に従う。ja-review は追加せず、run.json の役割・ja-review設定も変えない。`--roles`・`--ja-review`・`--no-ja-review`・`--reconsider` との同時指定は、空文字の指定も含め終了2。
 
 確認レビューは挙動とテストの取りこぼしを見る回で、回数に上限があるため、修正が日本語の文言に触れても ja-review は起動しない。修正 diff の日本語は、ほかの回と同じく SKILL.md Step 7 の「日本語の文言の確認」で確かめる。
 
