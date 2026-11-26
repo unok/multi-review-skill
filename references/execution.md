@@ -9,7 +9,7 @@
 
 | コマンド・引数 | 入出力・契約 |
 | --- | --- |
-| `mr init R --cwd PATH [--path PATH]... [--profile default\|codex] [--roles SLUG,...] [--exclude CLI]... [--only CLI]... [--ja-review] [--ja-skill PATH] [--base-summary TEXT] [--no-standing-decisions]` | `run.json`、空の `findings.json`・`ledger.md`、`iter-1/`。常設の決定事項を取り込む（停止は `--no-standing-decisions`、「決定事項」を参照）。対象省略なら未コミット変更→デフォルトブランチとの差分。デフォルトブランチは origin/HEAD→main→master。空範囲・未検出・非 git の対象省略・複数リポジトリは中断。`--cwd` は必須、パスはそこから解釈する。対象の1行要約は `--base-summary` で保存し、省略時はブランチ名・比較元または指定パス・ファイル数を使う |
+| `mr init R --cwd PATH [--path PATH]... [--profile default\|codex] [--roles SLUG,...] [--exclude CLI]... [--only CLI]... [--ja-review] [--ja-skill PATH] [--base-summary TEXT] [--no-standing-decisions] [--carry-from DIR]` | `run.json`、空の `findings.json`・`ledger.md`、`iter-1/`。常設の決定事項を取り込む（停止は `--no-standing-decisions`、「決定事項」を参照）。`--carry-from` は写しから前回の却下・保留と決定事項を取り込む（「引き継ぎ」を参照）。対象省略なら未コミット変更→デフォルトブランチとの差分。デフォルトブランチは origin/HEAD→main→master。空範囲・未検出・非 git の対象省略・複数リポジトリは中断。`--cwd` は必須、パスはそこから解釈する。対象の1行要約は `--base-summary` で保存し、省略時はブランチ名・比較元または指定パス・ファイル数を使う |
 | `mr prompts I [--confirm] [--roles SLUG,...] [--reconsider F1,F2,...] [--ja-review\|--no-ja-review]` | 正本から `*.prompt.md`、`target.json`、`prompts.json` を生成。巨大差分は `target.diff`。次のイテレーションの準備と台帳の iteration 更新も担当。役割変更・再評価・ja-review 実行の判断を引数で渡す。ja-review の指定を省略したときの既定は「レビュアー実行と収集」を参照。確認時の契約は「確認レビュー」を参照 |
 | `mr review I` | 呼び出し元がバックグラウンドで起動する。mr は全レビュアーの完了まで待つ。同時実行は最大8ジョブ。生成済みプロンプトで並列実行し、既存名の出力・試行別 stdout/stderr・`review.json` を保存。全レビュアー失敗なら終了1。一部欠席は結果に残して続行 |
 | `mr collect I` | 完了した成功出力だけを解析し、位置順の `collected.json`・`collected.md` を生成。意味による重複統合・選別・台帳登録はしない |
@@ -25,7 +25,7 @@
 | `mr decisions R add --input FILE` | 1件または配列の決定事項を登録し、`decisions.md` を生成。入力・採番・重複防止・上限は「決定事項」を参照 |
 | `mr decisions R remove ID...` | 指定した決定事項を削除し、`decisions.md` を生成。未知 ID があれば全件未削除 |
 | `mr decisions R render` | `decisions.json` から `decisions.md` を生成。jev-guard は使わない |
-| `mr archive R --to DIR` | 台帳・決定事項を検証し、DIR に写しを書く。DIR・内容・失敗時の扱いは「レポートファイル」の「写し」を参照 |
+| `mr archive R --to DIR` | 台帳・決定事項と、あれば `carried.json` を検証し、実行の要約とともに DIR に写す。DIR・内容・失敗時の扱いは「レポートファイル」の「写し」を参照 |
 | `mr rules I` | 条件確認・実行後、`rules.json` と生出力を保存。候補の妥当性は呼び出し元が確かめる |
 | `mr gate I` | `gate.json` と生出力。必要フィールドと型、覆せる形式条件 `overruleEligible`、反証対象 `grounds` までを返し、実行統計を1行追記する。反証・ダブルチェック・record は行わない |
 
@@ -183,9 +183,9 @@ multi-review は呼び出し元が実施するので実行しない。
 
 `mr init` は、利用者共通の `${XDG_CONFIG_HOME:-$HOME/.config}/multi-review/decisions.json` → 対象ルートの `.multi-review/decisions.json` の順に常設入力を取り込む。git はリポジトリルート、非 git は解決済みの `--cwd` を対象ルートとする。XDG_CONFIG_HOME が未設定・空文字・相対パスなら無視し、`$HOME/.config` を使う。HOME が空文字、または絶対パスで決められない場合は利用者共通の常設ファイルを不存在として扱い、プロジェクトの常設ファイルは通常どおり読む。どちらのファイルも任意で、有効なリンクは読み、壊れたリンクはエラーにする。形式は add と同じ単体オブジェクトまたは配列だが、許すフィールドは `type`・`body`・`reason` だけで、`findingIds` は空配列でも受け付けない。`--no-standing-decisions` なら探索・読み取りを行わない。プロジェクトの常設ファイルは作業ツリー専用で、コミットして共有する使い方は想定しない。Step 8 で `.multi-review/` を `.git/info/exclude` に入れると、このファイルも無視対象になる。共有が必要な決定は利用者共通のファイルに置く。未追跡の常設ファイルをレビュー対象にしたくなければ `.git/info/exclude` か `.gitignore` に入れる。追跡済みなら `--path` で対象を絞る。
 
-取り込みは add と同じ検証・採番・重複防止・上限を使い、全件を検証してから保存する。不正入力はファイルパスと要素位置（配列は0始まりの `[n]`、単体は `[0]`）を診断して終了1。JSON の解析失敗はファイルと解析エラーを示す。init の保存失敗時も生成途中の状態ファイルを巻き戻し、R とロックは残す。取り込み0件なら decisions.json と decisions.md は作らない。R 内の decisions.json がリンクなら add・remove・render・prompts は拒否し、統計は記録せず statsError に理由を残す。init は decisions.json または decisions.md が残っていれば初期化済みとして拒否する。常設ファイルは読み取り専用で、init 後に変更しても既存 R に再取り込みしない。
+取り込みは add と同じ検証・採番・重複防止・上限を使い、全件を検証してから保存する。不正入力はファイルパスと要素位置（配列は0始まりの `[n]`、単体は `[0]`）を診断して終了1。JSON の解析失敗はファイルと解析エラーを示す。init の保存失敗時も生成途中の状態ファイルを巻き戻し、R とロックは残す。取り込み0件なら decisions.json と decisions.md は作らない。R 内の decisions.json がリンクなら add・remove・render・prompts は拒否し、統計は記録せず statsError に理由を残す。init は decisions.json または decisions.md が残っていれば初期化済みとして拒否する。R の `run.json`・`findings.json`・`ledger.md`・`ledger.render.md` がリンクや通常ファイル以外なら拒否する。常設ファイルは読み取り専用で、init 後に変更しても既存 R に再取り込みしない。
 
-常設由来は `sources: ["user"]` または `["project"]` を持ち、両方に同じ決定があれば1件にまとめて `["user", "project"]` を保持する。出所は receipt に含めず、実行中の同じ入力の add も既存 ID を返す。出所なしは実行中の決定（旧データを含む）とし、add の入力で出所を指定できない。remove は R の決定と receipt だけを削除し、常設ファイルは変えない。削除後の手動再追加は新しい ID・出所なしとなり、別の R の init では常設入力を再び取り込む。
+常設由来は `sources: ["user"]` または `["project"]` を持ち、両方に同じ決定があれば1件にまとめて `["user", "project"]` を保持する。写しからの取り込みは `carried` を出所に持つ。出所は receipt に含めず、実行中の同じ入力の add も既存 ID を返す。出所なしは実行中の決定（旧データを含む）とし、add の入力で出所を指定できない。remove は R の決定と receipt だけを削除し、常設ファイルは変えない。削除後の手動再追加は新しい ID・出所なしとなり、別の R の init では常設入力を再び取り込む。
 
 init の stdout は run.json のキー（取り込みがあれば `decisionSequence`・`decisionImports` も含む）に `standingDecisions: {"count": 1, "sources": [{"source": "user", "path": "/absolute/path/decisions.json", "ids": ["D1"]}]}` を加える。count は重複除去後の件数、sources は読み込んだファイルを取り込み順に示し、ids は重複なしの ID 数値順。空配列のファイルも ids が空の項目として示し、不存在・取り込み停止なら項目を出さない。このサマリは run.json に保存しない。
 
@@ -193,11 +193,26 @@ init の stdout は run.json のキー（取り込みがあれば `decisionSeque
 - `id` は D1 から R 全体で採番し、削除後も再利用しない。`iteration` は記録時の台帳の値。`run.json` の `decisionSequence` と `decisionImports` に採番と入力の receipt を保存し、同じ入力の再実行はイテレーションをまたいでも同じ ID を返す。削除時は receipt も除き、同内容の再追加は新しい ID になる。
 - stdout は台帳と同じ `{"ids":["D1"]}`。add は入力順、remove は登録順で ID を返し、render は空配列。空の入力配列は登録なし、remove の ID 省略・未知 ID はエラー。同一 R のロックと各ファイルの原子的置換を使い、run 保存時の例外では決定事項の JSON を復元する。Markdown 保存失敗は終了1とし、保存済み JSON から render で復旧する。
 
-`decisions.md` は種別ごとに ID の数値順で本文・理由・記録イテレーション・関連指摘を表示し、常設由来には `出所: 利用者共通・プロジェクト`（該当するものだけ）を添える。空の種別見出しは出さず、全件ゼロなら「決定事項なし」。生成物であることと編集先を先頭のコメントに示し、レビュアー向けの固定指示はプロンプトに埋め込むときだけ付ける。プロンプトの節と同じ生成処理を使い、固定指示を付けた節全体の上限は8192 bytes（UTF-8、見出し・固定指示・記録情報・改行を含む）。超える add は保存前に拒否し、古い決定の統合を促す。render・prompts でも上限を検査し、切り捨てない。
+`decisions.md` は種別ごとに ID の数値順で本文・理由・記録イテレーション・関連指摘を表示し、出所があれば `user` は「利用者共通」、`project` は「プロジェクト」、`carried` は「前回の実行」と表示する。空の種別見出しは出さず、全件ゼロなら「決定事項なし」。生成物であることと編集先を先頭のコメントに示し、レビュアー向けの固定指示はプロンプトに埋め込むときだけ付ける。プロンプトの節と同じ生成処理を使い、固定指示を付けた節全体の上限は8192 bytes（UTF-8、見出し・固定指示・記録情報・改行を含む）。超える add は保存前に拒否し、古い決定の統合を促す。render・prompts でも上限を検査し、切り捨てない。
 
 通常レビューのプロンプトは役割本文・共通報告形式の後、対象本文の前に節を入れる。ja-review は外部テンプレートの後、FILE 本文の前に各バッチへ入れ、節も引数バッチの上限に数える。policy は初回から、triage は iter-2 以降だけ載せ、該当する決定がゼロなら節を出さない。decisions.md には常に両種別を載せる。`--reconsider` の対象指摘を `findingIds` に含む triage 決定は、そのプロンプトから外す。既存の却下・保留一覧は残す。決定事項に反する指摘・基準に当たる指摘は報告させず、前提が崩れている具体例を示せる場合だけ、共通報告形式の「問題:」欄、ja-review の「理由:」欄に決定 ID・入力・手順・結果を書かせる。
 
 決定事項の変更は成果物を失効させず、記録後に `mr prompts` で作るプロンプトから効く。決定事項を変えた後に、作成済みで未実行のプロンプトがあれば `mr prompts` を実行し直す。修正担当への受け渡しは「委譲の共通指示」に従う。
+
+## 引き継ぎ `mr init --carry-from`（Step 2）
+
+`mr init R ... --carry-from DIR` は、`mr archive` が作った写し DIR から前回の却下・保留と決定事項を取り込む。指定がなければ何もせず、写しを自動では探さない。相対パスは `--cwd` から解釈する。DIR はリンクでないディレクトリとし、`carry-meta.json`・`findings.json`・`decisions.json` と、あれば `carried.json` はリンクでない通常ファイルを受け付ける。`carry-meta.json` には `version`（整数の1）・`reviewId`・`cwd`・`branch`・`tree` が必要で、`tree` は木の ID または null。真偽値の `carried` は `carried.json` の有無と一致することが必要で、キーがない旧版の写しでは false として扱う。台帳と決定事項は通常の検証を通り（決定事項の採番の上限は除く）、要約・台帳・決定事項の reviewId が一致することを確かめる。`carry-meta.json` の `ledger` は、`findings.json` の状態別件数と一致する必要がある。`digests` があれば、ファイル名の集合と各ファイルの SHA-256 が写しと一致することも確かめる。`carried.json` があれば下記の形式と、ID および元の reviewId と元の ID の組に重複がないことを検証する。`cwd` は今回の対象ルートと一致し、今回の対象は git で、写しと同じブランチにあることが必要（どちらかが detached HEAD なら拒否）。却下・保留の前提はそのブランチの変更に対するものなので、同じブランチでだけ引き継ぐ。条件を満たさなければ終了1で、R には状態ファイルを残さない。R に `carried.json` やそのリンクが残っていれば、`--carry-from` の指定にかかわらず初期化済みとして拒否する。
+
+前回の台帳の `rejected`・`on_hold` の指摘を R 直下の `carried.json` に保存する（台帳には入れない）。`fixed`・`unresolved` は取り込まず、未解決は件数だけを残す。写しに `carried.json` があれば、その項目も世代を1つ進めて引き継ぎ、3世代を超えた項目は落とす。元の reviewId と元の ID の組で重複を除き、元の reviewId と元の ID の順に `P1, P2, …` を振る。今回の対象範囲にないファイルと、今は存在しないファイルの項目は取り込まない。`changed` は、写しの `tree` のそのファイルと今の作業ツリー（未コミットを含む）が違えば true、同じなら false、`tree` がない・木にファイルがない・木を読めない場合は null。
+
+```json
+{"version": 1, "from": "<写しの reviewId>", "tree": "<写しの tree または null>",
+ "findings": [{"id": "P1", "reviewId": "...", "originalId": "F1", "status": "rejected", "file": "a.py", "line": 3,
+   "problem": "...", "reason": "...", "severity": "中", "source": "codex-general", "generation": 1, "changed": false}],
+ "skipped": {"outOfScope": 0, "missing": 0, "generation": 0}, "unresolvedNotCarried": 0}
+```
+
+前回の決定事項のうち出所のない決定と、出所に `carried` を含む決定を、`findingIds` を外して `sources: ["carried"]`（出所の表示は「決定事項」を参照）で取り込む。出所が常設だけの決定は取り込まず、今回の常設の取り込みに任せる（`--no-standing-decisions` でも取り込まない）。常設と同じ内容は常設の取り込みと同じく1件にまとめる。上限を超えたら終了1とし、`--carry-from` を外せば始められると診断に示す。init の stdout には `carried`（`from`・`rejected`・`onHold`・`skipped`・`unresolvedNotCarried`・取り込んだ決定事項の件数 `decisions`）を加え、`--carry-from` がなければ出さない。`carried.json` は今のところプロンプトや統計に使わない。
 
 ## 確認レビュー（Step 7）
 
@@ -286,9 +301,9 @@ needed の理由を特定できないまま反証の手順に進めないよう�
 
 ### 写し `mr archive`（Step 8）
 
-`mr archive R --to DIR` は、R の `findings.json`・`decisions.json`（未作成なら空の決定事項）を検証してから同じ名前で DIR に写し（R の `findings.json`・`run.json`・`decisions.json` がリンクなら、R の外の内容を写さないよう拒否する）、実行の要約 `carry-meta.json` を書く。`carry-meta.json` は `version`（1）・`reviewId`・`cwd`・`branch`（archive 実行時のブランチ。完全な参照名から `refs/heads/` を外した値で、detached HEAD なら null）・`mode`・`base`・`paths`（run.json の値）・`tree`（snapshot を試みた最後の回が木の方式で、その回の修正 diff が `valid_diff` の検証を通る場合の `after.tree`。複製モード・fixdiff 前・失効・snapshot の失敗や、snapshot を試みた回がなければ null で、それより古い回の木は使わない。`snapshot.mode` を書く前に止まった回も、`snapshot.tree` などの snapshot の成果物が 1 つでもあれば試みた回とする）・`iteration`（台帳の値）・`ledger`（台帳の状態別の件数）を持ち、再実行で内容が変わらないよう日時を入れない。
+`mr archive R --to DIR` は、R の `findings.json`・`decisions.json`（未作成なら空の決定事項）と、あれば `carried.json` を検証してから同じ名前で DIR に写し、実行の要約 `carry-meta.json` を書く。R の `findings.json`・`run.json`・`decisions.json`・`carried.json` は読み込む前に通常ファイルであることを確かめ、リンクは拒否する。`carry-meta.json` は `version`（1）・`reviewId`・`cwd`・`branch`（git の対象で init 時に `run.json` に記録したブランチ。完全な参照名から `refs/heads/` を外した値で、detached HEAD なら null。キーがない旧版の実行では archive 時のブランチ）・`mode`・`base`・`paths`（run.json の値）・`tree`（snapshot を試みた最後の回が木の方式で、その回の修正 diff が `valid_diff` の検証を通る場合の `after.tree`。複製モード・fixdiff 前・失効・snapshot の失敗や、snapshot を試みた回がなければ null で、それより古い回の木は使わない。`snapshot.mode` を書く前に止まった回も、`snapshot.tree` などの snapshot の成果物が 1 つでもあれば試みた回とする）・`iteration`（台帳の値）・`ledger`（台帳の状態別の件数）・`carried`（写しに `carried.json` を含むかを表す真偽値）を持ち、再実行で内容が変わらないよう日時を入れない。`digests` には、実際に写す各ファイルの SHA-256 をファイル名ごとに64桁の16進文字列で記録する。
 
-git の対象だけを受け付け、非 git は拒否する（写しを次のレビューの範囲やコミットから外す手段が git の無視設定しかないため）。DIR は対象ルートの `.multi-review/` 直下のディレクトリに限り、なければ作る。常設の決定事項と同じ名前（`decisions.json`）は保存先にしない。DIR と `.multi-review/` は通常のディレクトリ、写す3ファイルは既存なら通常のファイルであることを確かめ、リンクは拒否する。写す3ファイルが `git check-ignore` で無視対象と確かめられなければ書かない。DIR に写すファイルが既にあれば、`carry-meta.json` で同じ reviewId と確かめられた場合だけ上書きし、別の reviewId の場合や、`carry-meta.json` がない・読めない場合は拒否する。`carry-meta.json` は毎回まず既にあると失敗する形で作ることを試し、既にあれば（確認の後に別のレビューが書いた場合を含む）その時点の内容で同じ確認をし直してから上書きする。拒否はほかのファイルを置き換える前に起きる。全てを検証してから `carry-meta.json`・`findings.json`・`decisions.json` の順に書く（途中で止まっても同じ reviewId と確かめて再実行で上書きできるよう、要約を先に書く）。書き込みに失敗したら置き換えたファイルだけを元に戻し、作った空のディレクトリを消す。1つの復元や削除に失敗しても残りを続け、元のエラーに追記する。DIR の report.md などほかのファイルと、R の台帳・決定事項・run.json は変えない。R のロックに従う。stdout は写したファイルの絶対パスの一覧 `files` と `carryMeta`。
+git の対象だけを受け付け、非 git は拒否する（写しを次のレビューの範囲やコミットから外す手段が git の無視設定しかないため）。`run.json` に `branch` があれば現在のブランチとの一致を確かめ、片方だけが detached HEAD の場合も拒否する。DIR は対象ルートの `.multi-review/` 直下のディレクトリに限り、なければ作る。常設の決定事項と同じ名前（`decisions.json`）は保存先にしない。DIR と `.multi-review/` は通常のディレクトリ、写すファイルは既存なら通常のファイルであることを確かめ、リンクは拒否する。写すファイルが `git check-ignore` で無視対象と確かめられなければ書かない。DIR に写しのファイルが既にあれば、`carry-meta.json` で同じ reviewId と確かめられた場合だけ上書きし、別の reviewId の場合や、`carry-meta.json` がない・読めない場合は拒否する。`carry-meta.json` は毎回まず既にあると失敗する形で作ることを試し、既にあれば（確認の後に別のレビューが書いた場合を含む）その時点の内容で同じ確認をし直してから上書きする。拒否はほかのファイルを置き換える前に起きる。全てを検証してから `carry-meta.json`・`findings.json`・`decisions.json` の順に書き、`carried.json` があれば最後に書く（途中で止まっても同じ reviewId と確かめて再実行で上書きできるよう、要約を先に書く）。R に `carried.json` がなければ、同じレビューの写しに残る `carried.json` を削除する。削除する `carried.json` も更新前に `git check-ignore` で確認し、無視対象でなければ写しの更新を拒否する。書き込みや削除に失敗したら置き換えたファイルや削除したファイルを元に戻し、作った空のディレクトリを消す。1つの復元や削除に失敗しても残りを続け、元のエラーに追記する。DIR の report.md などほかのファイルと、R の台帳・決定事項・run.json は変えない。R のロックに従う。stdout は写したファイルの絶対パスの一覧 `files` と `carryMeta`。
 
 ### exclude への追記（Step 8）
 

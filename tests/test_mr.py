@@ -1,3 +1,4 @@
+import hashlib
 import json
 import importlib.util
 import io
@@ -3863,7 +3864,12 @@ Path('leaked').touch()
             stream.write('.multi-review/\n')
 
     def test_archive_copies_validated_state_and_carry_meta(self):
-        self.changed_repository()
+        self.repository()
+        # 同名のタグがあっても、ブランチは完全な参照名から取る。
+        self.git('tag', 'main')
+        (self.repo / 'a.txt').write_text('change\n')
+        self.initialize()
+        self.assertEqual(self.read_json(self.run / 'run.json')['branch'], 'main')
         self.exclude_multi_review()
         for problem in ('却下する', '保留する', '直す'):
             self.add(problem=problem)
@@ -3881,8 +3887,9 @@ Path('leaked').touch()
         result = self.call('archive', self.run, '--to', target)
         meta = {'version': 1, 'reviewId': self.run.name, 'cwd': self.read_json(self.run / 'run.json')['cwd'],
                 'branch': 'main', 'mode': 'uncommitted', 'base': None, 'paths': [],
-                'tree': (self.iter / 'after.tree').read_text().strip(), 'iteration': 1,
-                'ledger': {'unresolved': 0, 'fixed': 1, 'on_hold': 1, 'rejected': 1}}
+                'tree': (self.iter / 'after.tree').read_text().strip(), 'iteration': 1, 'carried': False,
+                'ledger': {'unresolved': 0, 'fixed': 1, 'on_hold': 1, 'rejected': 1},
+                'digests': {name: hashlib.sha256(state[name]).hexdigest() for name in ('findings.json', 'decisions.json')}}
         self.assertEqual(result, {'files': [str(target / name) for name in
                                             ('carry-meta.json', 'findings.json', 'decisions.json')],
                                   'carryMeta': meta})
@@ -3900,13 +3907,6 @@ Path('leaked').touch()
         self.assertEqual(self.call('archive', self.run, '--to', target)['carryMeta']['ledger']['unresolved'], 1)
         self.assertEqual((target / 'findings.json').read_bytes(), (self.run / 'findings.json').read_bytes())
         self.assertEqual(self.read_json(target / 'carry-meta.json')['ledger']['unresolved'], 1)
-        # 同名のタグがあっても、ブランチは完全な参照名から取る。
-        self.git('tag', 'main')
-        self.assertEqual(self.call('archive', self.run, '--to', target)['carryMeta']['branch'], 'main')
-        self.git('checkout', '-q', '-b', 'feat/x')
-        self.assertEqual(self.call('archive', self.run, '--to', target)['carryMeta']['branch'], 'feat/x')
-        self.git('checkout', '-q', '--detach')
-        self.assertIsNone(self.call('archive', self.run, '--to', target)['carryMeta']['branch'])
         # 対象ルートへのリンクを含む論理パスでも、実体の .multi-review/ に書く。
         link = self.root / 'repo-link'
         link.symlink_to(self.repo, target_is_directory=True)
@@ -3919,21 +3919,76 @@ Path('leaked').touch()
         self.write_json(self.run / 'run.json', run)
         self.assertIsNone(self.call('archive', self.run, '--to', target)['carryMeta']['base'])
 
+    def test_archive_requires_reviewed_branch(self):
+        self.changed_repository()
+        self.exclude_multi_review()
+        target = self.archive_dir()
+
+        def rejected(run, reviewed, current):
+            self.call('archive', run, '--to', target, code=1)
+            self.assertIn('archive must run on the reviewed branch', self.last_stderr)
+            self.assertIn(f'reviewed: {reviewed}', self.last_stderr)
+            self.assertIn(f'current: {current}', self.last_stderr)
+            self.assertFalse(target.parent.exists())
+
+        self.git('checkout', '-q', '-b', 'feat/x')
+        rejected(self.run, 'main', 'feat/x')
+        self.git('checkout', '-q', '--detach')
+        rejected(self.run, 'main', 'detached HEAD')
+        detached = self.root / 'detached-run'
+        self.call('init', detached, '--cwd', self.repo, '--path', 'a.txt')
+        self.assertIsNone(self.read_json(detached / 'run.json')['branch'])
+        self.git('checkout', '-q', 'feat/x')
+        rejected(detached, 'detached HEAD', 'feat/x')
+        self.git('checkout', '-q', 'main')
+        self.assertEqual(self.call('archive', self.run, '--to', target)['carryMeta']['branch'], 'main')
+        run = self.read_json(self.run / 'run.json')
+        self.assertEqual(run.pop('branch'), 'main')
+        self.write_json(self.run / 'run.json', run)
+        self.git('checkout', '-q', '-b', 'feat/legacy')
+        self.assertEqual(self.call('archive', self.run, '--to', target)['carryMeta']['branch'], 'feat/legacy')
+        self.git('checkout', '-q', '--detach')
+        self.assertIsNone(self.call('archive', self.run, '--to', target)['carryMeta']['branch'])
+        self.assertIsNone(self.call('archive', detached, '--to', self.archive_dir('detached'))['carryMeta']['branch'])
+
     def test_archive_rejects_non_git_target(self):
         target = self.archive_dir()
         self.call('archive', self.run, '--to', target, code=1)
         self.assertIn('archive requires a git target', self.last_stderr)
         self.assertFalse(target.parent.exists())
 
+    def write_empty_carried(self):
+        path = self.run / 'carried.json'
+        self.write_json(path, {'version': 1, 'from': 'previous-review', 'tree': None, 'findings': [],
+                               'skipped': {'outOfScope': 0, 'missing': 0, 'generation': 0}, 'unresolvedNotCarried': 0})
+        return path
+
+    def test_archive_refuses_invalid_run_branch(self):
+        self.changed_repository()
+        self.exclude_multi_review()
+        target = self.archive_dir()
+        path = self.run / 'run.json'
+        run = self.read_json(path)
+        for branch in (1, True, {}, [], '', ' '):
+            with self.subTest(branch=branch):
+                self.write_json(path, dict(run, branch=branch))
+                for command in (('archive', self.run, '--to', target), ('decisions', self.run, 'render')):
+                    self.call(*command, code=1)
+                    self.assertEqual(self.last_stderr.strip(), 'invalid run state')
+                self.assertFalse(target.parent.exists())
+
     def test_archive_refuses_review_state_links(self):
         self.changed_repository()
         self.exclude_multi_review()
         self.add()
+        self.add_decisions(self.decision())
         target = self.archive_dir()
         # R の外の有効な状態へのリンクをたどると、R の外の内容を写しとして公開してしまう。
-        # 壊れた run.json は全コマンド共通の読み込みで拒否されるため、切れたリンクは台帳だけで確かめる。
+        carried = self.write_empty_carried()
         for name, message, cases in (('findings.json', 'ledger file must not be a link', (False, True)),
-                                     ('run.json', 'run file must not be a link', (False,))):
+                                     ('run.json', 'run file must not be a link', (False, True)),
+                                     ('decisions.json', 'decisions file must not be a link', (False, True)),
+                                     ('carried.json', 'carried file must not be a link', (False, True))):
             for dangling in cases:
                 with self.subTest(name=name, dangling=dangling):
                     path = self.run / name
@@ -3952,9 +4007,31 @@ Path('leaked').touch()
                     self.assertEqual(outside.read_bytes(), original)
                     path.unlink()
                     outside.rename(path)
+            for kind in ('directory', 'fifo'):
+                with self.subTest(name=name, kind=kind):
+                    path = self.run / name
+                    original = path.read_bytes()
+                    path.unlink()
+                    if kind == 'directory':
+                        path.mkdir()
+                    else:
+                        os.mkfifo(path)
+                    self.call('archive', self.run, '--to', target, code=1, timeout=5)
+                    self.assertIn(f'{path}: ', self.last_stderr)
+                    self.assertIn('file must be a regular file', self.last_stderr)
+                    self.assertFalse(target.parent.exists())
+                    if kind == 'directory':
+                        path.rmdir()
+                    else:
+                        path.unlink()
+                    path.write_bytes(original)
         # リンクでなければ同じ状態をそのまま写す。
-        self.call('archive', self.run, '--to', target)
+        result = self.call('archive', self.run, '--to', target)
+        self.assertEqual(result['files'], [str(target / name) for name in
+                                           ('carry-meta.json', 'findings.json', 'decisions.json', 'carried.json')])
+        self.assertIs(self.read_json(target / 'carry-meta.json')['carried'], True)
         self.assertEqual((target / 'findings.json').read_bytes(), (self.run / 'findings.json').read_bytes())
+        self.assertEqual((target / 'carried.json').read_bytes(), carried.read_bytes())
 
     def test_archive_tree_is_from_last_attempted_snapshot(self):
         self.changed_repository()
@@ -4062,7 +4139,8 @@ Path('leaked').touch()
         target.mkdir(parents=True)
         outside = self.root / 'outside.json'
         outside.write_text('外')
-        for name in ('findings.json', 'decisions.json', 'carry-meta.json'):
+        self.write_empty_carried()
+        for name in ('findings.json', 'decisions.json', 'carry-meta.json', 'carried.json'):
             with self.subTest(name=name):
                 (target / name).symlink_to(outside)
                 rejected(target, 'archive file must be a regular file')
@@ -4071,6 +4149,11 @@ Path('leaked').touch()
                 (target / name).mkdir()
                 rejected(target, 'archive file must be a regular file')
                 (target / name).rmdir()
+        (self.repo / '.git/info/exclude').write_text(
+            '.multi-review/*/carry-meta.json\n.multi-review/*/findings.json\n.multi-review/*/decisions.json\n')
+        rejected(target, 'archive file is not ignored by git: ' + str(target / 'carried.json'))
+        self.assertEqual(list(target.iterdir()), [])
+        self.exclude_multi_review()
         # 所有元を確かめられない写しは上書きしない。
         for name, text, message in (
                 ('carry-meta.json', json.dumps({'version': 1, 'reviewId': 'other-review'}),
@@ -4091,7 +4174,9 @@ Path('leaked').touch()
         unknown['decisions'][0]['findingIds'] = ['F99']
         for name, text, message in (('findings.json', '{', 'Expecting property name'),
                                     ('decisions.json', '{', 'decisions.json: Expecting property name'),
-                                    ('decisions.json', json.dumps(unknown), 'decisions.json: invalid decision findingIds')):
+                                    ('decisions.json', json.dumps(unknown), 'decisions.json: invalid decision findingIds'),
+                                    ('carried.json', '', 'carried.json: Expecting value'),
+                                    ('carried.json', '{}', 'carried.json: invalid carried findings')):
             with self.subTest(name=name, text=text):
                 path = self.run / name
                 original = path.read_bytes()
@@ -4108,7 +4193,7 @@ Path('leaked').touch()
     def test_archive_write_failure_restores_previous_copy(self):
         self.changed_repository()
         self.exclude_multi_review()
-        self.add()
+        self.add(file='a.txt', line=1)
         target = self.archive_dir()
         # 初回の書き込み失敗では、作った DIR も .multi-review/ も残さない。
         self.fail_replacement(target / 'carry-meta.json', 'archive', self.run, '--to', target)
@@ -4161,14 +4246,17 @@ sys.exit(mr.main())
         stop = """import os, sys
 sys.path.insert(0, sys.argv.pop(1))
 import mr
+stop_after = sys.argv.pop(1)
 original = mr.write_atomic
-def write_atomic(*args, **kwargs):
-    original(*args, **kwargs)
-    os._exit(9)
+def write_atomic(path, *args, **kwargs):
+    original(path, *args, **kwargs)
+    if path.name == stop_after:
+        os._exit(9)
 mr.write_atomic = write_atomic
 sys.exit(mr.main())
 """
-        result = subprocess.run([sys.executable, '-c', stop, str(CLI.parent), 'archive', str(self.run), '--to', str(resumed)],
+        result = subprocess.run([sys.executable, '-c', stop, str(CLI.parent), 'carry-meta.json',
+                                 'archive', str(self.run), '--to', str(resumed)],
                                 env=self.env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 9, result.stdout + result.stderr)
         self.assertEqual(sorted(p.name for p in resumed.iterdir()), ['carry-meta.json'])
@@ -4176,6 +4264,47 @@ sys.exit(mr.main())
         self.assertEqual((resumed / 'findings.json').read_bytes(), (self.run / 'findings.json').read_bytes())
         self.assertEqual(self.read_json(resumed / 'decisions.json'), {'reviewId': self.run.name, 'decisions': []})
         self.assertEqual(self.read_json(resumed / 'carry-meta.json')['ledger']['unresolved'], 2)
+        self.call('ledger', self.run, 'reject', 'F1', '--reason', '誤検知')
+        result = subprocess.run([sys.executable, '-c', stop, str(CLI.parent), 'carry-meta.json',
+                                 'archive', str(self.run), '--to', str(resumed)],
+                                env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 9, result.stdout + result.stderr)
+        self.assertEqual(self.read_json(resumed / 'carry-meta.json')['ledger']['rejected'], 1)
+        self.assertEqual(self.read_json(resumed / 'findings.json')['findings'][0]['status'], 'unresolved')
+        directory, _ = self.carry(resumed, code=1, name='partial-update-run')
+        self.assertIn(f'{resumed / "carry-meta.json"}: invalid carry source', self.last_stderr)
+        self.assertEqual([p.name for p in directory.iterdir()], ['.mr.lock'])
+        self.call('archive', self.run, '--to', resumed)
+        _, result = self.carry(resumed, name='resumed-run')
+        self.assertEqual(result['carried']['rejected'], 1)
+        before = self.read_json(resumed / 'carry-meta.json')
+        self.call('ledger', self.run, 'reject', 'F1', '--reason', '更新した理由')
+        result = subprocess.run([sys.executable, '-c', stop, str(CLI.parent), 'carry-meta.json',
+                                 'archive', str(self.run), '--to', str(resumed)],
+                                env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 9, result.stdout + result.stderr)
+        self.assertEqual(self.read_json(resumed / 'carry-meta.json')['ledger'], before['ledger'])
+        self.assertEqual(self.read_json(resumed / 'findings.json')['findings'][0]['reason'], '誤検知')
+        directory, _ = self.carry(resumed, code=1, name='partial-reason-update-run')
+        self.assertIn(f'{resumed / "carry-meta.json"}: invalid carry source', self.last_stderr)
+        self.assertEqual([p.name for p in directory.iterdir()], ['.mr.lock'])
+        self.call('archive', self.run, '--to', resumed)
+        directory, _ = self.carry(resumed, name='resumed-reason-run')
+        self.assertEqual(self.read_json(directory / 'carried.json')['findings'][0]['reason'], '更新した理由')
+        # 決定事項を書いた後でも、carried.json が残る書き込み途中の写しは取り込めない。
+        carried = self.write_empty_carried()
+        interrupted = self.archive_dir('interrupted')
+        result = subprocess.run([sys.executable, '-c', stop, str(CLI.parent), 'decisions.json',
+                                 'archive', str(self.run), '--to', str(interrupted)],
+                                env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 9, result.stdout + result.stderr)
+        self.assertEqual(sorted(p.name for p in interrupted.iterdir()), ['carry-meta.json', 'decisions.json', 'findings.json'])
+        directory, _ = self.carry(interrupted, code=1)
+        self.assertIn(f'{interrupted / "carry-meta.json"}: invalid carry source', self.last_stderr)
+        self.assertEqual([p.name for p in directory.iterdir()], ['.mr.lock'])
+        self.call('archive', self.run, '--to', interrupted)
+        self.carry(interrupted)
+        carried.unlink()
         # 作ったディレクトリの削除に失敗しても、元の書き込みエラーを残して後始末を続ける。
         fresh = self.archive_dir('20260102-000000')
         launcher = """import sys
@@ -4203,6 +4332,16 @@ with patch.object(mr.os, 'replace', failing(mr.os.replace)), patch.object(mr.os,
         self.assertIn('injected replacement failure', result.stderr)
         self.assertIn('injected rmdir failure', result.stderr)
         self.assertEqual(list(fresh.iterdir()), [])
+
+        # 引き継ぎの書き込みが失敗したら、そこまでに更新した写しを元に戻す。
+        carried = self.write_empty_carried()
+        self.call('archive', self.run, '--to', target)
+        before = {path: path.read_bytes() for path in target.iterdir()}
+        self.add(problem='引き継いだ回での追加')
+        self.add_decisions(self.decision(body='引き継いだ回の方針'))
+        carried.write_bytes(carried.read_bytes() + b' ')
+        self.fail_replacement(target / 'carried.json', 'archive', self.run, '--to', target)
+        self.assertEqual({path: path.read_bytes() for path in target.iterdir()}, before)
 
     def test_archive_refuses_summary_created_after_ownership_check(self):
         self.changed_repository()
@@ -4265,11 +4404,62 @@ mr.os.replace = failing""")
         self.assertEqual(sorted(p.name for p in target.iterdir()), ['carry-meta.json'])
         self.assertEqual((target / 'carry-meta.json').read_text(), placed)
 
+    def test_archive_removes_stale_carried_only_for_same_review(self):
+        self.changed_repository()
+        self.exclude_multi_review()
+        target = self.archive_dir()
+        target.mkdir(parents=True)
+        stale = target / 'carried.json'
+        stale.write_bytes(self.write_empty_carried().read_bytes())
+        (self.run / 'carried.json').unlink()
+        self.call('archive', self.run, '--to', target, code=1)
+        self.assertIn('archive directory holds another review', self.last_stderr)
+        self.assertEqual(list(target.iterdir()), [stale])
+        meta = target / 'carry-meta.json'
+        self.write_json(meta, {'version': 1, 'reviewId': 'another-review'})
+        before = {path: path.read_bytes() for path in target.iterdir()}
+        self.call('archive', self.run, '--to', target, code=1)
+        self.assertIn('archive directory holds another review', self.last_stderr)
+        self.assertEqual({path: path.read_bytes() for path in target.iterdir()}, before)
+        self.write_json(meta, {'version': 1, 'reviewId': self.run.name})
+        before = {path: path.read_bytes() for path in target.iterdir()}
+        self.git('add', '-f', '--', str(stale))
+        self.call('archive', self.run, '--to', target, code=1)
+        self.assertIn('archive file is not ignored by git: ' + str(stale), self.last_stderr)
+        self.assertEqual({path: path.read_bytes() for path in target.iterdir()}, before)
+        self.assertEqual(self.git('diff', '--', str(stale)), b'')
+        self.git('rm', '--cached', '--', str(stale))
+        self.fail_replacement(target / 'decisions.json', 'archive', self.run, '--to', target)
+        self.assertEqual({path: path.read_bytes() for path in target.iterdir()}, before)
+        launcher = """import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv.pop(1))
+import mr
+stale = Path(sys.argv.pop(1))
+unlink = Path.unlink
+def failing(path, *args, **kwargs):
+    if path == stale:
+        raise OSError('injected unlink failure')
+    return unlink(path, *args, **kwargs)
+Path.unlink = failing
+sys.exit(mr.main())
+"""
+        result = subprocess.run([sys.executable, '-c', launcher, str(CLI.parent), str(stale),
+                                 'archive', str(self.run), '--to', str(target)],
+                                env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('injected unlink failure', result.stderr)
+        self.assertEqual({path: path.read_bytes() for path in target.iterdir()}, before)
+        result = self.call('archive', self.run, '--to', target)
+        self.assertFalse(stale.exists())
+        self.assertNotIn(str(stale), result['files'])
+
     def test_archive_refuses_copy_written_before_originals_are_saved(self):
         self.changed_repository()
         self.exclude_multi_review()
         self.add()
-        # 空の保存先で所有の確認を通った後、元の内容を控える前に、別のレビューが 3 ファイルを書いた状況を作る。
+        carried = self.write_empty_carried()
+        # 空の保存先で所有の確認を通った後、元の内容を控える前に、別のレビューが写しを書いた状況を作る。
         # 要約を組み立てる current_branch の呼び出しが、確認と控えの間にあることを使う。
         launcher = """import json, sys
 from pathlib import Path
@@ -4283,6 +4473,7 @@ def current_branch(cwd):
     (target / 'carry-meta.json').write_text(json.dumps({'version': 1, 'reviewId': review}))
     (target / 'findings.json').write_text('他のレビューの台帳')
     (target / 'decisions.json').write_text('他のレビューの決定事項')
+    (target / 'carried.json').write_text('他のレビューの引き継ぎ')
     return original(cwd)
 mr.current_branch = current_branch
 sys.exit(mr.main())
@@ -4298,18 +4489,423 @@ sys.exit(mr.main())
         target = self.archive_dir('other')
         result = archive(target, 'other-review', 1)
         self.assertIn('archive directory holds another review', result.stderr)
-        # 別のレビューの写しは 3 ファイルとも変えず、要約より先にほかのファイルも置き換えない。
+        # 別のレビューの写しは要約もほかのファイルも変えない。
         self.assertEqual(self.read_json(target / 'carry-meta.json'), {'version': 1, 'reviewId': 'other-review'})
         self.assertEqual((target / 'findings.json').read_text(), '他のレビューの台帳')
         self.assertEqual((target / 'decisions.json').read_text(), '他のレビューの決定事項')
+        self.assertEqual((target / 'carried.json').read_text(), '他のレビューの引き継ぎ')
         self.assertEqual(sorted(p.name for p in target.iterdir()),
-                         ['carry-meta.json', 'decisions.json', 'findings.json'])
+                         ['carried.json', 'carry-meta.json', 'decisions.json', 'findings.json'])
         # 同じレビューが先に書いていたなら、上書きして写しを作る。
         target = self.archive_dir('same')
         archive(target, self.run.name, 0)
         self.assertEqual((target / 'findings.json').read_bytes(), (self.run / 'findings.json').read_bytes())
+        self.assertEqual((target / 'carried.json').read_bytes(), carried.read_bytes())
         self.assertEqual(self.read_json(target / 'carry-meta.json')['reviewId'], self.run.name)
         self.assertEqual(self.read_json(target / 'carry-meta.json')['ledger']['unresolved'], 1)
+
+    def test_archive_refuses_carried_changed_during_validation(self):
+        self.changed_repository()
+        self.exclude_multi_review()
+        carried = self.write_empty_carried()
+        target = self.archive_dir()
+        launcher = """import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv.pop(1))
+import mr
+carried = Path(sys.argv.pop(1))
+original = mr.validate_carried
+def validate(value):
+    result = original(value)
+    carried.write_bytes(carried.read_bytes() + b' ')
+    return result
+mr.validate_carried = validate
+sys.exit(mr.main())
+"""
+        result = subprocess.run([sys.executable, '-c', launcher, str(CLI.parent), str(carried),
+                                 'archive', str(self.run), '--to', str(target)],
+                                env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('review state changed during archive', result.stderr)
+        self.assertFalse(target.parent.exists())
+
+    def carry_source(self, name='20260101-000000'):
+        # 前回の実行: 却下2・保留1・修正済み2・未解決1、出所なしの policy・triage と常設由来の決定を写す。
+        self.repository()
+        (self.repo / 'a.txt').write_text('change\n')
+        standing = Path(self.env['XDG_CONFIG_HOME']) / 'multi-review/decisions.json'
+        standing.parent.mkdir(parents=True, exist_ok=True)
+        self.write_json(standing, self.decision(body='常設の方針'))
+        self.assertNotIn('carried', self.initialize())
+        self.exclude_multi_review()
+        for file in ('b.txt', 'c.txt'):
+            (self.repo / file).write_text(file + '\n')
+        for number, file in enumerate(('a.txt', 'b.txt', 'c.txt', 'a.txt', 'b.txt', 'a.txt'), 1):
+            self.add(file=file, line=1, problem=f'不備{number}')
+        self.call('ledger', self.run, 'reject', 'F1', 'F2', '--reason', '誤検知')
+        self.call('ledger', self.run, 'hold', 'F3', '--reason', '別の変更で扱う')
+        self.call('snapshot', self.iter)
+        (self.repo / 'a.txt').write_text('fixed\n')
+        self.call('fixdiff', self.iter)
+        self.call('ledger', self.run, 'fix', 'F4', 'F5', '--iteration', 1, '--summary', '直した')
+        self.add_decisions([dict(self.decision(), findingIds=['F1']),
+                            self.decision(type='triage', body='別の変更で扱う指摘は保留する')])
+        standing.unlink()
+        target = self.archive_dir(name)
+        self.call('archive', self.run, '--to', target)
+        return target
+
+    def carry(self, source, *options, code=0, name='next-run'):
+        directory = self.root / name
+        result = self.call('init', directory, '--cwd', self.repo, '--carry-from', source, *options, code=code)
+        return directory, result
+
+    def test_carry_from_imports_rejected_held_and_decisions(self):
+        source = self.carry_source()
+        self.assertFalse((self.run / 'carried.json').exists())
+        (self.repo / 'a.txt').write_text('changed after archive\n')
+        requested = self.repo / 'subdir'
+        requested.mkdir()
+        directory = self.root / 'next-run'
+        result = self.call('init', directory, '--cwd', requested,
+                           '--carry-from', Path('..') / source.relative_to(self.repo))
+        self.assertNotIn('carried', self.read_json(directory / 'run.json'))
+        self.assertEqual(result['carried'], {
+            'from': self.run.name, 'rejected': 2, 'onHold': 1, 'unresolvedNotCarried': 1, 'decisions': 2,
+            'skipped': {'outOfScope': 0, 'missing': 0, 'generation': 0}})
+        carried = self.read_json(directory / 'carried.json')
+        self.assertEqual((carried['version'], carried['from'], carried['tree'], carried['unresolvedNotCarried']),
+                         (1, self.run.name, self.read_json(source / 'carry-meta.json')['tree'], 1))
+        self.assertEqual([(i['id'], i['originalId'], i['status'], i['file'], i['generation'], i['changed'])
+                          for i in carried['findings']],
+                         [('P1', 'F1', 'rejected', 'a.txt', 1, True), ('P2', 'F2', 'rejected', 'b.txt', 1, False),
+                          ('P3', 'F3', 'on_hold', 'c.txt', 1, False)])
+        self.assertEqual(carried['findings'][0]['reason'], '誤検知')
+        decisions = self.read_json(directory / 'decisions.json')['decisions']
+        self.assertEqual([(d['type'], d['body'], d['sources']) for d in decisions],
+                         [('policy', '表示文言は各解析器が出す', ['carried']),
+                          ('triage', '別の変更で扱う指摘は保留する', ['carried'])])
+        self.assertFalse(any('findingIds' in d and d['findingIds'] for d in decisions))
+        # 台帳は空のまま、決定事項の節は既存の規則で載り、carried.json はプロンプトを変えない。
+        self.assertEqual(self.read_json(directory / 'findings.json')['findings'], [])
+        self.call('prompts', directory / 'iter-1')
+        prompt = (directory / 'iter-1/claude.prompt.md').read_bytes()
+        self.assertIn('出所: 前回の実行', prompt.decode())
+        self.assertNotIn('再報告しない基準', prompt.decode())
+        (directory / 'carried.json').unlink()
+        self.call('prompts', directory / 'iter-1')
+        self.assertEqual((directory / 'iter-1/claude.prompt.md').read_bytes(), prompt)
+        # 写しの tree がなければ判定しない。
+        meta = self.read_json(source / 'carry-meta.json')
+        self.write_json(source / 'carry-meta.json', dict(meta, tree=None))
+        directory, _ = self.carry(source, name='no-tree')
+        self.assertEqual({i['changed'] for i in self.read_json(directory / 'carried.json')['findings']}, {None})
+        self.write_json(source / 'carry-meta.json', dict(meta, tree='0' * 40))
+        directory, _ = self.carry(source, name='unknown-tree')
+        self.assertEqual({i['changed'] for i in self.read_json(directory / 'carried.json')['findings']}, {None})
+        self.write_json(source / 'carry-meta.json', meta)
+        # 常設と同じ内容は 1 件にまとめ、--no-standing-decisions でも出所なしの決定は取り込む。
+        standing = Path(self.env['XDG_CONFIG_HOME']) / 'multi-review/decisions.json'
+        self.write_json(standing, self.decision())
+        self.addCleanup(standing.unlink, missing_ok=True)
+        directory, _ = self.carry(source, name='merged')
+        self.assertEqual([d['sources'] for d in self.read_json(directory / 'decisions.json')['decisions']],
+                         [['user', 'carried'], ['carried']])
+        directory, _ = self.carry(source, '--no-standing-decisions', name='no-standing')
+        self.assertEqual([d['sources'] for d in self.read_json(directory / 'decisions.json')['decisions']],
+                         [['carried'], ['carried']])
+        # 範囲外・存在しないファイルの項目は取り込まない。
+        directory, result = self.carry(source, '--path', 'a.txt', name='path-run')
+        self.assertEqual(result['carried']['skipped']['outOfScope'], 2)
+        self.assertEqual([i['file'] for i in self.read_json(directory / 'carried.json')['findings']], ['a.txt'])
+        (self.repo / 'a.txt').unlink()
+        _, result = self.carry(source, name='missing-run')
+        self.assertEqual(result['carried']['skipped']['missing'], 1)
+        (self.repo / 'a.txt').symlink_to('absent')
+        _, result = self.carry(source, name='broken-link-run')
+        self.assertEqual(result['carried']['skipped']['missing'], 0)
+        self.assertEqual(result['carried']['rejected'], 2)
+
+    def test_carry_from_rejects_other_sources_without_leaving_state(self):
+        source = self.carry_source()
+        meta = self.read_json(source / 'carry-meta.json')
+
+        def rejected(message, path=source):
+            directory = self.root / 'next-run'
+            try:
+                self.call('init', directory, '--cwd', self.repo, '--carry-from', path, code=1, timeout=5)
+                self.assertIn(message, self.last_stderr)
+                self.assertEqual(sorted(p.name for p in directory.iterdir()), ['.mr.lock'])
+            finally:
+                if directory.exists():
+                    shutil.rmtree(directory)
+        meta_error = f'{source / "carry-meta.json"}: invalid carry source'
+        for changes, message in (({'cwd': '/elsewhere'}, f'{source}: carry source is for another repository'),
+                                 ({'branch': 'other'}, f'{source}: carry source is for another branch'),
+                                 ({'branch': None}, f'{source}: carry requires a branch'),
+                                 ({'version': 2}, meta_error), ({'version': True}, meta_error),
+                                 ({'reviewId': 'other-review'}, meta_error), ({'reviewId': 1}, meta_error),
+                                 ({'cwd': None}, meta_error), ({'branch': 1}, meta_error),
+                                 ({'tree': []}, meta_error), ({'tree': 'abc'}, meta_error),
+                                 ({'carried': 0}, meta_error), ({'carried': None}, meta_error),
+                                 ({'carried': True}, meta_error), ({'ledger': {}}, meta_error),
+                                 ({'ledger': dict(meta['ledger'], rejected=1)}, meta_error),
+                                 ({'ledger': dict(meta['ledger'], on_hold=True)}, meta_error)):
+            with self.subTest(changes=changes):
+                self.write_json(source / 'carry-meta.json', dict(meta, **changes))
+                rejected(message)
+        for key in ('version', 'reviewId', 'cwd', 'branch', 'tree', 'ledger'):
+            with self.subTest(missing_key=key):
+                self.write_json(source / 'carry-meta.json', {k: v for k, v in meta.items() if k != key})
+                rejected(meta_error)
+        legacy = {key: val for key, val in meta.items() if key not in ('carried', 'digests')}
+        self.write_json(source / 'carry-meta.json', legacy)
+        _, result = self.carry(source, name='legacy-run')
+        self.assertEqual(result['carried']['rejected'], 2)
+        carried = self.write_empty_carried()
+        shutil.copyfile(carried, source / 'carried.json')
+        carried.unlink()
+        rejected(meta_error)
+        self.write_json(source / 'carry-meta.json', dict(meta, carried=False))
+        rejected(meta_error)
+        (source / 'carried.json').unlink()
+        self.write_json(source / 'carry-meta.json', meta)
+        self.git('checkout', '-q', '--detach')
+        rejected('carry requires a branch')
+        self.git('checkout', '-q', 'main')
+        for name, contents in (('findings.json', '{'), ('decisions.json', '{'), ('carried.json', '{}')):
+            with self.subTest(invalid_file=name):
+                path = source / name
+                original = path.read_bytes() if path.exists() else None
+                if name == 'carried.json':
+                    self.write_json(source / 'carry-meta.json', dict(meta, carried=True))
+                path.write_text(contents)
+                rejected(f'{path}: ')
+                self.write_json(source / 'carry-meta.json', meta)
+                if original is None:
+                    path.unlink()
+                else:
+                    path.write_bytes(original)
+        (source / 'carry-meta.json').unlink()
+        rejected('carry-meta.json: ')
+        self.write_json(source / 'carry-meta.json', meta)
+        for name in ('carry-meta.json', 'findings.json', 'decisions.json', 'carried.json'):
+            for kind in ('link', 'directory', 'fifo'):
+                with self.subTest(file=name, kind=kind):
+                    path = source / name
+                    outside = self.root / ('original-' + name)
+                    if path.exists():
+                        path.rename(outside)
+                    if kind == 'link':
+                        path.symlink_to(outside)
+                    elif kind == 'directory':
+                        path.mkdir()
+                    else:
+                        os.mkfifo(path)
+                    rejected(f'{path}: carry source file must be a regular file')
+                    if kind == 'directory':
+                        path.rmdir()
+                    else:
+                        path.unlink()
+                    if outside.exists():
+                        outside.rename(path)
+        link = source.parent / 'link'
+        link.symlink_to(source, target_is_directory=True)
+        directory, _ = self.carry(link, code=1, name='linked')
+        self.assertIn('carry source must be a directory', self.last_stderr)
+        # 取り込むと決定事項の上限を超えるなら、--carry-from を外せば始められると示す。
+        standing = Path(self.env['XDG_CONFIG_HOME']) / 'multi-review/decisions.json'
+        # 常設の決定だけで上限ちょうどにし、引き継いだ決定を足すと超えることを確かめる。
+        item = self.decision()
+        value = {'decisions': [dict(item, id='D1', iteration=1, sources=['user'])]}
+        size = len(mr.decisions_markdown(value, field='問題').encode('utf-8'))
+        self.write_json(standing, dict(item, body=item['body'] + 'x' * (mr.DECISIONS_MAX_BYTES - size)))
+        self.addCleanup(standing.unlink, missing_ok=True)
+        self.call('init', self.root / 'standing-only', '--cwd', self.repo)
+        (self.repo / 'a.txt').write_text('new before decision limit check\n')
+        before = self.git('count-objects')
+        rejected(f'{source / "decisions.json"}[1]: ', source.relative_to(self.repo))
+        self.assertIn('remove --carry-from', self.last_stderr)
+        self.assertEqual(self.git('count-objects'), before)
+        standing.unlink()
+        # 非 git の対象では受け付けない。
+        plain = self.root / 'plain'
+        plain.mkdir()
+        directory = self.root / 'plain-run'
+        self.call('init', directory, '--cwd', plain, '--path', '.', '--carry-from', source, code=1)
+        self.assertIn('carry requires a git target', self.last_stderr)
+
+    def test_carry_from_requires_matching_archive_digests(self):
+        source = self.carry_source()
+        self.write_empty_carried()
+        self.call('archive', self.run, '--to', source)
+        meta_path = source / 'carry-meta.json'
+        meta = self.read_json(meta_path)
+        digests = meta['digests']
+
+        def rejected():
+            directory, _ = self.carry(source, code=1)
+            self.assertIn(f'{meta_path}: invalid carry source', self.last_stderr)
+            self.assertEqual([p.name for p in directory.iterdir()], ['.mr.lock'])
+
+        for name in ('findings.json', 'decisions.json', 'carried.json'):
+            with self.subTest(file=name):
+                path = source / name
+                original = path.read_bytes()
+                path.write_bytes(original.replace(b' ', b'\t', 1))
+                rejected()
+                path.write_bytes(original)
+        carried = source / 'carried.json'
+        original = carried.read_bytes()
+        carried.unlink()
+        self.write_json(meta_path, dict(meta, carried=False))
+        rejected()
+        carried.write_bytes(original)
+
+        for invalid in (None, [], {}, dict(digests, **{'extra.json': '0' * 64}),
+                        {name: value for name, value in digests.items() if name != 'carried.json'},
+                        *(dict(digests, **{'findings.json': value})
+                          for value in (0, '', 'a' * 63, 'a' * 65, 'g' * 64))):
+            with self.subTest(digests=invalid):
+                self.write_json(meta_path, dict(meta, digests=invalid))
+                rejected()
+        del meta['digests']
+        self.write_json(meta_path, meta)
+        _, result = self.carry(source, name='legacy-with-carried')
+        self.assertEqual(result['carried']['rejected'], 2)
+
+    def test_carry_from_generations(self):
+        source = self.carry_source()
+        for generation in (2, 3):
+            directory, _ = self.carry(source, name=f'run-{generation}')
+            self.assertEqual([(d['body'], d['sources']) for d in self.read_json(directory / 'decisions.json')['decisions']],
+                             [('表示文言は各解析器が出す', ['carried']), ('別の変更で扱う指摘は保留する', ['carried'])])
+            self.call('snapshot', directory / 'iter-1')
+            (self.repo / 'a.txt').write_text(f'fixed in run-{generation}\n')
+            self.call('fixdiff', directory / 'iter-1')
+            target = self.archive_dir(f'2026010{generation}-000000')
+            self.call('archive', directory, '--to', target)
+            self.assertTrue((target / 'carried.json').is_file())
+            source = target
+        directory, result = self.carry(source, name='run-4')
+        carried = self.read_json(directory / 'carried.json')
+        meta = self.read_json(source / 'carry-meta.json')
+        self.assertIsNotNone(meta['tree'])
+        self.assertEqual((carried['from'], carried['tree']), (meta['reviewId'], meta['tree']))
+        # 前回の台帳は空なので、初回の実行 ID を持つ 3 世代目の項目だけが残る。
+        self.assertEqual([(i['id'], i['reviewId'], i['originalId'], i['generation']) for i in carried['findings']],
+                         [('P1', self.run.name, 'F1', 3), ('P2', self.run.name, 'F2', 3), ('P3', self.run.name, 'F3', 3)])
+        target = self.archive_dir('20260104-000000')
+        self.call('archive', directory, '--to', target)
+        directory, result = self.carry(target, name='run-5')
+        self.assertEqual(result['carried']['skipped']['generation'], 3)
+        self.assertEqual(self.read_json(directory / 'carried.json')['skipped']['generation'], 3)
+        self.assertEqual((result['carried']['rejected'], result['carried']['onHold']), (0, 0))
+
+    def test_carry_from_init_save_failures(self):
+        source = self.carry_source()
+        for name in ('decisions.json', 'carried.json'):
+            with self.subTest(name=name):
+                directory = self.root / 'failed-run'
+                self.fail_replacement(directory / name, 'init', directory, '--cwd', self.repo, '--carry-from', source)
+                self.assertEqual([path.name for path in directory.iterdir()], ['.mr.lock'])
+                shutil.rmtree(directory)
+
+    def test_init_rejects_leftover_carried_state(self):
+        source = self.carry_source()
+        directory = self.root / 'interrupted-run'
+        directory.mkdir()
+        stale = directory / 'carried.json'
+        for kind in ('file', 'dangling link'):
+            if kind == 'file':
+                stale.write_text('{}')
+            else:
+                stale.symlink_to(self.root / 'absent')
+            for options in ((), ('--carry-from', source)):
+                with self.subTest(kind=kind, options=options):
+                    self.call('init', directory, '--cwd', self.repo, *options, code=1)
+                    self.assertIn('review already initialized', self.last_stderr)
+                    self.assertEqual({p.name for p in directory.iterdir()}, {'carried.json', '.mr.lock'})
+            stale.unlink()
+        backup = directory / 'ledger.md'
+        os.mkfifo(backup)
+        (self.repo / 'a.txt').write_text('new after archive\n')
+        before = self.git('count-objects')
+        self.call('init', directory, '--cwd', self.repo, '--carry-from', source, code=1, timeout=5)
+        self.assertIn(f'{backup}: review state file must be a regular file', self.last_stderr)
+        self.assertEqual({p.name for p in directory.iterdir()}, {'ledger.md', '.mr.lock'})
+        self.assertEqual(self.git('count-objects'), before)
+
+    def test_carry_from_validates_items_for_init_and_archive(self):
+        source = self.carry_source()
+        directory, _ = self.carry(source)
+        carried = self.read_json(directory / 'carried.json')
+        first, second, _ = carried['findings']
+        cases = {
+            'duplicate id': [first, dict(second, id=first['id'])],
+            'duplicate origin': [first, dict(first, id=second['id'])],
+            'generation above limit': [dict(first, generation=4)],
+            'boolean generation': [dict(first, generation=True)],
+            'fixed': [dict(first, status='fixed')],
+            'changed string': [dict(first, changed='false')],
+            'changed number': [dict(first, changed=1)],
+            'missing key': [{key: val for key, val in first.items() if key != 'reason'}],
+            'extra key': [dict(first, extra=None)],
+        }
+        target = self.archive_dir('validated')
+        meta = source / 'carry-meta.json'
+        self.write_json(meta, dict(self.read_json(meta), carried=True))
+        for name, invalid in [(name, dict(carried, findings=items)) for name, items in cases.items()] + [
+                ('boolean version', dict(carried, version=True))]:
+            with self.subTest(name=name):
+                message = 'invalid carried findings' if name == 'boolean version' else 'invalid carried finding'
+                path = directory / 'carried.json'
+                self.write_json(path, invalid)
+                self.call('archive', directory, '--to', target, code=1)
+                self.assertIn(f'{path}: {message}\n', self.last_stderr)
+                self.assertFalse(target.exists())
+                path = source / 'carried.json'
+                self.write_json(path, invalid)
+                failed, _ = self.carry(source, code=1, name='failed-run')
+                self.assertIn(f'{path}: {message}\n', self.last_stderr)
+                self.assertEqual([p.name for p in failed.iterdir()], ['.mr.lock'])
+        reordered = dict(carried, findings=[dict(reversed(list(i.items()))) for i in carried['findings']])
+        self.write_json(directory / 'carried.json', reordered)
+        self.call('archive', directory, '--to', target)
+        accepted, _ = self.carry(target, name='reordered-run')
+        self.assertEqual(len(self.read_json(accepted / 'carried.json')['findings']), 3)
+
+    def test_carry_from_merges_origins_and_orders_ids(self):
+        source = self.carry_source()
+        directory, _ = self.carry(source)
+        carried = self.read_json(directory / 'carried.json')
+        first = carried['findings'][0]
+        carried['findings'] = [
+            dict(first, id='P1', reviewId='z-review', originalId='F1'),
+            dict(first, id='P2', originalId='F10'),
+            dict(first, id='P3', originalId='F2', reason='過去の理由'),
+        ]
+        self.write_json(self.run / 'carried.json', carried)
+        (self.repo / 'new.txt').write_text('new\n')
+        self.add(file='new.txt', line=1)
+        self.call('ledger', self.run, 'reject', 'F7', '--reason', '写しの木にない')
+        self.call('archive', self.run, '--to', source)
+        directory, _ = self.carry(source, name='merged-origins')
+        findings = self.read_json(directory / 'carried.json')['findings']
+        self.assertEqual([(i['id'], i['reviewId'], i['originalId']) for i in findings],
+                         [(f'P{n}', self.run.name, f'F{i}') for n, i in enumerate((1, 2, 3, 7, 10), 1)]
+                         + [('P6', 'z-review', 'F1')])
+        self.assertEqual((findings[1]['reason'], findings[1]['generation']), ('誤検知', 1))
+        self.assertIsNone(findings[3]['changed'])
+
+    def test_carry_from_without_findings_does_not_write_git_objects(self):
+        source = self.carry_source()
+        self.assertIsNotNone(self.read_json(source / 'carry-meta.json')['tree'])
+        (self.repo / 'new.txt').write_text('new content absent from the object database\n')
+        before = set(self.git('cat-file', '--batch-all-objects', '--batch-check').splitlines())
+        _, result = self.carry(source, '--path', 'new.txt')
+        self.assertEqual((result['carried']['rejected'], result['carried']['onHold']), (0, 0))
+        self.assertEqual(set(self.git('cat-file', '--batch-all-objects', '--batch-check').splitlines()), before)
 
     def test_full_lifecycle_with_fake_guard(self):
         self.repository()

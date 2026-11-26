@@ -84,9 +84,16 @@ MULTI_REVIEW_DIR = '.multi-review'
 # mr archive が MULTI_REVIEW_DIR/<タイムスタンプ>/ に書く、実行の要約。
 CARRY_META_FILE = 'carry-meta.json'
 CARRY_META_VERSION = 1
+# mr init --carry-from が写しから取り込んだ前回の却下・保留。台帳とは別に R 直下に置く。
+CARRIED_FILE = 'carried.json'
+CARRIED_VERSION = 1
+CARRIED_STATES = ('rejected', 'on_hold')
+CARRY_MAX_GENERATIONS = 3
+CARRIED_FIELDS = ('id', 'reviewId', 'originalId', 'status', 'file', 'line', 'problem', 'reason',
+                  'severity', 'source', 'generation', 'changed')
 DECISIONS_MAX_BYTES = 8192
 DECISION_TYPES = {'policy': '方針', 'triage': '再報告しない基準'}
-DECISION_SOURCES = {'user': '利用者共通', 'project': 'プロジェクト'}
+DECISION_SOURCES = {'user': '利用者共通', 'project': 'プロジェクト', 'carried': '前回の実行'}
 STATUS_AWAITING = 'awaiting_instruction'
 NO_LINE_MARK = '［行なし］'
 NO_VALUE_MARK = '［初期値なし］'
@@ -200,6 +207,8 @@ def load_run(root):
             isinstance(run.get('decisionImports', {}), dict) and
             all(nonempty(k) and isinstance(v, str) and re.fullmatch(r'D[1-9]\d*', v)
                 for k, v in run.get('decisionImports', {}).items()), 'invalid run state')
+    # 旧版が作った run.json には branch がないため、キーの有無はそのままにする。
+    require(run.get('branch') is None or nonempty(run['branch']), 'invalid run state')
     return run
 
 
@@ -605,6 +614,17 @@ def xdg_home(variable, fallback):
     return home / fallback if home.is_absolute() else None
 
 
+def import_decisions(entries, path, value, ledger, run, source):
+    ids = set()
+    for index, raw in entries:
+        try:
+            ids.add(add_decision(raw, value, ledger, run, source))
+            bounded_decisions_markdown(value)
+        except EXPECTED_ERRORS as error:
+            raise Failure(display_path(str(path)) + f'[{index}]: ' + str(error)) from error
+    return ids
+
+
 def standing_decisions(cwd, value, ledger, run, disabled):
     result = {'count': 0, 'sources': []}
     if disabled:
@@ -619,15 +639,8 @@ def standing_decisions(cwd, value, ledger, run, disabled):
             incoming = read_json(path)
         except EXPECTED_ERRORS as error:
             raise Failure(display_path(str(path)) + ': ' + str(error)) from error
-        ids = []
-        for index, raw in enumerate(incoming if isinstance(incoming, list) else [incoming]):
-            try:
-                decision_id = add_decision(raw, value, ledger, run, source)
-                bounded_decisions_markdown(value)
-            except EXPECTED_ERRORS as error:
-                raise Failure(display_path(str(path)) + f'[{index}]: ' + str(error)) from error
-            if decision_id not in ids:
-                ids.append(decision_id)
+        ids = import_decisions(enumerate(incoming if isinstance(incoming, list) else [incoming]),
+                               path, value, ledger, run, source)
         result['sources'].append({'source': source, 'path': str(path),
                                   'ids': sorted(ids, key=lambda item: int(item[1:]))})
     result['count'] = len({item for source in result['sources'] for item in source['ids']})
@@ -952,7 +965,8 @@ def target_root(args, root):
 def init(args, root, run):
     require(not (root / RUN_FILE).exists() and not (root / LEDGER_FILE).exists() and
             not (root / DECISIONS_FILE).exists() and not (root / DECISIONS_FILE).is_symlink() and
-            not (root / DECISIONS_MD_FILE).exists() and not (root / DECISIONS_MD_FILE).is_symlink(),
+            not (root / DECISIONS_MD_FILE).exists() and not (root / DECISIONS_MD_FILE).is_symlink() and
+            not (root / CARRIED_FILE).exists() and not (root / CARRIED_FILE).is_symlink(),
             'review already initialized')
     requested, cwd, is_git = args.target
     paths = []
@@ -999,6 +1013,7 @@ def init(args, root, run):
            'taskSequence': 0, 'tasks': {}, 'confirmIterations': []}
     branch = 'non-git'
     if is_git:
+        run['branch'] = current_branch(cwd)
         branch_result = run_command(['git', 'symbolic-ref', '--short', '-q', 'HEAD'], cwd, allowed=(0, 1))
         branch = os.fsdecode(branch_result.stdout).strip() or 'detached HEAD'
     scope = ', '.join(map(display_path, paths)) if paths else base_name if mode == 'base' else 'HEAD'
@@ -1009,8 +1024,16 @@ def init(args, root, run):
     value = {'reviewId': root.name, 'decisions': []}
     imported = standing_decisions(cwd, value, ledger, run, args.no_standing_decisions)
     names = [RUN_FILE, LEDGER_FILE, LEDGER_MD_FILE, 'ledger.render.md']
-    if imported['count']:
+    for name in names:
+        path = root / name
+        require(not path.is_symlink() and (path.is_file() or not path.exists()),
+                display_path(str(path)) + ': review state file must be a regular file')
+    carried = carry_from(Path(os.path.abspath(requested / args.carry_from)), run, value, ledger) if args.carry_from else None
+    decisions_saved = bool(imported['count'] or carried and carried[1]['decisions'])
+    if decisions_saved:
         names.extend((DECISIONS_FILE, DECISIONS_MD_FILE))
+    if carried:
+        names.append(CARRIED_FILE)
     originals = {root / name: (root / name).read_bytes() if (root / name).exists() else None
                  for name in names}
     directory = iteration_dir(root, 1)
@@ -1019,11 +1042,18 @@ def init(args, root, run):
         save_json(root / RUN_FILE, run)
         save_json(root / LEDGER_FILE, ledger)
         render(root, ledger)
-        if imported['count']:
+        if decisions_saved:
             validate_decisions(value, ledger, run)
             save_json(root / DECISIONS_FILE, value)
             render_decisions(root, bounded_decisions_markdown(value))
         directory.mkdir(exist_ok=True)
+        if carried:
+            data = validate_carried(carried[0])
+            findings = data['findings']
+            changes = carried_changes(cwd, data['tree'], {item['file'] for item in findings})
+            for item in findings:
+                item['changed'] = changes.get(item['file'])
+            save_json(root / CARRIED_FILE, data)
     except BaseException:
         for path, original in originals.items():
             if original is None:
@@ -1033,7 +1063,152 @@ def init(args, root, run):
         if not existed and directory.is_dir():
             directory.rmdir()
         raise
-    return dict(run, standingDecisions=imported)
+    return dict(run, standingDecisions=imported, **({'carried': carried[1]} if carried else {}))
+
+
+def validate_carried(value):
+    require(isinstance(value, dict) and set(value) == {'version', 'from', 'tree', 'findings', 'skipped',
+                                                       'unresolvedNotCarried'} and
+            type(value['version']) is int and value['version'] == CARRIED_VERSION and nonempty(value['from']) and
+            (value['tree'] is None or isinstance(value['tree'], str) and re.fullmatch(TREE_ID, value['tree'])) and
+            isinstance(value['findings'], list) and isinstance(value['skipped'], dict) and
+            set(value['skipped']) == {'outOfScope', 'missing', 'generation'} and
+            all(type(n) is int and n >= 0 for n in (*value['skipped'].values(), value['unresolvedNotCarried'])),
+            'invalid carried findings')
+    seen = set()
+    origins = set()
+    for item in value['findings']:
+        require(isinstance(item, dict) and set(item) == set(CARRIED_FIELDS) and
+                re.fullmatch(r'P[1-9]\d*', str(item['id'])) and item['id'] not in seen and
+                all(nonempty(item[key]) for key in ('reviewId', 'originalId', 'file', 'problem', 'reason', 'source')) and
+                (item['reviewId'], item['originalId']) not in origins and
+                item['status'] in CARRIED_STATES and item['severity'] in SEVERITIES.values() and
+                positive_int(item['line']) and positive_int(item['generation']) and
+                item['generation'] <= CARRY_MAX_GENERATIONS and
+                (item['changed'] is None or type(item['changed']) is bool),
+                'invalid carried finding')
+        seen.add(item['id'])
+        origins.add((item['reviewId'], item['originalId']))
+    return value
+
+
+def load_carried(directory):
+    path = directory / CARRIED_FILE
+    try:
+        return validate_carried(read_json(path)) if path.exists() else None
+    except EXPECTED_ERRORS as error:
+        raise Failure(display_path(str(path)) + ': ' + str(error)) from error
+
+
+def carried_changes(cwd, tree, files):
+    # 未コミットの変更も比べるため、対象リポジトリのオブジェクトに今の作業ツリーを保存する。
+    # 木にないファイルと読めない木は判定しない。
+    if tree is None or not files:
+        return {}
+    try:
+        with tempfile.TemporaryDirectory() as temporary:
+            current = save_worktree_tree(cwd, Path(temporary), 'carry')
+        known = set(nul_paths(git(cwd, 'ls-tree', '-r', '-z', '--name-only', tree)))
+        changed = set(nul_paths(git(cwd, 'diff-tree', '-r', '-z', '--name-only', '--no-renames', tree, current)))
+    except EXPECTED_ERRORS:
+        return {}
+    return {name: name in changed for name in files if name in known}
+
+
+def read_carry_source(directory):
+    require(not directory.is_symlink() and directory.is_dir(),
+            display_path(str(directory)) + ': carry source must be a directory')
+    for name in (CARRY_META_FILE, LEDGER_FILE, DECISIONS_FILE, CARRIED_FILE):
+        path = directory / name
+        require(not path.is_symlink() and (path.is_file() or name == CARRIED_FILE and not path.exists()),
+                display_path(str(path)) + ': carry source file must be a regular file')
+    meta_path = display_path(str(directory / CARRY_META_FILE))
+    try:
+        meta = read_json(directory / CARRY_META_FILE)
+    except EXPECTED_ERRORS as error:
+        raise Failure(meta_path + ': ' + str(error)) from error
+    digests = {}
+
+    def read_file(name, validate):
+        path = directory / name
+        try:
+            data = path.read_bytes()
+            digests[name] = digest(data)
+            return validate(parse_json(data.decode('utf-8')))
+        except EXPECTED_ERRORS as error:
+            raise Failure(display_path(str(path)) + ': ' + str(error)) from error
+
+    ledger = read_file(LEDGER_FILE, validate_ledger)
+    require(isinstance(meta, dict) and {'version', 'reviewId', 'cwd', 'branch', 'tree'} <= meta.keys() and
+            type(meta['version']) is int and meta['version'] == CARRY_META_VERSION and
+            meta['reviewId'] == ledger['reviewId'] and isinstance(meta['cwd'], str) and
+            (meta['branch'] is None or isinstance(meta['branch'], str)) and
+            (meta['tree'] is None or isinstance(meta['tree'], str) and re.fullmatch(TREE_ID, meta['tree'])) and
+            type(meta.get('carried', False)) is bool,
+            meta_path + ': invalid carry source')
+    counts = meta.get('ledger')
+    require(counts == ledger_counts(ledger) and all(type(count) is int for count in counts.values()),
+            meta_path + ': invalid carry source')
+    # 写しには run.json がないので、決定事項の採番の上限は検査しない。
+    decisions = read_file(DECISIONS_FILE, lambda value: validate_decisions(value, ledger, {'decisionSequence': math.inf}))
+    carried = read_file(CARRIED_FILE, validate_carried) if (directory / CARRIED_FILE).exists() else None
+    require(meta.get('carried', False) == (carried is not None), meta_path + ': invalid carry source')
+    if 'digests' in meta:
+        expected = meta['digests']
+        require(isinstance(expected, dict) and expected.keys() == digests.keys() and
+                all(isinstance(value, str) and re.fullmatch(r'[0-9a-fA-F]{64}', value) for value in expected.values()),
+                meta_path + ': invalid carry source')
+        require(all(expected[name].lower() == value for name, value in digests.items()),
+                meta_path + ': invalid carry source')
+    return meta, ledger, decisions, carried
+
+
+def carry_from(source, run, value, ledger):
+    prefix = display_path(str(source)) + ': '
+    require(run['git'], prefix + 'carry requires a git target')
+    meta, previous, decisions, carried = read_carry_source(source)
+    require(meta['cwd'] == run['cwd'], prefix + 'carry source is for another repository')
+    branch = run['branch']
+    # 却下・保留の前提はそのブランチの変更に対するものなので、同じブランチでだけ引き継ぐ。
+    require(branch is not None and meta['branch'] is not None, prefix + 'carry requires a branch (detached HEAD)')
+    require(meta['branch'] == branch, prefix + 'carry source is for another branch')
+    items = {(meta['reviewId'], item['id']): dict(item, reviewId=meta['reviewId'], originalId=item['id'], generation=1)
+             for item in previous['findings'] if item['status'] in CARRIED_STATES}
+    skipped = {'outOfScope': 0, 'missing': 0, 'generation': 0}
+    for item in (carried or {'findings': []})['findings']:
+        if item['generation'] + 1 > CARRY_MAX_GENERATIONS:
+            skipped['generation'] += 1
+            continue
+        items.setdefault((item['reviewId'], item['originalId']), dict(item, generation=item['generation'] + 1))
+    scope = set(scope_files(run))
+    kept = []
+    for key in sorted(items, key=lambda key: (key[0], natural_id_key(key[1]))):
+        item = items[key]
+        path = Path(run['cwd']) / item['file']
+        if item['file'] not in scope:
+            skipped['outOfScope'] += 1
+        # 対象範囲と同じくリンク自体をファイルとして扱い、切れたリンクも存在するとみなす。
+        elif not path.is_symlink() and not path.exists():
+            skipped['missing'] += 1
+        else:
+            kept.append(item)
+    findings = [{field: (f'P{number}' if field == 'id' else None if field == 'changed'
+                         else item[field]) for field in CARRIED_FIELDS} for number, item in enumerate(kept, 1)]
+    # 出所が常設だけの決定は、今回の常設の取り込みに任せる。
+    entries = ((index, {key: raw[key] for key in ('type', 'body', 'reason')})
+               for index, raw in enumerate(decisions['decisions'])
+               if not raw.get('sources') or 'carried' in raw['sources'])
+    try:
+        ids = import_decisions(entries, source / DECISIONS_FILE, value, ledger, run, 'carried')
+    except Failure as error:
+        raise Failure(f'{error} (remove --carry-from to start without carried findings and decisions)') from error
+    unresolved = sum(item['status'] == 'unresolved' for item in previous['findings'])
+    data = {'version': CARRIED_VERSION, 'from': meta['reviewId'], 'tree': meta['tree'], 'findings': findings,
+            'skipped': skipped, 'unresolvedNotCarried': unresolved}
+    summary = {'from': meta['reviewId'], 'rejected': sum(i['status'] == 'rejected' for i in findings),
+               'onHold': sum(i['status'] == 'on_hold' for i in findings), 'skipped': skipped,
+               'unresolvedNotCarried': unresolved, 'decisions': len(ids)}
+    return data, summary
 
 
 def report_format():
@@ -2670,6 +2845,12 @@ def require_archive_owner(meta_path, review_id):
             'archive directory holds another review')
 
 
+def require_archive_source(path, label, optional=False):
+    prefix = display_path(str(path)) + ': ' + label + ' file '
+    require(not path.is_symlink(), prefix + 'must not be a link')
+    require(path.is_file() or optional and not path.exists(), prefix + 'must be a regular file')
+
+
 def archive(args, root, run):
     # 写しを次のレビューの範囲やコミットから外す手段が git の無視設定しかないため、git の対象だけを受け付ける。
     require(run['git'], 'archive requires a git target')
@@ -2686,41 +2867,53 @@ def archive(args, root, run):
     # 大文字小文字を区別しないファイルシステムでも同じパスになるので、区別せずに比べる。
     require(target.name.casefold() != DECISIONS_FILE.casefold(), 'archive directory name is reserved: ' + target.name)
     # carry-meta.json を最初に書き、途中で止まっても同じ reviewId と確かめて再実行で上書きできるようにする。
-    names = (CARRY_META_FILE, LEDGER_FILE, DECISIONS_FILE)
-    paths = [target / name for name in names]
+    # 引き継いだ指摘が 0 件でも、スキップと引き継がなかった未解決の件数を写しに残す。
+    sources = (root / LEDGER_FILE, root / DECISIONS_FILE, root / CARRIED_FILE)
+    for path, label in zip(sources, ('ledger', 'decisions', 'carried')):
+        require_archive_source(path, label, optional=label != 'ledger')
+    # 検証した版と別の版を写さないよう、写すバイト列を先に読み、検証の後も変わっていないことを確かめる。
+    contents = [source.read_bytes() if source.exists() else None for source in sources]
+    ledger_data, decisions_data, carried_data = contents
+    paths = [target / name for name in (CARRY_META_FILE, LEDGER_FILE, DECISIONS_FILE, CARRIED_FILE)]
     require(all(not path.is_symlink() and (path.is_file() or not path.exists()) for path in paths),
             'archive file must be a regular file')
-    for path in paths:
-        ignored = run_command(['git', 'check-ignore', '-q', '--', str(path.relative_to(base.parent))], cwd,
-                              allowed=(0, 1))
-        require(ignored.returncode == 0, 'archive file is not ignored by git: ' + display_path(str(path)))
-    # 台帳と要約に使う run.json は R に属し、リンクをたどると R の外の内容を写しとして公開することになる。
-    # 決定事項のリンクは load_decisions が拒否する。
-    for name, label in ((RUN_FILE, 'run'), (LEDGER_FILE, 'ledger')):
-        if (root / name).is_symlink():
-            raise Failure(display_path(str(root / name)) + ': ' + label + ' file must not be a link')
-    path = root / DECISIONS_FILE
-    # 検証した版と別の版を写さないよう、写すバイト列を先に読み、検証の後も変わっていないことを確かめる。
-    contents = [(root / LEDGER_FILE).read_bytes(), path.read_bytes() if path.exists() else None]
     ledger = load_ledger(root)
     decisions = load_decisions_reported(root, ledger, run)
-    require([(root / LEDGER_FILE).read_bytes(), path.read_bytes() if path.exists() else None] == contents,
+    load_carried(root)
+    require(not any(source.is_symlink() for source in sources) and
+            [source.read_bytes() if source.exists() else None for source in sources] == contents,
             'review state changed during archive')
     meta_path = target / CARRY_META_FILE
     # 所有元を確かめられない写しは上書きしない。
     if any(path.exists() for path in paths):
         require(meta_path.exists(), 'archive directory holds another review')
         require_archive_owner(meta_path, ledger['reviewId'])
+    branch = current_branch(cwd)
+    reviewed_branch = run.get('branch', branch)
+    require(branch == reviewed_branch, 'archive must run on the reviewed branch '
+            f'(reviewed: {reviewed_branch or "detached HEAD"}, current: {branch or "detached HEAD"})')
     meta = {'version': CARRY_META_VERSION, 'reviewId': ledger['reviewId'], 'cwd': run['cwd'],
-            'branch': current_branch(cwd), 'mode': run['mode'], 'base': run.get('base'), 'paths': run['paths'],
+            'branch': reviewed_branch,
+            'mode': run['mode'], 'base': run.get('base'), 'paths': run['paths'],
             'tree': last_checked_tree(root, ledger['iteration']), 'iteration': ledger['iteration'],
-            'ledger': ledger_counts(ledger)}
-    files = {CARRY_META_FILE: json.dumps(meta, indent=2) + '\n',
-             LEDGER_FILE: contents[0],
-             # 決定事項のないレビューも、写しを読む側が同じ形で読めるよう空の決定事項を写す。
-             DECISIONS_FILE: contents[1] if contents[1] is not None else json.dumps(decisions, indent=2) + '\n'}
+            'ledger': ledger_counts(ledger), 'carried': carried_data is not None}
+    # 決定事項のないレビューも、写しを読む側が同じ形で読めるよう空の決定事項を写す。
+    if decisions_data is None:
+        decisions_data = (json.dumps(decisions, indent=2) + '\n').encode('utf-8')
+    files = {LEDGER_FILE: ledger_data,
+             DECISIONS_FILE: decisions_data,
+             CARRIED_FILE: carried_data}
+    meta['digests'] = {name: digest(data) for name, data in files.items() if data is not None}
+    files = {CARRY_META_FILE: json.dumps(meta, indent=2) + '\n', **files}
     created = [directory for directory in (base, target) if not directory.exists()]
     originals = {path: path.read_bytes() if path.exists() else None for path in paths}
+    for name, data in files.items():
+        path = target / name
+        if data is None and originals[path] is None:
+            continue
+        ignored = run_command(['git', 'check-ignore', '-q', '--', str(path.relative_to(base.parent))], cwd,
+                              allowed=(0, 1))
+        require(ignored.returncode == 0, 'archive file is not ignored by git: ' + display_path(str(path)))
     replaced = []
     try:
         for name, data in files.items():
@@ -2735,11 +2928,15 @@ def archive(args, root, run):
                     require_archive_owner(file, ledger['reviewId'])
                     originals[file] = file.read_bytes()
                     write_atomic(file, data)
-            else:
+            elif data is not None:
                 write_atomic(file, data)
+            elif originals[file] is not None:
+                file.unlink()
+            else:
+                continue
             replaced.append(file)
     except BaseException as error:
-        # 置き換えたファイルだけを戻す。1つの復元に失敗しても残りを続け、元のエラーに追記する。
+        # 更新したファイルだけを戻す。1つの復元に失敗しても残りを続け、元のエラーに追記する。
         for file in replaced:
             try:
                 if originals[file] is None:
@@ -2755,7 +2952,7 @@ def archive(args, root, run):
             except BaseException as rollback_error:
                 error.__notes__ = [*getattr(error, '__notes__', []), f'{display_path(str(directory))}: {rollback_error}']
         raise
-    return {'files': [str(path) for path in paths], 'carryMeta': meta}
+    return {'files': [str(target / name) for name, data in files.items() if data is not None], 'carryMeta': meta}
 
 
 COMMANDS = {
@@ -2793,6 +2990,7 @@ def parser():
     init_parser.add_argument('--only', choices=REVIEWERS, action='append', default=[])
     init_parser.add_argument('--ja-review', action='store_true')
     init_parser.add_argument('--no-standing-decisions', action='store_true')
+    init_parser.add_argument('--carry-from', type=Path)
     init_parser.add_argument('--ja-skill', type=Path, default=Path('~/.claude/skills/ja-review'))
     init_parser.add_argument('--diff-budget', type=int, default=DIFF_BUDGET)
     init_parser.add_argument('--timeout', type=float, default=REVIEW_TIMEOUT)
@@ -2854,6 +3052,8 @@ def main():
             # run.json が壊れていても旧出力を使わせないため、指定されたコマンドの出力を読み込み前に失効させる。
             if args.command in INVALIDATE_BEFORE_LOAD:
                 invalidate(args.directory.resolve(), args.command)
+            if args.command == 'archive':
+                require_archive_source(root / RUN_FILE, 'run')
             run = None if args.command == 'init' else load_run(root)
             result = handler(args, root, run)
         print(json.dumps(result))
