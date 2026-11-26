@@ -775,8 +775,8 @@ with patch.object(subprocess.Popen, 'communicate', communicate):
             (b, None, [(b, u)], None), (a, [b, {}], [], 'project[1]'),
             ('{', a, [], 'user'), (a, dict(a, findingIds=[]), [], 'project[0]'),
             (dict(a, extra=1), None, [], 'user[0]'), (exact, None, [(exact, u)], None),
-            (overflow, None, [], 'user[0]'),
-            (half, dict(half, reason='別の理由'), [], 'project[0]'),
+            (overflow, None, [], 'limit'),
+            (half, dict(half, reason='別の理由'), [], 'limit'),
             ('{', 'directory', [], 'disabled')]
         paths = [Path(self.env['XDG_CONFIG_HOME']) / 'multi-review/decisions.json',
                  self.repo / '.multi-review/decisions.json']
@@ -799,9 +799,15 @@ with patch.object(subprocess.Popen, 'communicate', communicate):
                                    *(['--no-standing-decisions'] if disabled else []),
                                    code=1 if error and not disabled else 0)
                 if error and not disabled:
-                    source, _, index = error.partition('[')
-                    self.assertIn(str(paths[0 if source == 'user' else 1]) +
-                                  ('[' + index if index else ''), self.last_stderr)
+                    if error == 'limit':
+                        self.assertIn('decisions section is', self.last_stderr)
+                        for path, value in zip(paths, (user, project)):
+                            if value is not None:
+                                self.assertIn(str(path), self.last_stderr)
+                    else:
+                        source, _, index = error.partition('[')
+                        self.assertIn(str(paths[0 if source == 'user' else 1]) +
+                                      ('[' + index if index else ''), self.last_stderr)
                     self.assertEqual(set(x.name for x in root.iterdir()), {'.mr.lock'})
                     continue
                 self.assertEqual(result['standingDecisions']['count'], len(expected))
@@ -1121,7 +1127,8 @@ with patch.object(pwd, 'getpwuid', side_effect=KeyError('no home')):
                 self.call('init', root, '--cwd', self.repo, '--path', '.',
                           code=1 if delta > 0 or duplicate else 0)
                 if delta > 0 or duplicate:
-                    self.assertIn(str(project if duplicate else path) + '[0]', self.last_stderr)
+                    self.assertIn(str(project if duplicate else path) + ':', self.last_stderr)
+                    self.assertIn('decisions section is', self.last_stderr)
                     self.assertEqual(set(p.name for p in root.iterdir()), {'.mr.lock'})
                 else:
                     self.assertEqual(len(self.read_json(root / 'decisions.json')['decisions']), 1)
@@ -3997,6 +4004,345 @@ Path('leaked').touch()
                                'skipped': {'outOfScope': 0, 'missing': 0, 'generation': 0}, 'unresolvedNotCarried': 0})
         return path
 
+    def write_carried_pair(self):
+        path = self.write_empty_carried()
+        value = self.read_json(path)
+        value['findings'] = [
+            self.finding(id=f'P{n}', originalId=f'F{n}', reviewId=value['from'], status=status,
+                         generation=1, changed=False, reason='前回の理由', problem=f'前回の指摘{n}')
+            for n, status in enumerate(('rejected', 'on_hold'), 1)]
+        self.write_json(path, value)
+        return path, value
+
+    def test_carried_prompt_finding_sections(self):
+        path, value = self.write_carried_pair()
+        held = '前回までの実行で保留済み（検討済みのため再報告不要）:\nP2 日本語.py:3 前回の指摘2 理由: 前回の理由'
+        rejected_heading = ('却下済み（同じ内容は再報告不要。却下の理由が誤っている具体例を示せる場合だけ、'
+                            '「問題:」欄に指摘 ID と具体例（入力・手順・結果）を書いて再指摘してよい）:')
+        rejected = '前回までの実行で' + rejected_heading + '\nP1 日本語.py:3 前回の指摘1 理由: 前回の理由'
+        listing = held + '\n' + rejected
+        def prompt(directory, *options):
+            return Path(self.call('prompts', directory, *options)['reviewers'][0]['prompt']).read_text()
+
+        first = prompt(self.iter)
+        self.assertNotIn('検討済みのため再報告不要（前提変更', first)
+        self.assertTrue(first.endswith(listing))
+        confirm = prompt(self.iter, '--confirm')
+        self.assertTrue(confirm.endswith(listing))
+        self.assertNotIn('\n' + rejected_heading, confirm)
+        for action, problem in (('reject', '今回の却下'), ('hold', '今回の保留')):
+            self.call('ledger', self.run, action, *self.add(problem=problem)['ids'], '--reason', '今回の理由')
+        self.call('ledger', self.run, 'fix', *self.add(problem='今回の修正')['ids'],
+                  '--iteration', '1', '--summary', '修正概要')
+        second = self.run / 'iter-2'
+        fixes = '\n前回の修正概要:\nF3 修正概要'
+        f1 = 'F1 日本語.py:3 今回の却下 理由: 今回の理由'
+        f2 = 'F2 日本語.py:3 今回の保留 理由: 今回の理由'
+        considered = '検討済みのため再報告不要（前提変更で再評価する項目を除く）:\n'
+        for options, current in [((), f1 + '\n' + f2),
+                                 (('--confirm',), f2 + '\n' + rejected_heading + '\n' + f1)]:
+            self.assertTrue(prompt(second, *options).endswith(considered + current + '\n' + listing + fixes))
+        for changes, expected in [((True, True), ''), ((True, False), held),
+                                  ((None, None), rejected + '（ファイルの変更は判定不能）')]:
+            items = [dict(item, changed=changed) for item, changed in zip(value['findings'], changes)]
+            self.write_json(path, dict(value, findings=items))
+            text = prompt(second)
+            self.assertEqual(text[text.index(considered):],
+                             considered + f1 + '\n' + f2 + ('\n' + expected if expected else '') + fixes)
+
+    def test_carried_prompt_byte_limit_and_empty_input(self):
+        (self.repo / '本文.txt').write_text('校閲対象')
+        path, value = self.write_carried_pair()
+        for directory, options in [(self.iter, ()), (self.run / 'iter-2', ()),
+                                   (self.run / 'iter-2', ('--confirm',))]:
+            path.unlink()
+            def prompt():
+                return Path(self.call('prompts', directory, *options)['reviewers'][0]['prompt']).read_bytes()
+            original = prompt()
+            self.write_json(path, dict(value, findings=[]))
+            self.assertEqual(prompt(), original)
+        value['findings'].append(dict(value['findings'][0], id='P3', originalId='F3', changed=True))
+        self.write_json(path, value)
+        def listing():
+            text = Path(self.call('prompts', self.run / 'iter-2')['reviewers'][0]['prompt']).read_text()
+            return text.split('（前提変更で再評価する項目を除く）:\n\n', 1)[1].split('\n前回の修正概要:', 1)[0]
+        first = value['findings'][0]
+        first['reason'] += 'x' * (8192 - len(listing().encode()))
+        self.write_json(path, value)
+        self.assertEqual(len(listing().encode()), 8192)
+        first['reason'] += 'x'
+        self.write_json(path, value)
+        self.assertEqual(listing(), '前回までの実行から引き継いだ指摘 2 件は、一覧が上限を超えるため載せていない。')
+
+    def test_carried_fix_diffs_exclude_findings_from_prompts_and_future_runs(self):
+        source = self.carry_source()
+        directory, _ = self.carry(source)
+        representative = self.repo / '日本語.py'
+        representative.write_text('original\n')
+        path = directory / 'carried.json'
+        value = self.read_json(path)
+        value['findings'][0]['file'] = str(representative)
+        value['findings'].append(dict(value['findings'][2], id='P4', originalId='F7',
+                                      problem='同じ不備（他: sub/../b.txt:1）'))
+        self.write_json(path, value)
+        original = path.read_bytes()
+        first, second, third = (directory / f'iter-{n}' for n in (1, 2, 3))
+
+        def prompt(iteration, *options):
+            return Path(self.call('prompts', iteration, *options)['reviewers'][0]['prompt']).read_text()
+
+        self.assertIn(f'\nP1 {representative}:1 不備1', prompt(first))
+        self.call('snapshot', first)
+        representative.write_text('fixed again\n')
+        self.call('fixdiff', first)
+        self.assertIn(b'diff --git "a/\\', (first / 'fix.diff').read_bytes())
+        for options in ((), ('--confirm',)):
+            text = prompt(second, *options)
+            self.assertNotIn('\nP1 ', text)
+            self.assertIn('\nP2 b.txt:1 不備2', text)
+            self.assertIn('\nP3 c.txt:1 不備3', text)
+            self.assertIn('\nP4 c.txt:1 同じ不備', text)
+        self.call('snapshot', second)
+        representative.write_text('original\n')
+        (self.repo / 'b.txt').chmod(0o755)
+        self.call('fixdiff', second)
+        text = prompt(third, '--confirm')
+        self.assertNotRegex(text, r'(?m)^P[124] ')
+        self.assertIn('\nP3 c.txt:1 不備3', text)
+        target = self.archive_dir('after-fixes')
+        self.call('archive', directory, '--to', target)
+        self.assertEqual(path.read_bytes(), original)
+        archived = target / 'carried.json'
+        findings = self.read_json(archived)['findings']
+        self.assertEqual(findings, [dict(item, changed=item['id'] != 'P3') for item in value['findings']])
+        self.assertEqual(self.read_json(target / 'carry-meta.json')['digests']['carried.json'],
+                         hashlib.sha256(archived.read_bytes()).hexdigest())
+        next_run, result = self.carry(target, name='run-after-fixes')
+        self.assertEqual(result['carried']['skipped']['changed'], 3)
+        self.assertEqual(self.read_json(next_run / 'carried.json')['findings'],
+                         [dict(value['findings'][2], id='P1', generation=2)])
+
+    def test_carried_copy_fix_diff_and_archive_completion(self):
+        source = self.carry_source()
+        directory, _ = self.carry(source)
+        carried_path = directory / 'carried.json'
+        original = carried_path.read_bytes()
+        first = directory / 'iter-1'
+        target = self.archive_dir('copy-fixes')
+        archived = target / 'carried.json'
+        self.assertFalse((first / 'fixdiff.json').exists())
+        self.assertFalse((first / 'fix.diff').exists())
+        self.call('archive', directory, '--to', target)
+        self.assertEqual(archived.read_bytes(), original)
+        self.fail_tree_generation()
+        self.assertEqual(self.call('snapshot', first)['mode'], 'copy')
+        (self.repo / 'a.txt').write_text('fixed again\n')
+        self.call('fixdiff', first)
+        patch = first / 'fix.diff'
+        patch_data = patch.read_bytes()
+        self.assertTrue(patch_data.startswith(b'--- a/a.txt'))
+        job = self.call('prompts', directory / 'iter-2')['reviewers'][0]
+        text = Path(job['prompt']).read_text()
+        self.assertNotIn('\nP1 ', text)
+        self.assertIn('\nP2 b.txt:1 不備2', text)
+        self.call('archive', directory, '--to', target)
+        self.assertEqual([item['changed'] for item in self.read_json(archived)['findings']], [True, False, False])
+        patch.write_bytes(patch_data + b'\n')
+        result = self.call('archive', directory, '--to', target)
+        self.assertIsNone(result['carryMeta']['tree'])
+        self.assertEqual([item['changed'] for item in self.read_json(archived)['findings']], [True, True, True])
+        patch.write_bytes(patch_data)
+        body = self.root / 'task.md'
+        body.write_text('修正を再委譲する\n')
+        self.call('task', first, '--input', body)
+        self.assertFalse((first / 'fixdiff.json').exists())
+        self.assertEqual(patch.read_bytes(), patch_data)
+        self.call('archive', directory, '--to', target)
+        self.assertEqual([item['changed'] for item in self.read_json(archived)['findings']], [True, True, True])
+        self.assertEqual(carried_path.read_bytes(), original)
+
+    def test_init_checks_decisions_limit_after_merging_sources(self):
+        self.changed_repository()
+        self.exclude_multi_review()
+        self.add_decisions(self.decision(body='写しだけの方針'))
+        source = self.archive_dir()
+        self.call('archive', self.run, '--to', source)
+        standing = Path(self.env['XDG_CONFIG_HOME']) / 'multi-review/decisions.json'
+        standing.parent.mkdir(parents=True)
+        shared = self.decision(body='常設と写しで共通の方針')
+        self.write_json(standing, shared)
+        probe, _ = self.carry(source, name='before-merging')
+        job = self.call('prompts', probe / 'iter-1')['reviewers'][0]
+        text = Path(job['prompt']).read_text()
+        section = text[text.index('## 決定事項'):text.index('レビュー対象（')].removesuffix('\n')
+        shared['body'] += 'x' * (8193 - len(section.encode()))
+        self.write_json(standing, shared)
+        self.add_decisions(shared)
+        self.call('archive', self.run, '--to', source)
+        directory, _ = self.carry(source)
+        decisions = self.read_json(directory / 'decisions.json')['decisions']
+        self.assertEqual([(item['body'], item['sources']) for item in decisions],
+                         [(shared['body'], ['user', 'carried']), ('写しだけの方針', ['carried'])])
+        self.call('prompts', directory / 'iter-1')
+        self.write_json(standing, dict(shared, body=shared['body'] + 'x' * 8192))
+        plain = self.root / 'oversized-standing'
+        self.call('init', plain, '--cwd', self.repo, code=1)
+        diagnostic = self.last_stderr
+        self.assertIn(mr.display_path(str(standing)) + ': decisions section is', diagnostic)
+        failed, _ = self.carry(source, code=1, name='oversized-standing-with-carry')
+        self.assertEqual(self.last_stderr, diagnostic)
+        self.assertEqual([path.name for path in failed.iterdir()], ['.mr.lock'])
+
+    def test_split_decisions_limit_before_add_and_carry(self):
+        source = self.carry_source()
+        standing = Path(self.env['XDG_CONFIG_HOME']) / 'multi-review/decisions.json'
+        incoming = self.root / 'ordinary-decision.json'
+        ordinary = self.decision(body='今回の方針')
+
+        def prompt_size(directory):
+            job = self.call('prompts', directory / 'iter-1')['reviewers'][0]
+            text = Path(job['prompt']).read_text()
+            section = text[text.index('## 決定事項'):text.index('レビュー対象（')].removesuffix('\n')
+            self.assertIn('## 異議を出してよい方針', section)
+            return len(section.encode())
+
+        for action in ('add', 'init'):
+            with self.subTest(action=action):
+                if action == 'add':
+                    sample, _ = self.carry(source, name='sample-add')
+                    self.write_json(incoming, ordinary)
+                    self.call('decisions', sample, 'add', '--input', incoming)
+                    directory, _ = self.carry(source, name='limit-add')
+                    paths = [directory / name for name in ('run.json', 'decisions.json', 'decisions.md')]
+                    saved = [path.read_bytes() for path in paths]
+                else:
+                    self.write_json(standing, ordinary)
+                    sample, _ = self.carry(source, name='sample-init')
+                exact = ordinary['body'] + 'x' * (8192 - prompt_size(sample))
+                self.write_json(incoming if action == 'add' else standing, dict(ordinary, body=exact + 'x'))
+                if action == 'add':
+                    self.call('decisions', directory, 'add', '--input', incoming, code=1)
+                    self.assertEqual([path.read_bytes() for path in paths], saved)
+                else:
+                    rejected, _ = self.carry(source, code=1, name='over-limit-init')
+                    self.assertEqual([path.name for path in rejected.iterdir()], ['.mr.lock'])
+                    self.assertIn('remove --carry-from', self.last_stderr)
+                self.assertIn('decisions section is 8193 bytes (limit 8192)', self.last_stderr)
+                self.write_json(incoming if action == 'add' else standing, dict(ordinary, body=exact))
+                if action == 'add':
+                    self.call('decisions', directory, 'add', '--input', incoming)
+                else:
+                    directory, _ = self.carry(source, name='limit-init')
+                self.assertEqual(prompt_size(directory), 8192)
+                self.call('prompts', directory / 'iter-1', '--confirm')
+                self.call('prompts', directory / 'iter-2')
+
+    def test_carried_policy_prompt_sections_and_ja_review(self):
+        self.add()
+        self.call('ledger', self.run, 'reject', 'F1', '--reason', '今回の理由')
+        self.add_decisions([self.decision(body='前回方針', findingIds=['F1']), self.decision(body='通常方針'),
+                            self.decision(type='triage', body='前回基準'), self.decision(body='併合方針'),
+                            self.decision(body='今回方針', findingIds=['F1'])])
+        decisions = self.run / 'decisions.json'
+        value = self.read_json(decisions)
+        for index, sources in [(0, ['carried']), (2, ['carried']), (3, ['user', 'carried'])]:
+            value['decisions'][index]['sources'] = sources
+        self.write_json(decisions, value)
+        self.write_carried_pair()
+        (self.repo / '本文.txt').write_text('校閲対象')
+        run = self.read_json(self.run / 'run.json')
+        self.write_json(self.run / 'run.json', dict(run, jaSkill=str(self.ja_skill())))
+        text = Path(self.call('prompts', self.iter)['reviewers'][0]['prompt']).read_text()
+        sections = text[text.index('## 決定事項'):text.index('レビュー対象（')].removesuffix('\n')
+        item = value['decisions'][0]
+        body = item['body']
+        item['body'] += 'x' * (8192 - len(sections.encode()))
+        self.write_json(decisions, value)
+        self.call('prompts', self.iter)
+        item['body'] += 'x'
+        self.write_json(decisions, value)
+        self.call('prompts', self.iter, code=1)
+        self.assertIn('decisions section is 8193 bytes (limit 8192)', self.last_stderr)
+        item['body'] = body
+        self.write_json(decisions, value)
+        for directory, options, ordinary, disputable in [
+                (self.iter, ['--ja-review'], [2, 5], [1, 4]),
+                (self.run / 'iter-2', [], [1, 2, 4, 5, 3], []),
+                (self.run / 'iter-2', ['--confirm'], [], [1, 4, 5])]:
+            jobs = self.call('prompts', directory, *options)['reviewers']
+            if options == ['--ja-review']:
+                self.assertTrue(any(j['source'].startswith('ja-') for j in jobs))
+            for job in jobs:
+                text = Path(job['prompt']).read_text()
+                normal, _, challenge = text.partition('## 異議を出してよい方針')
+                self.assertEqual(re.findall(r'^- D(\d+)（', normal, re.M), list(map(str, ordinary)))
+                self.assertEqual(re.findall(r'^- D(\d+)（', challenge, re.M), list(map(str, disputable)))
+                if disputable:
+                    self.assertIn('この方針は呼び出し元が選別で決めたもので、前回までの実行から引き継いだものを含むことがある。'
+                                  '誤っている可能性がある。具体的な不備を示せるなら決定 ID を書いて指摘してよい。',
+                                  challenge)
+                    self.assertNotIn('決定事項に反する指摘、基準に当たる指摘は出さない。', challenge)
+                if job['source'].startswith('ja-'):
+                    self.assertNotRegex(text, r'(?m)^P[12] ')
+                    self.assertIn('「理由:」', normal)
+
+    def test_carried_prompt_refuses_invalid_file_before_invalidation(self):
+        self.call('prompts', self.iter)
+        artifacts = {self.iter / name: (self.iter / name).read_bytes() for name in ('prompts.json', 'target.json')}
+        path = self.write_empty_carried()
+        valid = self.root / 'valid-carried.json'
+        shutil.copyfile(path, valid)
+        path.write_text('{')
+        for invalid in ('json', 'link', 'dangling link', 'directory'):
+            if invalid != 'json':
+                path.unlink()
+                if invalid == 'directory':
+                    path.mkdir()
+                else:
+                    path.symlink_to(valid if invalid == 'link' else self.root / 'missing')
+            self.call('prompts', self.iter, code=1)
+            self.assertIn(mr.display_path(str(path)) + ':', self.last_stderr)
+            if 'link' in invalid:
+                self.assertIn('carried file must not be a link', self.last_stderr)
+            self.assertEqual({artifact: artifact.read_bytes() for artifact in artifacts}, artifacts)
+
+    def test_carried_remove_preserves_ids_and_propagates_to_archive(self):
+        source = self.carry_source()
+        directory, _ = self.carry(source)
+        path = directory / 'carried.json'
+        command = ('carried', directory, 'remove')
+        original = path.read_bytes()
+        for argv, reason in [(('carried', self.run, 'remove', 'P1'), 'carried file not found'),
+                             (command, 'carried finding IDs required'),
+                             ((*command, 'P2', 'P99'), 'unknown carried finding ID')]:
+            with self.subTest(argv=argv):
+                self.call(*argv, code=1)
+                self.assertIn(reason, self.last_stderr)
+                self.assertEqual(path.read_bytes(), original)
+        with (directory / '.mr.lock').open('a') as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX)
+            self.call(*command, 'P2', code=1)
+            self.assertIn('another command', self.last_stderr)
+            self.assertEqual(path.read_bytes(), original)
+        self.fail_replacement(path, *command, 'P2')
+        self.assertEqual(path.read_bytes(), original)
+        job = self.call('prompts', directory / 'iter-1')['reviewers'][0]
+        self.assertIn('\nP2 b.txt:1 不備2', Path(job['prompt']).read_text())
+        self.assertEqual(self.call(*command, 'P2'), {'ids': ['P2'], 'rejected': 1, 'onHold': 1})
+        self.assertEqual([item['id'] for item in self.read_json(path)['findings']], ['P1', 'P3'])
+        job = self.call('prompts', directory / 'iter-1')['reviewers'][0]
+        prompt = Path(job['prompt']).read_text()
+        self.assertNotIn('\nP2 ', prompt)
+        self.assertIn('\nP1 a.txt:1 不備1', prompt)
+        self.assertIn('\nP3 c.txt:1 不備3', prompt)
+        target = self.archive_dir('removed')
+        self.call('archive', directory, '--to', target)
+        self.assertEqual((target / 'carried.json').read_bytes(), path.read_bytes())
+        next_run, _ = self.carry(target, name='after-remove')
+        self.assertEqual([(i['id'], i['originalId']) for i in self.read_json(next_run / 'carried.json')['findings']],
+                         [('P1', 'F1'), ('P2', 'F3')])
+        self.assertEqual(self.call(*command, 'P3', 'P1'), {'ids': ['P1', 'P3'], 'rejected': 0, 'onHold': 0})
+
     def test_archive_refuses_invalid_run_branch(self):
         self.changed_repository()
         self.exclude_multi_review()
@@ -4587,7 +4933,7 @@ sys.exit(mr.main())
         self.assertNotIn('carried', self.read_json(directory / 'run.json'))
         self.assertEqual(result['carried'], {
             'from': self.run.name, 'rejected': 2, 'onHold': 1, 'unresolvedNotCarried': 1, 'decisions': 2,
-            'skipped': {'outOfScope': 0, 'missing': 0, 'generation': 0}})
+            'skipped': {'outOfScope': 0, 'missing': 0, 'generation': 0, 'changed': 0}})
         carried = self.read_json(directory / 'carried.json')
         self.assertEqual((carried['version'], carried['from'], carried['tree'], carried['unresolvedNotCarried']),
                          (1, self.run.name, self.read_json(source / 'carry-meta.json')['tree'], 1))
@@ -4601,15 +4947,15 @@ sys.exit(mr.main())
                          [('policy', '表示文言は各解析器が出す', ['carried']),
                           ('triage', '別の変更で扱う指摘は保留する', ['carried'])])
         self.assertFalse(any('findingIds' in d and d['findingIds'] for d in decisions))
-        # 台帳は空のまま、決定事項の節は既存の規則で載り、carried.json はプロンプトを変えない。
         self.assertEqual(self.read_json(directory / 'findings.json')['findings'], [])
         self.call('prompts', directory / 'iter-1')
         prompt = (directory / 'iter-1/claude.prompt.md').read_bytes()
+        self.assertIn('## 異議を出してよい方針', prompt.decode())
         self.assertIn('出所: 前回の実行', prompt.decode())
         self.assertNotIn('再報告しない基準', prompt.decode())
-        (directory / 'carried.json').unlink()
-        self.call('prompts', directory / 'iter-1')
-        self.assertEqual((directory / 'iter-1/claude.prompt.md').read_bytes(), prompt)
+        self.assertNotIn('\nP1 ', prompt.decode())
+        self.assertIn('\nP2 b.txt:1 不備2 理由: 誤検知', prompt.decode())
+        self.assertIn('\nP3 c.txt:1 不備3 理由: 別の変更で扱う', prompt.decode())
         # 写しの tree がなければ判定しない。
         meta = self.read_json(source / 'carry-meta.json')
         self.write_json(source / 'carry-meta.json', dict(meta, tree=None))
@@ -4734,7 +5080,7 @@ sys.exit(mr.main())
         self.call('init', self.root / 'standing-only', '--cwd', self.repo)
         (self.repo / 'a.txt').write_text('new before decision limit check\n')
         before = self.git('count-objects')
-        rejected(f'{source / "decisions.json"}[1]: ', source.relative_to(self.repo))
+        rejected(f'{source / "decisions.json"}: decisions section is', source.relative_to(self.repo))
         self.assertIn('remove --carry-from', self.last_stderr)
         self.assertEqual(self.git('count-objects'), before)
         standing.unlink()
@@ -4815,7 +5161,7 @@ sys.exit(mr.main())
             self.assertEqual([(d['body'], d['sources']) for d in self.read_json(directory / 'decisions.json')['decisions']],
                              [('表示文言は各解析器が出す', ['carried']), ('別の変更で扱う指摘は保留する', ['carried'])])
             self.call('snapshot', directory / 'iter-1')
-            (self.repo / 'a.txt').write_text(f'fixed in run-{generation}\n')
+            (self.repo / 'unrelated.txt').write_text(f'fixed in run-{generation}\n')
             self.call('fixdiff', directory / 'iter-1')
             target = self.archive_dir(f'2026010{generation}-000000')
             self.call('archive', directory, '--to', target)
@@ -4835,6 +5181,33 @@ sys.exit(mr.main())
         self.assertEqual(result['carried']['skipped']['generation'], 3)
         self.assertEqual(self.read_json(directory / 'carried.json')['skipped']['generation'], 3)
         self.assertEqual((result['carried']['rejected'], result['carried']['onHold']), (0, 0))
+
+    def test_carry_from_skips_changed_and_unknown_findings_from_earlier_generations(self):
+        source = self.carry_source()
+        (self.repo / 'a.txt').write_text('changed after archive\n')
+        (self.repo / 'd.txt').write_text('new file\n')
+        directory, _ = self.carry(source)
+        path = directory / 'carried.json'
+        value = self.read_json(path)
+        self.assertIs(value['findings'][0]['changed'], True)
+        value['findings'][1]['changed'] = None
+        # changed 件数がない旧版の写しも読み込む。
+        del value['skipped']['changed']
+        self.write_json(path, value)
+        incoming = self.root / 'new-finding.json'
+        self.write_json(incoming, self.finding(file='d.txt', line=1))
+        ids = self.call('ledger', directory, 'add', '--input', incoming)['ids']
+        self.call('ledger', directory, 'reject', *ids, '--reason', '今回の却下')
+        self.call('snapshot', directory / 'iter-1')
+        self.call('fixdiff', directory / 'iter-1')
+        target = self.archive_dir('previous-generation')
+        self.call('archive', directory, '--to', target)
+        next_run, result = self.carry(target, name='next-generation')
+        carried = self.read_json(next_run / 'carried.json')
+        self.assertEqual(result['carried']['skipped']['changed'], 2)
+        self.assertEqual(carried['skipped'], result['carried']['skipped'])
+        self.assertEqual({(item['file'], item['generation'], item['changed']) for item in carried['findings']},
+                         {('c.txt', 2, False), ('d.txt', 1, False)})
 
     def test_carry_from_init_save_failures(self):
         source = self.carry_source()
@@ -4908,10 +5281,17 @@ sys.exit(mr.main())
         target = self.archive_dir('validated')
         meta = source / 'carry-meta.json'
         self.write_json(meta, dict(self.read_json(meta), carried=True))
-        for name, invalid in [(name, dict(carried, findings=items)) for name, items in cases.items()] + [
-                ('boolean version', dict(carried, version=True))]:
+        skipped = carried['skipped']
+        invalid_states = [
+            ('boolean version', dict(carried, version=True)),
+            ('missing skipped key', dict(carried, skipped={k: v for k, v in skipped.items() if k != 'generation'})),
+            ('extra skipped key', dict(carried, skipped=dict(skipped, extra=0))),
+            ('negative changed count', dict(carried, skipped=dict(skipped, changed=-1))),
+        ]
+        for name, invalid, message in [
+                *((name, dict(carried, findings=items), 'invalid carried finding') for name, items in cases.items()),
+                *((name, state, 'invalid carried findings') for name, state in invalid_states)]:
             with self.subTest(name=name):
-                message = 'invalid carried findings' if name == 'boolean version' else 'invalid carried finding'
                 path = directory / 'carried.json'
                 self.write_json(path, invalid)
                 self.call('archive', directory, '--to', target, code=1)
@@ -4960,15 +5340,29 @@ sys.exit(mr.main())
                 self.assertEqual([(i['file'], i['changed']) for i in findings],
                                  [('a.txt', changed), ('./a.txt', changed)])
 
+    def test_carry_from_compares_other_files_and_preserves_unknown(self):
+        source = self.carry_source()
+        for file, problem in [
+                (str(self.repo / 'a.txt'), '同じ不備（他: sub/../b.txt:1、unknown.txt:1）'),
+                ('sub/../c.txt', '別の不備（他: unknown.txt:1）')]:
+            ids = self.add(file=file, line=1, problem=problem)['ids']
+            self.call('ledger', self.run, 'reject', *ids, '--reason', '誤検知')
+        self.call('archive', self.run, '--to', source)
+        (self.repo / 'b.txt').write_text('changed after archive\n')
+        directory, _ = self.carry(source)
+        findings = self.read_json(directory / 'carried.json')['findings']
+        self.assertEqual([(item['file'], item['changed']) for item in findings if item['originalId'] in ('F7', 'F8')],
+                         [(str(self.repo / 'a.txt'), True), ('sub/../c.txt', None)])
+
     def test_carry_from_merges_origins_and_orders_ids(self):
         source = self.carry_source()
         directory, _ = self.carry(source)
         carried = self.read_json(directory / 'carried.json')
-        first = carried['findings'][0]
+        untouched = carried['findings'][1]
         carried['findings'] = [
-            dict(first, id='P1', reviewId='z-review', originalId='F1'),
-            dict(first, id='P2', reviewId='a-review', originalId='F10'),
-            dict(first, id='P3', reviewId='a-review', originalId='F2', reason='過去の理由'),
+            dict(untouched, id='P1', reviewId='z-review', originalId='F1'),
+            dict(untouched, id='P2', reviewId='a-review', originalId='F10'),
+            dict(untouched, id='P3', reviewId='a-review', originalId='F2', reason='過去の理由'),
         ]
         self.write_json(self.run / 'carried.json', carried)
         (self.repo / 'new.txt').write_text('new\n')
@@ -5347,8 +5741,12 @@ else:
         self.add()
         self.call('ledger', self.run, 'reject', 'F1', '--reason', '却下')
         self.add_decisions(self.decision(findingIds=['F1']))
+        carried_path, carried = self.write_carried_pair()
+        carried['findings'][0]['changed'] = None
+        self.write_json(carried_path, carried)
         plan = self.call('prompts', self.iter, '--confirm')
         confirm_docs = docs.split('## 確認レビュー（Step 7）', 1)[1].split('\n## ', 1)[0]
+        carry_docs = docs.split('## 引き継ぎ `mr init --carry-from`（Step 2）', 1)[1].split('\n## ', 1)[0]
         self.assertIn(mr.CONFIRM_REJECTED_HEADING, confirm_docs)
         for job in plan['reviewers']:
             if not job['source'].endswith('-general'):
@@ -5358,6 +5756,18 @@ else:
             heading, description, _ = section.split('\n\n', 2)
             self.assertIn(heading.removeprefix('## '), confirm_docs)
             self.assertIn(description, confirm_docs)
+            for status in ('保留済み', '却下済み'):
+                carried_heading = re.search(rf'^前回までの実行で{status}.*$', text, re.M)
+                self.assertIsNotNone(carried_heading)
+                self.assertIn('『' + carried_heading[0] + '』', carry_docs)
+            note = re.search(r'^P1 .*前回の理由(（.+）)$', text, re.M)
+            self.assertIsNotNone(note)
+            self.assertIn('「' + note[1] + '」', carry_docs)
+        carried['findings'][0]['reason'] += 'x' * 8192
+        self.write_json(carried_path, carried)
+        job = self.call('prompts', self.iter, '--confirm')['reviewers'][0]
+        overflow = Path(job['prompt']).read_text().splitlines()[-1]
+        self.assertIn('「' + overflow.replace(' 2 件', ' N 件') + '」', carry_docs)
         self.assertEqual(int(re.search(r'`--max-bytes` の既定は(\d+) bytes', docs)[1]), mr.INVENTORY_MAX_BYTES)
         self.assertEqual(int(re.search(r'値は(\d+)文字', docs)[1]), mr.INVENTORY_VALUE_CHARS)
         self.assertEqual(int(re.search(r'シグネチャ・名前は(\d+)文字', docs)[1]), mr.INVENTORY_SIGNATURE_CHARS)
