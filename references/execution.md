@@ -10,7 +10,7 @@
 | コマンド・引数 | 入出力・契約 |
 | --- | --- |
 | `mr init R --cwd PATH [--path PATH]... [--profile default\|codex] [--roles SLUG,...] [--exclude REVIEWER]... [--only REVIEWER]... [--ja-review] [--ja-skill PATH] [--base-summary TEXT] [--no-standing-decisions] [--carry-from DIR]` | `run.json`、空の `findings.json`・`ledger.md`、`iter-1/`。常設の決定事項を取り込む（停止は `--no-standing-decisions`、「決定事項」を参照）。`--carry-from` は写しから前回の却下・保留と決定事項を取り込む（「引き継ぎ」を参照）。対象省略なら未コミット変更→デフォルトブランチとの差分。デフォルトブランチは origin/HEAD→main→master。空範囲・未検出・非 git の対象省略・複数リポジトリは中断。`--cwd` は必須、パスはそこから解釈する。`REVIEWER` は `claude`・`codex`・`agy`・`ja-review` のいずれかで、`agy` は総合だけを指す。対象の1行要約は `--base-summary` で保存し、省略時はブランチ名・比較元または指定パス・ファイル数を使う |
-| `mr prompts I [--confirm] [--roles SLUG,...] [--reconsider F1,F2,...] [--ja-review\|--no-ja-review]` | 正本から `*.prompt.md`、`target.json`、`prompts.json` を生成。巨大差分は `target.diff`。次のイテレーションの準備と台帳の iteration 更新も担当。役割変更・再評価・ja-review 実行の判断を引数で渡す。ja-review の指定を省略したときの既定は「レビュアー実行と収集」を参照。確認時の契約は「確認レビュー」を参照 |
+| `mr prompts I [--confirm] [--roles SLUG,...] [--reconsider F1,F2,...] [--ja-review\|--no-ja-review]` | 正本から `*.prompt.md`、`target.json`、`prompts.json` を生成。巨大差分は `target.diff`。引き継ぎの掲載件数は「引き継ぎ」を参照。次のイテレーションの準備と台帳の iteration 更新も担当。役割変更・再評価・ja-review 実行の判断を引数で渡す。ja-review の指定を省略したときの既定は「レビュアー実行と収集」を参照。確認時の契約は「確認レビュー」を参照 |
 | `mr review I` | 呼び出し元がバックグラウンドで起動する。mr は全レビュアーの完了まで待つ。同時実行は最大8ジョブ。生成済みプロンプトで並列実行し、既存名の出力・試行別 stdout/stderr・`review.json` を保存。全レビュアー失敗なら終了1。一部欠席は結果に残して続行 |
 | `mr collect I` | 完了した成功出力だけを解析し、位置順の `collected.json`・`collected.md` を生成。意味による重複統合・選別・台帳登録はしない |
 | `mr snapshot I` | `snapshot.mode` と `snapshot.tree` または `snapshot.files`・`snapshot/`。保存済み基準の取り直しは拒否 |
@@ -215,7 +215,9 @@ init の stdout は run.json のキー（取り込みがあれば `decisionSeque
 
 前回の決定事項のうち出所のない決定と、出所に `carried` を含む決定を、`findingIds` を外して `sources: ["carried"]`（出所の表示は「決定事項」を参照）で取り込む。出所が常設だけの決定は取り込まず、今回の常設の取り込みに任せる（`--no-standing-decisions` でも取り込まない）。常設と同じ内容は常設の取り込みと同じく1件にまとめる。上限を超えたら終了1とする。常設の決定だけで超える場合は常設ファイルのパスを示し、引き継ぎ分を加えたときだけ超える場合は写しのパスと、`--carry-from` を外せば始められることを示す。init の stdout には `carried`（`from`・`rejected`・`onHold`・`skipped`・`unresolvedNotCarried`・取り込んだ決定事項の件数 `decisions`）を加え、`--carry-from` がなければ出さない。
 
-`mr prompts` は iter-1 から、対象本文と今回の台帳の節に続けて『前回までの実行で保留済み（検討済みのため再報告不要）:』『前回までの実行で却下済み（同じ内容は再報告不要。却下の理由が誤っている具体例を示せる場合だけ、「問題:」欄に指摘 ID と具体例（入力・手順・結果）を書いて再指摘してよい）:』の順に載せ、その後に前回の修正概要を置く。行は `P1 path:line 問題 理由: 理由` の形式とする。`changed` が false なら状態に応じた節に載せ、true なら一覧に載せない。null なら却下だけを載せ、行末に「（ファイルの変更は判定不能）」を付ける。通常の iter-2 以降と確認回では、それまでの各回の `fix.diff` が代表位置か「他:」に列挙された位置のファイルに触れていれば、その項目も一覧から外す。空の節は省く。2節の合計が見出しを含め UTF-8 で8192 bytesを超えたら、一覧の代わりに「前回までの実行から引き継いだ指摘 N 件は、一覧が上限を超えるため載せていない。」を出す。ja-review と統計にはこの一覧を渡さない。不正な `carried.json` やリンクは成果物を失効させる前にパス付きで診断し、終了1とする。
+`mr prompts` は iter-1 から、対象本文と今回の台帳の節に続けて『前回までの実行で保留済み（検討済みのため再報告不要）:』『前回までの実行で却下済み（同じ内容は再報告不要。却下の理由が誤っている具体例を示せる場合だけ、「問題:」欄に指摘 ID と具体例（入力・手順・結果）を書いて再指摘してよい）:』の順に載せ、その後に前回の修正概要を置く。行は `P1 path:line 問題 理由: 理由` の形式とする。`changed` が false なら状態に応じた節に載せ、true なら一覧に載せない。null なら却下だけを載せ、行末に「（ファイルの変更は判定不能）」を付ける。通常の iter-2 以降と確認回では、それまでの各回の `fix.diff` が代表位置か「他:」に列挙された位置のファイルに触れていれば、その項目も一覧から外す。空の節は省く。2節の合計が見出しを含め UTF-8 で8192 bytesを超えたら、一覧の代わりに「前回までの実行から引き継いだ指摘 N 件は、一覧が上限を超えるため載せていない。」を出す。ja-review にはこの一覧を渡さない。不正な `carried.json` やリンクは成果物を失効させる前にパス付きで診断し、終了1とする。
+
+`carried.json` がある回の `prompts.json` と stdout には、生成時点の `carried` を記録する。`from` は取り込み元の reviewId、`rejected`・`onHold` は却下・保留の件数、`shown` は一覧への掲載件数、`omitted` は `rejected + onHold - shown`。上限超過で注記を出した回と、実行可能なジョブが ja-review だけの回は `shown` が0になる。通常・確認レビューの総合・専門ジョブに共通する一覧は、agy 総合を含め、レビュアー数にかかわらず指摘ごとに1件と数える。
 
 出所に `carried` を含む policy は、通常の iter-1 では通常の決定事項の後に「異議を出してよい方針」として載せる。確認回の振り分けと固定指示は「確認レビュー」を参照。通常の iter-2 以降は「決定事項」に載せる。
 
@@ -237,7 +239,7 @@ prompts.json とstdoutの `confirm` は確認ならtrue、通常ならfalse。re
 
 ## ゲート `mr gate`（Step 7）
 
-`mr gate I` は結果が決まった全分岐で `${XDG_DATA_HOME:-$HOME/.local/share}/multi-review/runs.jsonl` に JSON を1行追記する。XDG_DATA_HOME が未設定・空文字・相対パスなら `$HOME/.local/share` を使う。HOME が空文字、または絶対パスで決められない場合は解決不能として statsError にする。結果を決めてから統計を追記し、`statsPath` または `statsError` を加えた `gate.json` を1回だけ保存する。追記後に gate.json の保存に失敗した場合は統計の行が残る。同じ I の再実行でも追記し、読む側は最後の行を使う。`MR_NO_STATS=1` で記録と保存先の探索を止める。
+`mr gate I` は結果が決まった全分岐で `${XDG_DATA_HOME:-$HOME/.local/share}/multi-review/runs.jsonl` に JSON を1行追記する。XDG_DATA_HOME が未設定・空文字・相対パスなら `$HOME/.local/share` を使う。HOME が空文字、または絶対パスで決められない場合は解決不能として statsError にする。結果を決めてから統計を追記し、`statsPath` または `statsError` を加えた `gate.json` を1回だけ保存する。追記後に gate.json の保存に失敗した場合は統計の行が残る。同じ I の再実行でも追記し、読む側は最後の行を使う。`MR_NO_STATS=1` で統計用の読み込み、保存先の探索、追記を止める。
 
 | 統計の項目 | 内容 |
 | --- | --- |
@@ -248,7 +250,10 @@ prompts.json とstdoutの `confirm` は確認ならtrue、通常ならfalse。re
 | `fixDiff` | `additions`・`deletions` はハンク本文の追加・削除行数。ファイル見出しは除く。`empty` は fix.diff が空かどうか。バイナリ変更などは追加・削除の行数がともに0でも空とは限らない |
 | `rules` | `status`・`candidates`。候補数は生出力の JSON の summary.violations または Markdown 末尾の件数から取得し、取得不能なら null |
 | `gate` | `status`・`next`・`reason`・`verdict`・`verdictReason`・`oversized`。verdict 関連の未提供値は null |
-| `decisions` | `policy`・`triage`・`withSources` の件数。出所が複数あっても1決定は1件 |
+| `decisions` | `policy`・`triage`・`withSources` の件数。`carried` が null でなければ、出所が `["carried"]` の決定を除く。常設と併合した決定はここでも `carried.decisions` でも1件。`carried` キーのない旧統計行の `decisions` には、引き継ぎだけに由来する決定も含まれる。 |
+| `carried` | prompts.json が記録した `from`・`rejected`・`onHold`・`shown`・`omitted` と、ゲート時に出所に `carried` を含む決定の件数 `decisions`。掲載記録がなければ `from` と状態別件数を現在の carried.json から取得し、`shown`・`omitted` は null。どちらの記録もなければ `carried` は null。旧統計行でのキー欠落は未記録 |
+
+掲載記録は件数がすべて非負の整数で、`rejected + onHold` と `shown + omitted` が一致し、`from` が現在の carried.json と一致する場合に使う。生成後に指摘を削除しても、次に生成するまで統計は保存済みの件数を使う。掲載記録が不正な場合や対応する carried.json が失われた場合は `statsError` とする。
 
 台帳は必須とし、決定事項がなければ0件とする。それ以外の成果物がなければその集計項目は null、有効な空配列は0件とする。fix.diff は近傍判定と同じ読み方で集計する。壊れた集計入力や保存先の解決・作成・書き込み失敗では追記せず、stdout と gate.json に英語の `statsError` を入れる。書き込めたバイト数が足りないときはエラーとし、部分行が残る場合がある。統計の失敗ではゲートの終了コードと next を変えない。成功時は `statsPath` に追記先を返す。古い I の再実行では現存する台帳・決定事項を使い、成果物の鮮度は判定しない。run.json 不正・不正な I・既存ロックの競合など、handler に到達しない失敗では記録しない。
 

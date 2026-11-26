@@ -1154,6 +1154,11 @@ def load_carried(directory):
         raise Failure(display_path(str(path)) + ': ' + str(error)) from error
 
 
+def carried_counts(findings):
+    return {'rejected': sum(i['status'] == 'rejected' for i in findings),
+            'onHold': sum(i['status'] == 'on_hold' for i in findings)}
+
+
 def carried_action(args, root, run):
     value = load_carried(root)
     require(value is not None, display_path(str(root / CARRIED_FILE)) + ': carried file not found')
@@ -1166,8 +1171,7 @@ def carried_action(args, root, run):
         ids = [item['id'] for item in findings if item['id'] in requested]
         findings = [item for item in findings if item['id'] not in requested]
         save_json(root / CARRIED_FILE, validate_carried(dict(value, findings=findings)))
-    return {'ids': ids, 'rejected': sum(i['status'] == 'rejected' for i in findings),
-            'onHold': sum(i['status'] == 'on_hold' for i in findings)}
+    return {'ids': ids, **carried_counts(findings)}
 
 
 def carried_path(cwd, name):
@@ -1292,8 +1296,7 @@ def carry_from(source, run, value, ledger):
     unresolved = sum(item['status'] == 'unresolved' for item in previous['findings'])
     data = {'version': CARRIED_VERSION, 'from': meta['reviewId'], 'tree': meta['tree'], 'findings': findings,
             'skipped': skipped, 'unresolvedNotCarried': unresolved}
-    summary = {'from': meta['reviewId'], 'rejected': sum(i['status'] == 'rejected' for i in findings),
-               'onHold': sum(i['status'] == 'on_hold' for i in findings), 'skipped': skipped,
+    summary = {'from': meta['reviewId'], **carried_counts(findings), 'skipped': skipped,
                'unresolvedNotCarried': unresolved, 'decisions': len(ids)}
     return data, summary
 
@@ -1667,10 +1670,11 @@ def prompt_carried(cwd, carried, touched):
     if rejected:
         sections.append(CARRIED_REJECTED_HEADING + '\n' + prompt_finding_lines(rejected, ('rejected',)))
     text = '\n'.join(sections)
+    shown = len(held) + len(rejected)
     if len(text.encode('utf-8')) > CARRIED_PROMPT_MAX_BYTES:
         # 一覧がなくてもレビューは成立し、再報告が増えるだけなので件数を示して続ける。
-        return f'前回までの実行から引き継いだ指摘 {len(held) + len(rejected)} 件は、一覧が上限を超えるため載せていない。'
-    return text
+        return f'前回までの実行から引き継いだ指摘 {shown} 件は、一覧が上限を超えるため載せていない。', 0
+    return text, shown
 
 
 def prompt_target(directory, run, ledger, iteration, files, reconsider, fixes=(), confirm=False, carried=''):
@@ -1769,7 +1773,7 @@ def prompts(args, root, run):
     touched = set()
     files, extra_files, fixes = iteration_files(directory, run, iteration,
                                                touched=touched if carried and carried['findings'] else None)
-    carried_text = prompt_carried(Path(run['cwd']), carried, touched)
+    carried_text, shown = prompt_carried(Path(run['cwd']), carried, touched)
     if ja_review and 'ja-review' not in run['excluded']:
         ja_decisions = bounded_decisions_markdown(value, iteration, field='理由', reconsider=reconsider)
         cwd = Path(run['cwd'])
@@ -1800,12 +1804,21 @@ def prompts(args, root, run):
     if ja_review and 'ja-review' not in run['excluded']:
         jobs.extend(ja_batches(directory, run, files, ranges, ja_decisions))
     require(jobs, 'no reviewer selected')
-    require(any(shutil.which(job['cli']) for job in jobs), 'no installed reviewer selected')
+    installed = [job for job in jobs if shutil.which(job['cli'])]
+    require(installed, 'no installed reviewer selected')
     originals = {root / name: (root / name).read_bytes() for name in (LEDGER_FILE, RUN_FILE)}
     ledger['iteration'] = iteration
     if args.confirm:
         run['confirmIterations'] = sorted({*confirms, iteration})
     result = {'cwd': run['cwd'], 'iteration': iteration, 'confirm': args.confirm, 'reviewers': jobs}
+    if carried is not None:
+        counts = carried_counts(carried['findings'])
+        # jobs には欠席報告のため未導入のジョブも残すので、生成時点で実行できる installed で判定する。
+        # ja-review のプロンプトには一覧を載せないため、起動できるのが ja-review だけなら掲載は0件。
+        if all(is_ja_review(job) for job in installed):
+            shown = 0
+        result['carried'] = {'from': carried['from'], **counts, 'shown': shown,
+                             'omitted': counts['rejected'] + counts['onHold'] - shown}
     try:
         save_json(root / LEDGER_FILE, validate_ledger(ledger))
         save_json(root / RUN_FILE, run)
@@ -2355,6 +2368,25 @@ def ledger_counts(ledger):
     return {state: sum(i['status'] == state for i in ledger['findings']) for state in STATES}
 
 
+def load_carried_stats(root, directory, prompts):
+    carried = load_carried(root)
+    # prompts.json がないか、旧版が作った prompts.json に carried がない場合は、
+    # 現在の carried.json から状態別件数だけを取り、掲載・非掲載は不明として扱う。
+    if 'carried' not in prompts:
+        if carried is None:
+            return None
+        return {'from': carried['from'], **carried_counts(carried['findings']), 'shown': None, 'omitted': None}
+    require(carried is not None, display_path(str(root / CARRIED_FILE)) + ': carried file not found')
+    record = prompts['carried']
+    counts = ('rejected', 'onHold', 'shown', 'omitted')
+    # mr carried remove で現在の件数が変わっても、統計には生成時点の件数を残す。
+    require(isinstance(record, dict) and record.get('from') == carried['from'] and
+            all(type(record.get(key)) is int and record[key] >= 0 for key in counts) and
+            record['rejected'] + record['onHold'] == record['shown'] + record['omitted'],
+            display_path(str(directory / 'prompts.json')) + ': invalid carried stats')
+    return {key: record[key] for key in ('from', *counts)}
+
+
 def run_stats(root, directory, run, output):
     iteration = iteration_number(directory)
     result = dict(reviewId=root.name, cwd=run['cwd'], mode=run['mode'], profile=run['profile'],
@@ -2392,8 +2424,16 @@ def run_stats(root, directory, run, output):
                                   bySource=dict(Counter(i['source'] for i in findings)))
     result['ledger'] = ledger_counts(ledger)
     result['ledger']['fixedThisIteration'] = sum(i.get('fixedIteration') == iteration for i in ledger['findings'])
-    result['decisions'] = {kind: sum(i['type'] == kind for i in decisions['decisions']) for kind in DECISION_TYPES}
-    result['decisions']['withSources'] = sum(bool(i.get('sources')) for i in decisions['decisions'])
+    carried = load_carried_stats(root, directory, values['prompts'] or {})
+    local_decisions = decisions['decisions']
+    # carried が null の回は carried.decisions に数える先がないため、引き継いだ決定も decisions に残す。
+    if carried is not None:
+        carried['decisions'] = sum('carried' in i.get('sources', []) for i in local_decisions)
+        # 常設と併合した決定は今回の常設にも由来するため、両方に1件ずつ数える。
+        local_decisions = [i for i in local_decisions if i.get('sources') != ['carried']]
+    result['carried'] = carried
+    result['decisions'] = {kind: sum(i['type'] == kind for i in local_decisions) for kind in DECISION_TYPES}
+    result['decisions']['withSources'] = sum(bool(i.get('sources')) for i in local_decisions)
     rules = values['rules']
     if rules is not None:
         require(isinstance(rules.get('status'), str) and rules['status'] in
