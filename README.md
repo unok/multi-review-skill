@@ -1,6 +1,6 @@
 # multi-review-skill
 
-Claude Code と Codex の両方から使うスキル。claude（総合＝Opus 5.5 medium、専門役割＝Opus 5.5 high）と codex（総合＝gpt-6.2-sol medium）に並列でコードレビューを依頼し、呼び出し元が指摘を選別して修正を指揮し、未解決の妥当な指摘がなくなるまで再レビューを繰り返す。`--profile codex` で総合の claude 枠を Opus 5.5 high、専門役割を codex（gpt-6.2-sol high）に切り替えられる。
+Claude Code と Codex の両方から使うスキル。claude（総合＝Opus 5.5 medium、専門役割＝Opus 5.5 high）と codex（総合＝gpt-6.2-sol medium）に並列でコードレビューを依頼し、導入済みなら agy の総合（`gemini-4-neon-medium`）を加える。呼び出し元が指摘を選別して修正を指揮し、未解決の妥当な指摘がなくなるまで再レビューを繰り返す。`--profile codex` で総合の claude 枠を Opus 5.5 high、専門役割を codex（gpt-6.2-sol high）に切り替えられる。
 
 レビュアーは指摘を出すだけで、妥当性の判定はスキルを実行するメインセッションが行う。却下した指摘は理由付きで台帳に記録し、再レビュー時にレビュアーへ提示するため、同じ誤検知でループが空回りしない。本スキルの手順書自体を multi-review で9イテレーション・セルフレビューし、99件の修正を経て全レビュアー「問題なし」まで収束させて検証した。
 
@@ -11,7 +11,7 @@ Claude Code と Codex の両方から使うスキル。claude（総合＝Opus 5.
 - Claude Code または Codex（実行主体）
 - レビュアー CLI（認証済みであること）: [codex](https://github.com/openai/codex) と claude
 
-一部の CLI がなくても動く。未インストールのレビュアーは欠席として最終レポートに記録される。
+agy（Antigravity CLI）は任意で、未導入なら構成に入らない。agy の総合を使う前に、対話モードの `agy` で一度認証しておく。未導入の claude・codex の総合は欠席として最終レポートに記録する。
 
 TypeScript の解析は `createSourceFile` を持つコンパイラ API 版（TypeScript 5.x・6.x）と、7.x のネイティブ API 版に対応する。対象ソースは実行しないが、対象プロジェクトの typescript パッケージは実行するため、利用者が入れた依存を信頼する前提で使う。
 
@@ -33,8 +33,8 @@ Claude Code では `/multi-review` または「複眼レビューして」、Cod
 
 - 引数なし: git の未コミット変更を対象にする。なければデフォルトブランチとの差分
 - パス指定: `/multi-review src/billing` のようにディレクトリ・ファイルを対象にできる
-- レビュアーの除外・限定: 「codex 抜きで」「claude だけで」。指定した CLI の全役割に適用
-- モデル構成: `$multi-review --profile codex`（パスとの併用例: `$multi-review --profile codex src/billing`）。省略時と `--profile default` は従来構成で、呼び出し元による自動切り替えはしない
+- レビュアーの除外・限定: 「codex 抜きで」「claude だけで」。「agy 抜きで」は agy の総合を外し、「agy と ja-review 抜きで」は日本語校閲も外す
+- モデル構成: `$multi-review --profile codex`（パスとの併用例: `$multi-review --profile codex src/billing`）。省略時は呼び出し元によらず `default` を使う
 
 1イテレーションは、レビュアー並列起動 → 選別（修正方針サマリを表示）→ 修正サブエージェントへの委譲 → diff 照合と品質チェック → 再レビューの順に進む。上限は5イテレーションで、到達時は残存指摘を報告して停止する。
 

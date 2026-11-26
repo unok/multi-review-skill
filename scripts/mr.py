@@ -107,7 +107,8 @@ JA_EXCLUDED_DIRS = ('dist', 'build')
 JA_EXCLUDED_FILES = ('pnpm-lock.yaml', 'package-lock.json', 'npm-shrinkwrap.json', 'yarn.lock', 'bun.lockb')
 JA_TEXT = re.compile(r'[\u3040-\u30ff\u4e00-\u9fff]')
 SPAN_SEPARATOR = ', '
-REVIEWERS = ('claude', 'codex', 'ja-review')
+REVIEWERS = ('claude', 'codex', 'agy', 'ja-review')
+REVIEWER_SELECTION_VERSION = 1
 SEVERITIES = {'high': '高', 'medium': '中', 'low': '低'}
 NEXT = {name: name for name in ('finish', 'limit', 'rereview', 'abort', 'caller_decision', 'awaiting_instruction')}
 INVALIDATE_BEFORE_LOAD = {'inventory'}
@@ -126,10 +127,12 @@ DIFF_HUNK = re.compile(r'@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@.*')
 JOB_MODELS = {
     'default': {'claude': {'general': ('claude-opus-5-5', 'medium'),
                            'specialist': ('claude-opus-5-5', 'high')},
-                'codex': {'general': ('gpt-6.2-sol', 'medium')}},
+                'codex': {'general': ('gpt-6.2-sol', 'medium')},
+                'agy': {'general': ('gemini-4-neon-medium', None)}},
     'codex': {'claude': {'general': ('claude-opus-5-5', 'high')},
               'codex': {'general': ('gpt-6.2-sol', 'medium'),
-                        'specialist': ('gpt-6.2-sol', 'high')}},
+                        'specialist': ('gpt-6.2-sol', 'high')},
+              'agy': {'general': ('gemini-4-neon-medium', None)}},
     # Model copied from ~/.claude/skills/ja-review/SKILL.md, 2026-11-10.
     'ja-review': {'agy': {'general': ('gemini-3.8-flash-high', None)}},
 }
@@ -202,6 +205,10 @@ def load_run(root):
             all(nonempty(k) and nonempty(v) for k, v in run.get('imports', {}).items()),
             'invalid run state')
     role_list(','.join(run['roles']))
+    # 旧版が作った run.json にはこのキーがないため、版 0（従来のレビュアー構成）として扱う。
+    selection_version = run.get('reviewerSelectionVersion', 0)
+    require(type(selection_version) is int and selection_version in (0, REVIEWER_SELECTION_VERSION),
+            'invalid run state')
     # 旧版が作った run.json にはこのキーがないため、空配列として扱う。
     confirms = run.get('confirmIterations', [])
     require(isinstance(confirms, list) and len(confirms) <= MAX_CONFIRM_REVIEWS and
@@ -233,6 +240,7 @@ def load_review_state(directory, filename):
     for job in state['reviewers']:
         require(isinstance(job, dict) and
                 all(nonempty(job.get(key)) for key in ('cli', 'source', 'model', 'prompt', 'output')) and
+                (not is_ja_review(job) or job['cli'] == 'agy') and
                 (nonempty(job.get('effort')) or job['cli'] == 'agy' and job.get('effort') is None) and
                 type(job.get('timeout')) in (int, float) and job['timeout'] > 0 and math.isfinite(job['timeout']),
                 'invalid ' + filename + ' reviewer')
@@ -1037,6 +1045,7 @@ def init(args, root, run):
         excluded.update(set(REVIEWERS) - set(args.only))
     run = {'cwd': str(cwd), 'git': is_git, 'paths': paths, 'mode': mode, 'base': base,
            'profile': args.profile, 'roles': roles, 'excluded': sorted(excluded),
+           'reviewerSelectionVersion': REVIEWER_SELECTION_VERSION,
            'jaReview': args.ja_review, 'jaSkill': str(args.ja_skill.expanduser().resolve()),
            'diffBudget': args.diff_budget, 'timeout': args.timeout, 'jaTimeout': args.ja_timeout,
            'taskSequence': 0, 'tasks': {}, 'confirmIterations': []}
@@ -1047,8 +1056,11 @@ def init(args, root, run):
         branch = os.fsdecode(branch_result.stdout).strip() or 'detached HEAD'
     scope = ', '.join(map(display_path, paths)) if paths else base_name if mode == 'base' else 'HEAD'
     run['baseSummary'] = args.base_summary or f'{mode}: {branch}, {scope}; {len(scope_files(run))} files'
-    enabled = set(REVIEWERS) if args.ja_review else set(REVIEWERS) - {'ja-review'}
-    require(enabled - excluded, 'all reviewers excluded')
+    selected = set(REVIEWERS) - excluded
+    if not args.ja_review:
+        selected.discard('ja-review')
+    require(selected, 'all reviewers excluded')
+    require(selected - {'agy', 'ja-review'} or shutil.which('agy'), 'agy not installed')
     ledger = {'reviewId': root.name, 'iteration': 1, 'findings': []}
     value = {'reviewId': root.name, 'decisions': []}
     imported = standing_decisions(cwd, value, ledger, run, args.no_standing_decisions)
@@ -1690,21 +1702,29 @@ def prompt_target(directory, run, ledger, iteration, files, reconsider, fixes=()
     return target
 
 
-def review_jobs(directory, run, target, decisions=''):
+def general_clis(run):
+    clis = ['claude', 'codex']
+    # 旧版が作った run.json にはこのキーがないため、版 0（従来のレビュアー構成）として扱う。
+    if run.get('reviewerSelectionVersion', 0) == REVIEWER_SELECTION_VERSION and shutil.which('agy'):
+        clis.append('agy')
+    return [cli for cli in clis if cli not in run['excluded']]
+
+
+def review_jobs(directory, run, clis, target, decisions=''):
     roles = role_texts()
     common = report_format()
     jobs = []
     specialist_cli = next(cli for cli, models in JOB_MODELS[run['profile']].items() if 'specialist' in models)
-    specs = [('claude', 'general'), ('codex', 'general')]
+    specs = [(cli, 'general') for cli in clis]
     # SKILL.md Step 3 selects no specialist roles when their CLI is absent.
     if specialist_cli not in run['excluded'] and shutil.which(specialist_cli):
         specs.extend((specialist_cli, role) for role in run['roles'])
     for cli, role in specs:
-        if cli in run['excluded']:
-            continue
-        stem = 'claude' if cli == 'claude' and role == 'general' else 'role-' + role
+        stem = {'claude': 'claude', 'agy': 'agy-general'}.get(cli, 'role-general') if role == 'general' else 'role-' + role
         prompt = directory / (stem + '.prompt.md')
-        write_atomic(prompt, roles[role] + '\n\n' + common + '\n\n' +
+        # 承認できないコマンドを試すと終了コード 0 で回答が空になるため、先に使えるツールを伝える。
+        prefix = 'このレビューではシェルコマンドを実行できない。ファイルの読み取りと検索のツールだけを使う。\n\n' if cli == 'agy' else ''
+        write_atomic(prompt, prefix + roles[role] + '\n\n' + common + '\n\n' +
                      (decisions + '\n' if decisions else '') + target)
         model_spec = JOB_MODELS[run['profile']][cli]['general' if role == 'general' else 'specialist']
         jobs.append(make_job(cli, cli + '-' + role, model_spec, prompt,
@@ -1741,9 +1761,9 @@ def prompts(args, root, run):
                                           confirm=args.confirm, rejected=rejected)
     # 2回目以降の ja-review は採用が少なく時間がかかるため、省略時は初回だけ init の設定に従う。
     # ja-review 以外のレビュアーが除外か未導入で 1 つも起動できない実行は、2回目以降にレビュアーなしで
-    # 止まらないよう init の設定に従う（claude・codex はレビュアー名と CLI 名が同じ）。
-    only_ja_review = not any(name not in run['excluded'] and shutil.which(name)
-                             for name in REVIEWERS if name != 'ja-review')
+    # 止まらないよう init の設定に従う。
+    clis = general_clis(run)
+    only_ja_review = not any(shutil.which(cli) for cli in clis)
     ja_default = run['jaReview'] and (iteration == 1 or only_ja_review)
     ja_review = not args.confirm and (ja_default if args.ja_review is None else args.ja_review)
     touched = set()
@@ -1776,7 +1796,7 @@ def prompts(args, root, run):
     # 引き継ぎ・決定事項の検証と範囲計算が済んでから既存の成果物を失効させる。
     invalidate(directory, 'prompts')
     target = prompt_target(directory, run, ledger, iteration, files, reconsider, fixes, args.confirm, carried_text)
-    jobs = review_jobs(directory, dict(run, roles=CONFIRM_SPECIALISTS) if args.confirm else run, target, decisions)
+    jobs = review_jobs(directory, dict(run, roles=CONFIRM_SPECIALISTS) if args.confirm else run, clis, target, decisions)
     if ja_review and 'ja-review' not in run['excluded']:
         jobs.extend(ja_batches(directory, run, files, ranges, ja_decisions))
     require(jobs, 'no reviewer selected')
@@ -1876,16 +1896,28 @@ def interrupt(signum, frame):
 REVIEW_CLIS = {
     'claude': {'argv': lambda job, final, prompt: [
         'claude', '-p', '--model', job['model'], '--effort', job['effort'], '--tools', 'Read,Glob,Grep'],
-        'stdin': True, 'stdout': True, 'ja_format': False, 'prompt_limit': None},
+        'stdin': True, 'stdout': True, 'prompt_limit': None},
     'codex': {'argv': lambda job, final, prompt: [
         'codex', '-m', job['model'], '-c', 'model_reasoning_effort="' + job['effort'] + '"',
         'exec', '-s', 'read-only', '--skip-git-repo-check', '-o', str(final), '-'],
-        'stdin': True, 'stdout': False, 'ja_format': False, 'prompt_limit': None},
-    # Copied agy invocation: ~/.claude/skills/ja-review/SKILL.md, 2026-11-10.
+        'stdin': True, 'stdout': False, 'prompt_limit': None},
+    # 差分を含む総合プロンプトは OS の単一引数の上限を超えうるため、非 TTY の標準入力で渡す。
     'agy': {'argv': lambda job, final, prompt: [
-        'agy', '--model', job['model'], '--mode', 'plan', '-p', prompt.decode('utf-8')],
-        'stdin': False, 'stdout': True, 'ja_format': True, 'prompt_limit': JA_BATCH_LIMIT},
+        'agy', '--model', job['model'], '--mode', 'plan', '--input-format', 'text',
+        # plan モードでも利用者が許可したコマンド・書き込み・MCP は実行されうるため、この起動に限って拒否する。
+        # 大きな差分は作業ディレクトリ外の target.diff に保存するため、イテレーションディレクトリの読み取りを許可する。
+        '--settings', json.dumps({'permissions': {'deny': ['command(*)', 'write_file(*)', 'mcp(*)'],
+                                                  'allow': [f"read_file({Path(job['prompt']).parent})"]}})],
+        'stdin': True, 'stdout': True, 'prompt_limit': None},
 }
+# Invocation copied from ~/.claude/skills/ja-review/SKILL.md, 2026-11-10.
+JA_REVIEW_CLI = {'argv': lambda job, final, prompt: [
+    'agy', '--model', job['model'], '--mode', 'plan', '-p', prompt.decode('utf-8')],
+    'stdin': False, 'stdout': True, 'prompt_limit': JA_BATCH_LIMIT}
+
+
+def is_ja_review(job):
+    return job['source'] == 'ja-review'
 
 
 def finish_process(process):
@@ -1945,7 +1977,8 @@ def review_attempt(job, cwd, output, number):
     final = attempt_path(output, number, 'md')
     final.unlink(missing_ok=True)
     prompt = Path(job['prompt']).read_bytes()
-    adapter = REVIEW_CLIS[job['cli']]
+    ja_format = is_ja_review(job)
+    adapter = JA_REVIEW_CLI if ja_format else REVIEW_CLIS[job['cli']]
     if adapter['prompt_limit'] is not None:
         require(len(prompt) <= adapter['prompt_limit'], 'ja batch exceeds limit')
     argv = adapter['argv'](job, final, prompt)
@@ -1960,7 +1993,7 @@ def review_attempt(job, cwd, output, number):
             reason = f'exit {code}'
         else:
             try:
-                parse_report(final.read_text(encoding='utf-8'), adapter['ja_format'])
+                parse_report(final.read_text(encoding='utf-8'), ja_format)
             except EXPECTED_ERRORS as error:
                 reason = str(error)
     return {'number': number, 'exitCode': code, 'reason': reason,
@@ -2004,7 +2037,7 @@ def reviewer_failures(results):
         job['status'] == 'success' for job in results if job['source'] == source))
     failed_batches = [{'output': job['output'], 'reason': job.get('reason'),
                        'attempts': job.get('attempts', [])} for job in results
-                      if REVIEW_CLIS.get(job['cli'], {}).get('ja_format') and job['status'] != 'success']
+                      if is_ja_review(job) and job['status'] != 'success']
     return {'absent': absent, 'failedBatches': failed_batches}
 
 
@@ -2055,7 +2088,7 @@ def collect(args, root, run):
         output = Path(job['output'])
         require(nonempty(job.get('outputHash')), 'missing review output hash')
         require(digest(output.read_bytes()) == job['outputHash'], 'review output changed after completion')
-        for finding in parse_report(output.read_text(encoding='utf-8'), REVIEW_CLIS[job['cli']]['ja_format']):
+        for finding in parse_report(output.read_text(encoding='utf-8'), is_ja_review(job)):
             flags = []
             for pos in finding['locations']:
                 unknown = not previous_valid or pos['line'] is None or \

@@ -15,6 +15,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from textwrap import indent
 import unittest
 
 CLI = Path(__file__).resolve().parents[1] / 'scripts/mr.py'
@@ -151,12 +152,12 @@ with patch.object(subprocess.Popen, 'communicate', communicate):
         self.assertIn('all reviewers failed', result.stderr)
         return self.read_json(self.iter / 'review.json')
 
-    def replace_review_output(self, directory, text, as_cli='claude'):
-        # Deliberately corrupt a completed report while keeping its transport integrity valid.
+    def replace_review_output(self, directory, text, source='claude-general'):
+        # 出力を書き換え、ハッシュを揃えて報告形式だけを検証する。
         review = self.read_json(directory / 'review.json')
-        job = next(j for j in review['reviewers'] if j['cli'] == 'claude')
+        job = next(j for j in review['reviewers'] if j['source'] == source)
         Path(job['output']).write_text(text)
-        job.update(cli=as_cli, outputHash=mr.digest(text.encode()))
+        job['outputHash'] = mr.digest(text.encode())
         self.write_json(directory / 'review.json', review)
 
     def fake(self, name, body):
@@ -193,17 +194,225 @@ with patch.object(subprocess.Popen, 'communicate', communicate):
         self.write_json(source, value)
         return self.call('decisions', self.run, 'add', '--input', source)
 
+    def fake_agy(self, general="print('問題なし')", ja="print('指摘なし')"):
+        self.fake('agy', f"""import json
+import sys
+from pathlib import Path
+assert Path.cwd() == Path({str(self.repo)!r})
+if sys.argv[2] == 'gemini-4-neon-medium':
+    assert sys.argv[1:-1] == ['--model', 'gemini-4-neon-medium', '--mode', 'plan', '--input-format', 'text', '--settings']
+    settings = json.loads(sys.argv[-1])
+    path, = settings['permissions']['allow']
+    assert path.startswith('read_file(') and path.endswith(')')
+    directory = Path(path[len('read_file('):-1])
+    assert directory.is_absolute() and Path({str(self.root)!r}) in directory.parents
+    assert settings == {{'permissions': {{'deny': ['command(*)', 'write_file(*)', 'mcp(*)'],
+                                         'allow': [f'read_file({{directory}})']}}}}
+    prompt = sys.stdin.buffer.read()
+    assert prompt == (directory / 'agy-general.prompt.md').read_bytes()
+    assert prompt.splitlines()[0].decode() == 'このレビューではシェルコマンドを実行できない。ファイルの読み取りと検索のツールだけを使う。'
+{indent(general, '    ')}
+    sys.exit(0)
+assert sys.argv[1:6] == ['--model', 'gemini-3.8-flash-high', '--mode', 'plan', '-p']
+assert len(sys.argv) == 7 and sys.argv[-1]
+assert sys.stdin.buffer.read() == b''
+{ja}
+""")
+
+    def test_agy_selection(self):
+        skill = self.ja_skill()
+        (self.repo / 'ja.txt').write_text('日本語\n')
+        claude, codex, agy = 'claude-general', 'codex-general', 'agy-general'
+        for index, (roles, options, expected) in enumerate([
+                ('bug-hunt', ('--profile', 'default'), [claude, codex, agy, 'claude-bug-hunt']),
+                ('test-quality', ('--profile', 'codex'), [claude, codex, agy, 'codex-test-quality']),
+                ('bug-hunt', ('--only', 'agy'), [agy]),
+                ('bug-hunt', ('--exclude', 'agy', '--ja-review'), [claude, codex, 'claude-bug-hunt', 'ja-review']),
+                ('bug-hunt', ('--exclude', 'ja-review', '--ja-review'), [claude, codex, agy, 'claude-bug-hunt']),
+                ('bug-hunt', ('--exclude', 'claude', '--exclude', 'codex'), [agy])]):
+            with self.subTest(options=options):
+                root = self.root / f'review-{index}'
+                self.call('init', root, '--cwd', self.repo, '--path', 'ja.txt',
+                          '--ja-skill', skill, '--roles', roles, *options)
+                jobs = self.call('prompts', root / 'iter-1')['reviewers']
+                self.assertEqual([job['source'] for job in jobs], expected)
+        self.call('init', self.root / 'excluded', '--cwd', self.repo, '--path', 'ja.txt',
+                  '--only', 'agy', '--exclude', 'agy', code=1)
+        self.assertIn('all reviewers excluded', self.last_stderr)
+
+    def test_agy_availability_and_legacy_run(self):
+        (self.repo / 'a.txt').write_text('変更\n')
+        self.fake_agy()
+        (self.bin / 'codex').unlink()
+        self.initialize('--path', 'a.txt', '--profile', 'codex', '--roles', 'bug-hunt')
+        jobs = self.call('prompts', self.iter)['reviewers']
+        self.assertEqual([job['source'] for job in jobs], ['claude-general', 'codex-general', 'agy-general'])
+        self.assertEqual(self.call('review', self.iter)['absent'], ['codex-general'])
+        (self.bin / 'agy').unlink()
+        result = self.call('review', self.iter)
+        self.assertEqual(result['absent'], ['agy-general', 'codex-general'])
+        job = next(job for job in result['reviewers'] if job['source'] == 'agy-general')
+        self.assertEqual((job['reason'], job['attempts']), ('not installed', []))
+        self.assertEqual(result['failedBatches'], [])
+
+        self.fake('codex', "import sys\nfrom pathlib import Path\nPath(sys.argv[sys.argv.index('-o')+1]).write_text('問題なし')")
+        self.initialize('--path', 'a.txt', '--roles', '')
+        jobs = self.call('prompts', self.iter)['reviewers']
+        self.assertEqual([job['source'] for job in jobs], ['claude-general', 'codex-general'])
+        self.assertEqual(self.call('review', self.iter)['absent'], [])
+        skill = self.ja_skill()
+        run = self.initialize('--path', 'a.txt', '--roles', '', '--ja-review', '--ja-skill', skill,
+                              '--exclude', 'claude', '--exclude', 'codex')
+        second = self.run / 'iter-2'
+        self.assertEqual([job['source'] for job in self.call('prompts', second)['reviewers']], ['agy-general'])
+        del run['reviewerSelectionVersion']
+        self.write_json(self.run / 'run.json', run)
+        self.assertEqual([job['source'] for job in self.call('prompts', second)['reviewers']], ['ja-review'])
+        self.assertEqual(self.call('review', second)['absent'], [])
+
+    def test_init_agy_selection_requires_cli(self):
+        (self.repo / 'a.txt').write_text('English only\n')
+        for installed in (False, True):
+            if installed:
+                self.fake_agy()
+            for index, options in enumerate([
+                    ('--only', 'agy'),
+                    ('--only', 'ja-review', '--ja-review'),
+                    ('--only', 'agy', '--only', 'ja-review', '--ja-review'),
+                    ('--exclude', 'claude', '--exclude', 'codex', '--ja-review'),
+                    ('--exclude', 'claude', '--exclude', 'codex')]):
+                with self.subTest(installed=installed, options=options):
+                    root = self.root / f'agy-{installed}-{index}'
+                    self.call('init', root, '--cwd', self.repo, '--path', 'a.txt',
+                              '--ja-skill', self.root / 'missing-skill', *options, code=0 if installed else 1)
+                    self.assertEqual((root / 'run.json').is_file(), installed)
+                    if not installed:
+                        self.assertEqual(self.last_stderr.strip(), 'agy not installed')
+
+            root = self.root / f'agy-all-excluded-{installed}'
+            self.call('init', root, '--cwd', self.repo, '--path', 'a.txt', '--ja-review',
+                      '--exclude', 'claude', '--exclude', 'codex', '--exclude', 'agy', '--exclude', 'ja-review', code=1)
+            self.assertEqual(self.last_stderr.strip(), 'all reviewers excluded')
+            self.assertFalse((root / 'run.json').exists())
+
+    def test_invalid_reviewer_selection_version(self):
+        path = self.run / 'run.json'
+        run = self.read_json(path)
+        for version in (2, -1, '1', 1.0, True, None):
+            with self.subTest(version=version):
+                self.write_json(path, dict(run, reviewerSelectionVersion=version))
+                self.call('prompts', self.iter, code=1)
+                self.assertEqual(self.last_stderr.strip(), 'invalid run state')
+        self.fake_agy()
+        self.write_json(path, dict(run, reviewerSelectionVersion=0))
+        jobs = self.call('prompts', self.iter, '--roles', '')['reviewers']
+        self.assertEqual([job['source'] for job in jobs], ['claude-general', 'codex-general'])
+
+    def test_ja_review_rejects_inconsistent_cli(self):
+        (self.repo / 'ja.txt').write_text('日本語\n')
+        self.ja_initialize('--path', 'ja.txt')
+        self.call('prompts', self.iter)
+        self.call('review', self.iter)
+        for filename, command in [('prompts.json', 'review'), ('review.json', 'collect')]:
+            with self.subTest(filename=filename):
+                path = self.iter / filename
+                state = self.read_json(path)
+                job = next(job for job in state['reviewers'] if job['source'] == 'ja-review')
+                job.update(cli='claude', effort='medium')
+                self.write_json(path, state)
+                self.call(command, self.iter, code=1)
+                self.assertEqual(self.last_stderr.strip(), f'invalid {filename} reviewer')
+
+    def test_agy_stdin_report_and_stats(self):
+        (self.repo / 'a.txt').write_text('変更\n')
+        self.fake_agy()
+        self.initialize('--path', 'a.txt', '--only', 'agy')
+        job, = self.call('prompts', self.iter)['reviewers']
+        prompt, output = self.iter / 'agy-general.prompt.md', self.iter / 'agy-general.md'
+        self.assertEqual((job['prompt'], job['output']), (str(prompt), str(output)))
+        # Linux で単一引数の上限になる 128 KiB の前後でも標準入力は全文を運べる。
+        first_line = prompt.read_bytes().splitlines(keepends=True)[0]
+        for size in (131071, 131072, 131073):
+            with self.subTest(size=size):
+                prefix = first_line + ('日本語' * 14000).encode()
+                prompt.write_bytes(prefix + b'x' * (size - len(prefix) - 1) + b'\n')
+                self.fake_agy(f"assert prompt == Path({str(prompt)!r}).read_bytes()\nprint('問題なし')")
+                job, = self.call('review', self.iter)['reviewers']
+                self.assertEqual(job['status'], 'success')
+                self.assertEqual(output.read_text(), '問題なし\n')
+                self.assertEqual(self.call('collect', self.iter)['findings'], [])
+        self.fake_agy("print(" + repr(self.report(1, path='a.txt')) + ")")
+        self.call('review', self.iter)
+        finding, = self.call('collect', self.iter)['findings']
+        self.assertEqual(finding['source'], 'agy-general')
+        self.stats_gate()
+        self.assertEqual(self.stats_rows()[-1]['collected']['bySource'], {'agy-general': 1})
+
+    def test_agy_retry_and_failed_batches(self):
+        (self.repo / 'ja.txt').write_text('日本語\n')
+        skill = self.ja_skill()
+        self.initialize('--path', 'ja.txt', '--roles', '', '--ja-review', '--ja-skill', skill)
+        self.call('prompts', self.iter)
+        marker = self.root / 'attempted'
+        self.fake_agy(f"marker = Path({str(marker)!r})\nif marker.exists():\n    print('問題なし')\nmarker.touch()")
+        result = self.call('review', self.iter)
+        job = next(job for job in result['reviewers'] if job['source'] == 'agy-general')
+        self.assertEqual([attempt['reason'] for attempt in job['attempts']], ['no valid report', None])
+        self.assertEqual(job['status'], 'success')
+        self.assertEqual(result['absent'], [])
+        for body, reason in [("raise SystemExit(7)", 'exit 7'), ("print('  ')", 'no valid report'),
+                             ("print('挨拶だけ')", 'no valid report'), ("print('指摘なし')", 'no valid report'),
+                             ('import time\ntime.sleep(30)', 'timeout')]:
+            with self.subTest(body=body):
+                if reason == 'timeout':
+                    plan_path = self.iter / 'prompts.json'
+                    plan = self.read_json(plan_path)
+                    next(job for job in plan['reviewers'] if job['source'] == 'agy-general')['timeout'] = .2
+                    self.write_json(plan_path, plan)
+                self.fake_agy(body, 'raise SystemExit(9)')
+                result = self.call('review', self.iter)
+                self.assertEqual(result['absent'], ['agy-general', 'ja-review'])
+                job = next(job for job in result['reviewers'] if job['source'] == 'agy-general')
+                self.assertEqual([attempt['reason'] for attempt in job['attempts']], [reason, reason])
+                batch, = result['failedBatches']
+                self.assertEqual(Path(batch['output']).parent.name, 'ja-review')
+                self.assertEqual(self.call('collect', self.iter)['failedBatches'], [batch])
+
+    def test_agy_large_diff_uses_same_target_as_other_general_reviewers(self):
+        self.changed_repository('--roles', '')
+        file = self.repo / 'a.txt'
+        baseline = self.git('diff', 'HEAD')
+        file.write_text('change' + 'x' * (200001 - len(baseline)) + '\n')
+        diff = self.git('diff', 'HEAD')
+        self.assertEqual(len(diff), 200001)
+        self.fake_agy()
+        jobs = self.call('prompts', self.iter)['reviewers']
+        self.assertEqual([job['source'] for job in jobs], ['claude-general', 'codex-general', 'agy-general'])
+        target = self.iter / 'target.diff'
+        self.assertEqual(target.read_bytes(), diff)
+        for job in jobs:
+            prompt = Path(job['prompt']).read_text()
+            self.assertIn(str(target), prompt)
+            self.assertEqual(prompt.startswith('このレビューではシェルコマンドを実行できない。'),
+                             job['source'] == 'agy-general')
+        self.fake_agy(f"assert directory == Path({str(target.parent)!r})\n"
+                      f"assert (directory / 'target.diff').read_bytes().endswith(b'change' + b'x' * {200001 - len(baseline)} + b'\\n')\n"
+                      "print('問題なし')")
+        self.assertEqual(self.call('review', self.iter)['absent'], [])
+
     def test_confirm_examples_reviewers_and_records(self):
         skill = self.ja_skill()
         (self.repo / 'ja.txt').write_text('校閲対象')
         for index, (options, missing, expected) in enumerate([
                 ([], None, [('claude-general', 'claude-opus-5-5', 'medium'),
                             ('codex-general', 'gpt-6.2-sol', 'medium'),
+                            ('agy-general', 'gemini-4-neon-medium', None),
                             ('claude-bug-hunt', 'claude-opus-5-5', 'high'),
                             ('claude-test-quality', 'claude-opus-5-5', 'high')]),
                 (['--profile', 'codex'], None,
                  [('claude-general', 'claude-opus-5-5', 'high'),
                   ('codex-general', 'gpt-6.2-sol', 'medium'),
+                  ('agy-general', 'gemini-4-neon-medium', None),
                   ('codex-bug-hunt', 'gpt-6.2-sol', 'high'),
                   ('codex-test-quality', 'gpt-6.2-sol', 'high')]),
                 (['--only', 'codex'], None, [('codex-general', 'gpt-6.2-sol', 'medium')]),
@@ -212,8 +421,13 @@ with patch.object(subprocess.Popen, 'communicate', communicate):
                   ('codex-bug-hunt', 'gpt-6.2-sol', 'high'),
                   ('codex-test-quality', 'gpt-6.2-sol', 'high')]),
                 ([], 'claude', [('claude-general', 'claude-opus-5-5', 'medium'),
-                                ('codex-general', 'gpt-6.2-sol', 'medium')]),
-                (['--exclude', 'claude', '--exclude', 'codex', '--ja-review'], None, [])]):
+                                ('codex-general', 'gpt-6.2-sol', 'medium'),
+                                ('agy-general', 'gemini-4-neon-medium', None)]),
+                ([], 'agy', [('claude-general', 'claude-opus-5-5', 'medium'),
+                             ('codex-general', 'gpt-6.2-sol', 'medium'),
+                             ('claude-bug-hunt', 'claude-opus-5-5', 'high'),
+                             ('claude-test-quality', 'claude-opus-5-5', 'high')]),
+                (['--exclude', 'claude', '--exclude', 'codex', '--exclude', 'agy', '--ja-review'], None, [])]):
             with self.subTest(options=options, missing=missing):
                 root = self.root / f'confirm-{index}'
                 self.call('init', root, '--cwd', self.repo, '--path', '.', '--roles', '',
@@ -225,7 +439,7 @@ with patch.object(subprocess.Popen, 'communicate', communicate):
                     if not expected:
                         normal = self.call('prompts', root / 'iter-1')
                         self.assertTrue(normal['reviewers'])
-                        self.assertTrue(all(j['cli'] == 'agy' for j in normal['reviewers']))
+                        self.assertTrue(all(j['source'] == 'ja-review' for j in normal['reviewers']))
                     plan = self.call('prompts', root / 'iter-1', '--confirm', code=0 if expected else 1)
                     if not expected:
                         self.assertIn('no reviewer selected', self.last_stderr)
@@ -239,12 +453,15 @@ with patch.object(subprocess.Popen, 'communicate', communicate):
                         self.assertIs(plan['confirm'], True)
                         self.assertEqual(plan['iteration'], 1)
                         self.assertEqual(plan, self.read_json(root / 'iter-1/prompts.json'))
-                        self.call('review', root / 'iter-1')
+                        result = self.call('review', root / 'iter-1')
+                        self.assertEqual(result['absent'], [missing + '-general'] if missing == 'claude' else [])
                         self.assertEqual(self.call('collect', root / 'iter-1')['findings'], [])
                         self.stats_gate(root / 'iter-1')
                         self.assertIs(self.stats_rows()[-1]['confirm'], True)
                 finally:
-                    if missing:
+                    if missing == 'agy':
+                        self.fake_agy()
+                    elif missing:
                         self.fake(missing, "print('問題なし')\n")
 
     def test_confirm_examples_repeats_limits_and_argument_errors(self):
@@ -640,18 +857,18 @@ with patch.object(subprocess.Popen, 'communicate', communicate):
         expected = (second / 'claude.prompt.md').read_bytes()
         plan = self.call('prompts', second, '--confirm')
         self.assertEqual([j['source'] for j in plan['reviewers']],
-                         ['claude-general', 'codex-general', 'claude-bug-hunt', 'claude-test-quality'])
+                         ['claude-general', 'codex-general', 'agy-general', 'claude-bug-hunt', 'claude-test-quality'])
         self.assertEqual((second / 'claude.prompt.md').read_bytes(), expected)
         self.assertIn('コミット済み', expected.decode())
         self.assertIn('未コミット', expected.decode())
-        self.assertFalse(any(j['cli'] == 'agy' for j in plan['reviewers']))
+        self.assertFalse(any(j['source'] == 'ja-review' for j in plan['reviewers']))
         self.assertFalse((second / 'ja-review').exists())
         self.call('review', second)
         self.call('collect', second)
         # 確認回の後の通常回は、役割構成が確認前の設定に戻る。ja-review は2回目以降の既定では起動しないので明示する。
         plan = self.call('prompts', self.run / 'iter-3', '--ja-review')
         self.assertEqual([j['source'] for j in plan['reviewers']],
-                         ['claude-general', 'codex-general', 'claude-pattern-consistency',
+                         ['claude-general', 'codex-general', 'agy-general', 'claude-pattern-consistency',
                           'claude-naming-symmetry', 'ja-review'])
         self.assertIs(plan['confirm'], False)
         self.assertEqual(self.read_json(self.run / 'run.json')['confirmIterations'], [2])
@@ -1386,7 +1603,7 @@ with patch.object(pwd, 'getpwuid', side_effect=KeyError('no home')):
         for directory, triage in [(self.iter, False), (self.run / 'iter-2', True)]:
             # 2 回目以降の ja-review は明示したときだけ起動する。
             options = ('--ja-review',) if triage else ()
-            jobs = [j for j in self.call('prompts', directory, *options)['reviewers'] if j['cli'] == 'agy']
+            jobs = [j for j in self.call('prompts', directory, *options)['reviewers'] if j['source'] == 'ja-review']
             self.assertGreater(len(jobs), 1)
             for job in jobs:
                 path = Path(job['prompt'])
@@ -1400,7 +1617,7 @@ with patch.object(pwd, 'getpwuid', side_effect=KeyError('no home')):
             self.assertIn('1000: ', ''.join(Path(j['prompt']).read_text() for j in jobs))
 
         reason = 'D1 の前提が崩れる。入力: 日本語。手順: 表示する。結果: 欠落する。'
-        self.fake('agy', "print(" + repr('### low ja.txt:1\n- 分類: 表記\n- 原文: 日本語\n- 修正案: 直す\n- 理由: ' + reason) + ")")
+        self.fake_agy(ja="print(" + repr('### low ja.txt:1\n- 分類: 表記\n- 原文: 日本語\n- 修正案: 直す\n- 理由: ' + reason) + ")")
         self.call('review', self.run / 'iter-2')
         findings = self.call('collect', self.run / 'iter-2')['findings']
         self.assertTrue(any(reason in item['problem'] for item in findings))
@@ -1411,7 +1628,7 @@ with patch.object(pwd, 'getpwuid', side_effect=KeyError('no home')):
         self.ja_initialize()
         self.add_decisions(self.decision())
         jobs = self.call('prompts', self.iter)['reviewers']
-        path = Path(next(j['prompt'] for j in jobs if j['cli'] == 'agy'))
+        path = Path(next(j['prompt'] for j in jobs if j['source'] == 'ja-review'))
         overhead = path.stat().st_size
         (self.repo / 'ja.txt').write_text('語' + 'x' * (mr.JA_BATCH_LIMIT - overhead) + '\n')
         self.call('prompts', self.iter)
@@ -1540,17 +1757,17 @@ with patch.object(pwd, 'getpwuid', side_effect=KeyError('no home')):
         for directory, included in [(self.iter, False), (self.run / 'iter-2', True)]:
             # 2 回目以降の ja-review は明示したときだけ起動する。
             options = ('--ja-review',) if included else ()
-            jobs = [j for j in self.call('prompts', directory, *options)['reviewers'] if j['cli'] == 'agy']
+            jobs = [j for j in self.call('prompts', directory, *options)['reviewers'] if j['source'] == 'ja-review']
             self.assertEqual(len(jobs), 1)
             self.assertEqual('## 決定事項' in Path(jobs[0]['prompt']).read_text(), included)
         jobs = [j for j in self.call('prompts', self.run / 'iter-2', '--reconsider', 'F1', '--ja-review')['reviewers']
-                if j['cli'] == 'agy']
+                if j['source'] == 'ja-review']
         self.assertEqual(len(jobs), 1)
         self.assertNotIn('## 決定事項', Path(jobs[0]['prompt']).read_text())
         (self.repo / 'ja.txt').write_text('english only\n')
         # 明示して起動しても、日本語の対象がなければ ja-review のジョブを作らない。
         jobs = self.call('prompts', self.run / 'iter-2', '--ja-review')['reviewers']
-        self.assertFalse(any(j['cli'] == 'agy' for j in jobs))
+        self.assertFalse(any(j['source'] == 'ja-review' for j in jobs))
 
     def git(self, *args):
         return subprocess.run(['git', *args], cwd=self.repo, env=self.env,
@@ -1882,12 +2099,12 @@ with patch.object(pwd, 'getpwuid', side_effect=KeyError('no home')):
         (skill / 'references').mkdir(parents=True)
         (skill / 'SKILL.md').write_text('ja skill')
         (skill / 'references/prompt.md').write_text('校閲して\n')
-        self.fake('agy', "print('指摘なし')\n")
+        self.fake_agy()
         return skill
 
-    def collection_fixture(self, text, patch=None):
+    def collection_fixture(self, text, patch=None, *, ja_review=False):
         directory = self.run / 'iter-2'
-        self.call('prompts', directory, '--roles', '')
+        self.call('prompts', directory, '--roles', '', *(['--ja-review'] if ja_review else []))
         self.fake('claude', 'print(' + repr(text) + ')')
         self.call('review', directory)
         if patch is not None:
@@ -2041,13 +2258,13 @@ with patch.object(pwd, 'getpwuid', side_effect=KeyError('no home')):
                         '--ja-review', '--ja-skill', str(self.root / 'missing'))
         self.call('prompts', self.iter)
         items = self.read_json(self.iter / 'prompts.json')['reviewers']
-        self.assertEqual([i['source'] for i in items], ['codex-general', 'codex-bug-hunt'])
-        self.assertEqual([i['effort'] for i in items], ['medium', 'high'])
+        self.assertEqual([i['source'] for i in items], ['codex-general', 'agy-general', 'codex-bug-hunt'])
+        self.assertEqual([i['effort'] for i in items], ['medium', None, 'high'])
         run = self.read_json(self.run / 'run.json')
         run['jaSkill'] = str(self.root / 'ja-skill')
         self.write_json(self.run / 'run.json', run)
         (self.bin / 'agy').unlink()
-        self.assertFalse(any(j['cli'] == 'agy' for j in self.call('prompts', self.iter)['reviewers']))
+        self.assertFalse(any(j['source'] == 'ja-review' for j in self.call('prompts', self.iter)['reviewers']))
 
     def test_review_retry_and_collect_multiple_locations(self):
         self.review_plan()
@@ -2986,7 +3203,7 @@ with patch.object(mr.os, 'write', write):
         self.assertNotIn('\ufffd', text)
         self.assertIn('\\udcfe', text)
         self.assertNotIn('\ufffd', (self.run / 'iter-2/target.diff').read_text())
-        self.assertTrue(any(job['cli'] == 'agy' for job in plan['reviewers']))
+        self.assertTrue(any(job['source'] == 'ja-review' for job in plan['reviewers']))
 
     def test_committed_gitlink_snapshot_copies_nested_content(self):
         self.repository()
@@ -3051,7 +3268,7 @@ with patch.object(mr.os, 'write', write):
             (('--ja-timeout', '-1'), 'limits must be positive', 1),
             (('--roles', 'security,bug-hunt,architecture,performance,test-quality'), 'too many specialist roles', 1),
             (('--only', 'ja-review'), 'all reviewers excluded', 1),
-            (('--exclude', 'claude', '--exclude', 'codex', '--exclude', 'ja-review'), 'all reviewers excluded', 1)]
+            (('--exclude', 'claude', '--exclude', 'codex', '--exclude', 'agy', '--exclude', 'ja-review'), 'all reviewers excluded', 1)]
         for options, reason, code in cases:
             with self.subTest(options=options):
                 target = self.root / ('invalid-' + str(len(list(self.root.glob('invalid-*')))))
@@ -3138,7 +3355,7 @@ with patch.object(mr.os, 'write', write):
         (self.repo / 'ja.txt').write_text(('日本語' * 50 + '\n') * 1000)
         self.ja_initialize()
         self.call('prompts', self.iter)
-        jobs = [j for j in self.read_json(self.iter / 'prompts.json')['reviewers'] if j['cli'] == 'agy']
+        jobs = [j for j in self.read_json(self.iter / 'prompts.json')['reviewers'] if j['source'] == 'ja-review']
         self.assertGreater(len(jobs), 1)
         texts = [Path(j['prompt']).read_text(encoding='utf-8') for j in jobs]
         self.assertTrue(all(Path(j['prompt']).stat().st_size <= mr.JA_BATCH_LIMIT for j in jobs))
@@ -3164,8 +3381,8 @@ with patch.object(mr.os, 'write', write):
         self.ja_initialize()
         self.call('prompts', self.iter)
         parameters = {Path(job['prompt']).read_text(): job['model'] for job in
-                      self.read_json(self.iter / 'prompts.json')['reviewers'] if job['cli'] == 'agy'}
-        self.fake('agy', 'parameters=' + repr(parameters) + '\n' + """import sys
+                      self.read_json(self.iter / 'prompts.json')['reviewers'] if job['source'] == 'ja-review'}
+        self.fake_agy(ja='parameters=' + repr(parameters) + '\n' + """import sys
 assert sys.argv[sys.argv.index('--mode')+1] == 'plan'
 assert sys.argv[sys.argv.index('--model')+1] == parameters[sys.argv[sys.argv.index('-p')+1]]
 assert sys.argv[sys.argv.index('--model')+1] == 'gemini-3.8-flash-high'
@@ -3821,38 +4038,38 @@ Path('leaked').touch()
         (self.repo / 'a.txt').write_text('日本語\n')
         self.initialize('--exclude', 'codex', '--roles', '', '--ja-skill', self.ja_skill())
         self.call('prompts', self.iter)
-        self.assertEqual([j['cli'] for j in self.read_json(self.iter / 'prompts.json')['reviewers']], ['claude'])
+        self.assertEqual([j['source'] for j in self.read_json(self.iter / 'prompts.json')['reviewers']], ['claude-general', 'agy-general'])
         second = self.run / 'iter-2'
         self.call('prompts', second, '--ja-review')
-        self.assertEqual([j['cli'] for j in self.read_json(second / 'prompts.json')['reviewers']], ['claude', 'agy'])
+        self.assertEqual([j['source'] for j in self.read_json(second / 'prompts.json')['reviewers']], ['claude-general', 'agy-general', 'ja-review'])
         self.assertFalse(self.read_json(self.run / 'run.json')['jaReview'])
         self.call('prompts', self.run / 'iter-3')
-        self.assertEqual([j['cli'] for j in self.read_json(self.run / 'iter-3/prompts.json')['reviewers']], ['claude'])
+        self.assertEqual([j['source'] for j in self.read_json(self.run / 'iter-3/prompts.json')['reviewers']], ['claude-general', 'agy-general'])
 
     def test_ja_review_runs_by_default_only_in_first_iteration(self):
         self.repository()
         (self.repo / 'a.txt').write_text('日本語\n')
         self.ja_initialize()
 
-        def clis(directory, *options):
-            return [j['cli'] for j in self.call('prompts', directory, *options)['reviewers']]
+        def sources(directory, *options):
+            return [j['source'] for j in self.call('prompts', directory, *options)['reviewers']]
         second, third = self.run / 'iter-2', self.run / 'iter-3'
-        self.assertNotIn('agy', clis(self.iter, '--no-ja-review'))
-        self.assertIn('agy', clis(self.iter))
+        self.assertNotIn('ja-review', sources(self.iter, '--no-ja-review'))
+        self.assertIn('ja-review', sources(self.iter))
         # 2回目以降は、省略時に init の設定があっても起動しない。
-        self.assertNotIn('agy', clis(second))
+        self.assertNotIn('ja-review', sources(second))
         self.assertFalse((second / 'ja-review').exists())
         # 同じイテレーションでも明示して作り直せば、そのイテレーションだけ起動する。
-        self.assertIn('agy', clis(second, '--ja-review'))
+        self.assertIn('ja-review', sources(second, '--ja-review'))
         self.assertTrue((second / 'ja-review').is_dir())
         # 明示の指定は次の呼び出しに残らず、省略時の作り直しで前回の ja-review の成果物も残さない。
-        self.assertNotIn('agy', clis(second))
+        self.assertNotIn('ja-review', sources(second))
         self.assertFalse((second / 'ja-review').exists())
-        self.assertIn('agy', clis(second, '--ja-review'))
-        self.assertNotIn('agy', clis(second, '--no-ja-review'))
+        self.assertIn('ja-review', sources(second, '--ja-review'))
+        self.assertNotIn('ja-review', sources(second, '--no-ja-review'))
         self.assertFalse((second / 'ja-review').exists())
-        self.assertNotIn('agy', clis(second, '--confirm'))
-        self.assertNotIn('agy', clis(third))
+        self.assertNotIn('ja-review', sources(second, '--confirm'))
+        self.assertNotIn('ja-review', sources(third))
         self.assertTrue(self.read_json(self.run / 'run.json')['jaReview'])
 
     def test_ja_review_skipped_by_default_in_later_iterations_except_ja_only_run(self):
@@ -3860,21 +4077,21 @@ Path('leaked').touch()
         (self.repo / 'a.txt').write_text('日本語\n')
         self.ja_initialize()
 
-        def clis(directory, *options):
-            return [j['cli'] for j in self.call('prompts', directory, *options)['reviewers']]
-        self.assertIn('agy', clis(self.iter))
+        def sources(directory, *options):
+            return [j['source'] for j in self.call('prompts', directory, *options)['reviewers']]
+        self.assertIn('ja-review', sources(self.iter))
         # 確認回を挟まない通常回でも、日本語の変更があるまま 2回目以降は省略時に起動しない。
         (self.repo / 'a.txt').write_text('日本語の修正\n')
-        self.assertNotIn('agy', clis(self.run / 'iter-2'))
-        self.assertNotIn('agy', clis(self.run / 'iter-3'))
+        self.assertNotIn('ja-review', sources(self.run / 'iter-2'))
+        self.assertNotIn('ja-review', sources(self.run / 'iter-3'))
         skill = self.read_json(self.run / 'run.json')['jaSkill']
         self.assertTrue(self.read_json(self.run / 'run.json')['jaReview'])
         # ja-review だけを選んだ実行は、2回目以降も省略時に init の設定に従う。
         self.run = self.root / 'ja-only-run'
         self.call('init', self.run, '--cwd', self.repo, '--path', '.', '--only', 'ja-review',
                   '--ja-review', '--ja-skill', skill)
-        self.assertEqual(clis(self.run / 'iter-1'), ['agy'])
-        self.assertEqual(clis(self.run / 'iter-2'), ['agy'])
+        self.assertEqual(sources(self.run / 'iter-1'), ['ja-review'])
+        self.assertEqual(sources(self.run / 'iter-2'), ['ja-review'])
         # 明示して外せばレビュアーがなくなり、台帳のイテレーションを進めずに止まる。
         self.call('prompts', self.run / 'iter-3', '--no-ja-review', code=1)
         self.assertIn('no reviewer selected', self.last_stderr)
@@ -3883,16 +4100,24 @@ Path('leaked').touch()
         self.run = self.root / 'one-excluded-run'
         self.call('init', self.run, '--cwd', self.repo, '--path', '.', '--exclude', 'codex', '--roles', '',
                   '--ja-review', '--ja-skill', skill)
-        self.assertEqual(clis(self.run / 'iter-1'), ['claude', 'agy'])
-        self.assertEqual(clis(self.run / 'iter-2'), ['claude'])
-        # 除外せず未導入で ja-review だけが起動できる実行も、2回目以降は省略時に init の設定に従う。
+        self.assertEqual(sources(self.run / 'iter-1'), ['claude-general', 'agy-general', 'ja-review'])
+        self.assertEqual(sources(self.run / 'iter-2'), ['claude-general', 'agy-general'])
+        # agy の総合を除外し、claude・codex が未導入なら、2回目以降も init の校閲設定に従う。
         self.run = self.root / 'not-installed-run'
         self.call('init', self.run, '--cwd', self.repo, '--path', '.', '--roles', '',
-                  '--ja-review', '--ja-skill', skill)
+                  '--ja-review', '--ja-skill', skill, '--exclude', 'agy')
         (self.bin / 'claude').unlink()
         (self.bin / 'codex').unlink()
-        self.assertIn('agy', clis(self.run / 'iter-1'))
-        self.assertIn('agy', clis(self.run / 'iter-2'))
+        self.assertIn('ja-review', sources(self.run / 'iter-1'))
+        self.assertIn('ja-review', sources(self.run / 'iter-2'))
+        # agy の総合を選ぶ場合は、claude・codex が未導入でも 2 回目に校閲を起動しない。
+        self.run = self.root / 'agy-installed-run'
+        self.call('init', self.run, '--cwd', self.repo, '--path', '.', '--roles', '',
+                  '--ja-review', '--ja-skill', skill)
+        self.assertEqual(sources(self.run / 'iter-2'), ['claude-general', 'codex-general', 'agy-general'])
+        result = self.call('review', self.run / 'iter-2')
+        self.assertEqual(result['absent'], ['claude-general', 'codex-general'])
+        self.assertEqual([j['source'] for j in result['reviewers'] if j['status'] == 'success'], ['agy-general'])
 
     def archive_dir(self, name='20260101-000000'):
         return Path(self.read_json(self.run / 'run.json')['cwd']) / '.multi-review' / name
@@ -4077,6 +4302,7 @@ Path('leaked').touch()
     def test_carried_fix_diffs_exclude_findings_from_prompts_and_future_runs(self):
         source = self.carry_source()
         directory, _ = self.carry(source)
+        self.fake_agy()
         representative = self.repo / '日本語.py'
         representative.write_text('original\n')
         path = directory / 'carried.json'
@@ -4096,8 +4322,11 @@ Path('leaked').touch()
         representative.write_text('fixed again\n')
         self.call('fixdiff', first)
         self.assertIn(b'diff --git "a/\\', (first / 'fix.diff').read_bytes())
+        prefix = 'このレビューではシェルコマンドを実行できない。ファイルの読み取りと検索のツールだけを使う。\n\n'.encode()
         for options in ((), ('--confirm',)):
             text = prompt(second, *options)
+            self.assertEqual((second / 'agy-general.prompt.md').read_bytes(),
+                             prefix + (second / 'claude.prompt.md').read_bytes())
             self.assertNotIn('\nP1 ', text)
             self.assertIn('\nP2 b.txt:1 不備2', text)
             self.assertIn('\nP3 c.txt:1 不備3', text)
@@ -5450,7 +5679,7 @@ else:
         (self.repo / 'ja.txt').write_text('日本語\n')
         self.ja_initialize()
         self.call('prompts', self.iter)
-        self.fake('agy', "import sys\nprint('logging before google.Init',file=sys.stderr)\nprint('x'*" +
+        self.fake_agy(ja="import sys\nprint('logging before google.Init',file=sys.stderr)\nprint('x'*" +
                   str(mr.STDERR_TAIL_CHARS + 1) + ",file=sys.stderr)\nprint('failure detail',file=sys.stderr)\nsys.exit(1)")
         self.call('review', self.iter)
         result = self.call('collect', self.iter)
@@ -5514,7 +5743,7 @@ else:
         self.call('prompts', self.iter)
         self.assertEqual(prompt.stat().st_size, mr.JA_BATCH_LIMIT)
         self.assertTrue(self.call('review', self.iter)['success'])
-        job = next(j for j in self.read_json(self.iter / 'review.json')['reviewers'] if j['cli'] == 'agy')
+        job = next(j for j in self.read_json(self.iter / 'review.json')['reviewers'] if j['source'] == 'ja-review')
         self.assertEqual(job['status'], 'success')
         file.write_text('語' + 'x' * (mr.JA_BATCH_LIMIT + 1 - overhead) + '\n')
         self.call('prompts', self.iter, code=1)
@@ -5527,7 +5756,7 @@ else:
         for name in names:
             (self.repo / name).write_text('語' + 'x' * 40000 + '\n')
         self.ja_initialize('--path', '.')
-        jobs = [j for j in self.call('prompts', self.iter)['reviewers'] if j['cli'] == 'agy']
+        jobs = [j for j in self.call('prompts', self.iter)['reviewers'] if j['source'] == 'ja-review']
         self.assertEqual(len(jobs), 2)
         texts = [Path(job['prompt']).read_text() for job in jobs]
         for job in jobs:
@@ -5824,9 +6053,9 @@ else:
     def test_only_and_exclude_control_all_roles(self):
         self.repository()
         for options, excluded, sources in [
-                (['--only', 'claude'], ['codex', 'ja-review'], ['claude-general', 'claude-bug-hunt']),
+                (['--only', 'claude'], ['agy', 'codex', 'ja-review'], ['claude-general', 'claude-bug-hunt']),
                 (['--only', 'claude', '--only', 'codex', '--exclude', 'claude'],
-                 ['claude', 'ja-review'], ['codex-general'])]:
+                 ['agy', 'claude', 'ja-review'], ['codex-general'])]:
             with self.subTest(options=options):
                 run = self.initialize('--roles', 'bug-hunt', *options, '--path', 'a.txt')
                 self.assertEqual(run['excluded'], excluded)
@@ -5933,7 +6162,7 @@ else:
         (self.repo / 'ja.txt').write_text('後\n' * 15000)
         self.ja_initialize()
         jobs = self.call('prompts', self.iter)['reviewers']
-        batches = [Path(j['prompt']) for j in jobs if j['cli'] == 'agy']
+        batches = [Path(j['prompt']) for j in jobs if j['source'] == 'ja-review']
         self.assertGreater(len(batches), 1)
         self.assertTrue(all(p.stat().st_size <= mr.JA_BATCH_LIMIT for p in batches))
         for batch in batches:
@@ -5943,7 +6172,7 @@ else:
                 self.assertNotIn('1-1, 2-2', text)
         self.git('commit', '-am', 'baseline2')
         self.git('mv', 'ja.txt', 'renamed.txt')
-        self.assertFalse(any(j['cli'] == 'agy' for j in self.call('prompts', self.iter)['reviewers']))
+        self.assertFalse(any(j['source'] == 'ja-review' for j in self.call('prompts', self.iter)['reviewers']))
 
     def test_ja_base_scope_uses_worktree_line_numbers(self):
         self.repository()
@@ -5976,12 +6205,15 @@ else:
     def test_models_effort_and_real_argv_for_both_profiles(self):
         self.repository()
         (self.repo / 'a.txt').write_text('change\n')
+        self.fake_agy()
         expected = {
             'default': [('claude-general', 'claude-opus-5-5', 'medium'),
                         ('codex-general', 'gpt-6.2-sol', 'medium'),
+                        ('agy-general', 'gemini-4-neon-medium', None),
                         ('claude-bug-hunt', 'claude-opus-5-5', 'high')],
             'codex': [('claude-general', 'claude-opus-5-5', 'high'),
                       ('codex-general', 'gpt-6.2-sol', 'medium'),
+                      ('agy-general', 'gemini-4-neon-medium', None),
                       ('codex-bug-hunt', 'gpt-6.2-sol', 'high')]}
         for profile, specs in expected.items():
             with self.subTest(profile=profile):
@@ -6006,19 +6238,20 @@ else:
         text = (CLI.parent.parent / 'SKILL.md').read_text(encoding='utf-8')
         table = text.split('| 役割 | `default`（省略時） | `codex` |\n', 1)[1]
         rows = [[cell.strip() for cell in line.strip('|').split('|')]
-                for line in table.splitlines()[1:4]]
-        self.assertEqual(len(rows), 3)
+                for line in table.splitlines()[1:5]]
+        self.assertEqual(len(rows), 4)
         self.repository()
         (self.repo / 'a.txt').write_text('change\n')
+        self.fake_agy()
         for column, profile in enumerate(('default', 'codex'), 1):
             with self.subTest(profile=profile):
                 self.initialize('--profile', profile, '--roles', 'bug-hunt')
                 jobs = self.call('prompts', self.iter)['reviewers']
-                self.assertEqual(len(jobs), 3)
+                self.assertEqual(len(jobs), 4)
                 for row, job in zip(rows, jobs):
                     with self.subTest(source=job['source']):
                         documented = row[column].replace('Opus 5.5', 'claude-opus-5-5')
-                        model = job['model'] + ' ' + job['effort']
+                        model = ' '.join(value for value in (job['model'], job['effort']) if value)
                         expected = job['cli'] + ' / ' + model if 'bug-hunt' in job['source'] else model
                         self.assertEqual(documented, expected)
 
@@ -6114,41 +6347,42 @@ else:
         (self.repo / 'a.txt').write_text('日本語\n')
         skill = self.ja_skill()
         self.initialize('--ja-review', '--ja-skill', skill / 'SKILL.md', '--roles', '')
-        self.assertTrue(any(j['cli'] == 'agy' for j in self.call('prompts', self.iter)['reviewers']))
+        self.assertTrue(any(j['source'] == 'ja-review' for j in self.call('prompts', self.iter)['reviewers']))
         (skill / 'references/prompt.md').unlink()
-        self.assertFalse(any(j['cli'] == 'agy' for j in self.call('prompts', self.iter)['reviewers']))
+        self.assertFalse(any(j['source'] == 'ja-review' for j in self.call('prompts', self.iter)['reviewers']))
         (skill / 'references/prompt.md').write_text('校閲して\n')
         (self.repo / 'a.txt').write_text('original\n')
-        self.assertFalse(any(j['cli'] == 'agy' for j in self.call('prompts', self.iter)['reviewers']))
+        self.assertFalse(any(j['source'] == 'ja-review' for j in self.call('prompts', self.iter)['reviewers']))
         self.fake('unsupported', "print('問題なし')")
         self.review_plan([self.job('unsupported', 'unsupported')])
         self.call('review', self.iter, code=1)
         result = self.read_json(self.iter / 'review.json')['reviewers'][0]
         self.assertEqual(result['reason'], 'unsupported CLI')
         (self.repo / 'a.txt').write_text('English change\n')
-        self.initialize('--exclude', 'claude', '--exclude', 'codex', '--ja-review',
+        self.initialize('--exclude', 'claude', '--exclude', 'codex', '--exclude', 'agy', '--ja-review',
                         '--ja-skill', skill, '--roles', '')
         self.call('prompts', self.iter, code=1)
         self.assertIn('no reviewer selected', self.last_stderr)
         self.assertFalse((self.iter / 'prompts.json').exists())
 
     def test_collect_invalid_reports_fail_with_specific_reason_and_no_artifacts(self):
-        self.collection_fixture(self.report(1))
+        (self.repo / 'ja.txt').write_text('日本語\n')
+        self.ja_initialize('--path', 'ja.txt')
         directory = self.run / 'iter-2'
-        cases = [('挨拶だけ', 'claude', 'no valid report'),
-                 (self.report(1, path='"bad\\udcff\\q"'), 'claude', 'invalid JSON path'),
-                 (self.report(0), 'claude', 'invalid report line'),
-                 (self.report(1) + '- 問題: 二重\n', 'claude', 'duplicate report field'),
-                 ('問題なし\n' + self.report(1), 'claude', 'contradictory empty report'),
-                 ('問題なし\n### 指摘1（重要度: 不明）\n- 問題: 不備', 'claude', 'contradictory empty report'),
-                 ('指摘なし\n### medium\n- 原文: 不備', 'agy', 'contradictory empty report'),
-                 ('### 指摘1（重要度: 高）\n- 問題: 必須欄欠落\n', 'claude', 'incomplete common report'),
-                 ('### medium a.py:1\n- 原文: 本文\n- 理由: 理由\n', 'agy', 'incomplete ja report')]
-        for text, cli, reason in cases:
+        cases = [('挨拶だけ', 'claude-general', 'no valid report'),
+                 (self.report(1, path='"bad\\udcff\\q"'), 'claude-general', 'invalid JSON path'),
+                 (self.report(0), 'claude-general', 'invalid report line'),
+                 (self.report(1) + '- 問題: 二重\n', 'claude-general', 'duplicate report field'),
+                 ('問題なし\n' + self.report(1), 'claude-general', 'contradictory empty report'),
+                 ('問題なし\n### 指摘1（重要度: 不明）\n- 問題: 不備', 'claude-general', 'contradictory empty report'),
+                 ('指摘なし\n### medium\n- 原文: 不備', 'ja-review', 'contradictory empty report'),
+                 ('### 指摘1（重要度: 高）\n- 問題: 必須欄欠落\n', 'claude-general', 'incomplete common report'),
+                 ('### medium a.py:1\n- 原文: 本文\n- 理由: 理由\n', 'ja-review', 'incomplete ja report')]
+        for text, source, reason in cases:
             with self.subTest(text=text):
-                # Reset the source transport; inject only the format fault under test.
-                self.collection_fixture(self.report(1))
-                self.replace_review_output(directory, text, cli)
+                # 正常な報告を生成してから、対象ジョブの報告形式だけを壊す。
+                self.collection_fixture(self.report(1), ja_review=source == 'ja-review')
+                self.replace_review_output(directory, text, source)
                 self.call('collect', directory, code=1)
                 self.assertIn(reason, self.last_stderr)
                 self.assertFalse((directory / 'collected.json').exists())
@@ -6171,12 +6405,14 @@ else:
         self.assertIsNone(result['findings'][0]['nearPreviousFix'])
 
     def test_ja_prefaced_empty_report_is_accepted(self):
-        self.collection_fixture('問題なし')
-        self.replace_review_output(self.run / 'iter-2', '確認済み\n 指摘なし。 \n### まとめ\n完了', 'agy')
+        (self.repo / 'ja.txt').write_text('日本語\n')
+        self.ja_initialize('--path', 'ja.txt')
+        self.collection_fixture('問題なし', ja_review=True)
+        self.replace_review_output(self.run / 'iter-2', '確認済み\n 指摘なし。 \n### まとめ\n完了', 'ja-review')
         self.assertEqual(self.call('collect', self.run / 'iter-2')['findings'], [])
         text = '### medium a.py:1\n- 分類: 表記\n- 原文: 不備\n- 修正案: 修正\n- 理由: 誤字\n### high\n'
         self.call('review', self.run / 'iter-2')
-        self.replace_review_output(self.run / 'iter-2', text, 'agy')
+        self.replace_review_output(self.run / 'iter-2', text, 'ja-review')
         findings = self.call('collect', self.run / 'iter-2')['findings']
         self.assertEqual(len(findings), 2)
         self.assertTrue(any(f.get('parseError') == 'malformed report heading' for f in findings))
@@ -6405,7 +6641,7 @@ sys.exit(mr.main())
         template.write_bytes(original)
         self.call('prompts', self.iter)
         plan = self.read_json(self.iter / 'prompts.json')
-        job = next(j for j in plan['reviewers'] if j['cli'] == 'agy')
+        job = next(j for j in plan['reviewers'] if j['source'] == 'ja-review')
         Path(job['prompt']).write_bytes(b'x' * (mr.JA_BATCH_LIMIT + 1))
         plan['reviewers'] = [job]
         self.write_json(self.iter / 'prompts.json', plan)
@@ -6435,7 +6671,7 @@ sys.exit(mr.main())
             with self.subTest(patch=patch):
                 self.fake('git', 'import os,sys\nif "diff" in sys.argv:\n    print(' +
                           repr(patch) + ')\nelse:\n    os.execv(' + repr(real_git) + ', ["git", *sys.argv[1:]])')
-                self.assertFalse(any(j['cli'] == 'agy' for j in self.call('prompts', self.iter)['reviewers']))
+                self.assertFalse(any(j['source'] == 'ja-review' for j in self.call('prompts', self.iter)['reviewers']))
 
     def test_invalid_fixdiff_state_is_rejected_by_all_consumers(self):
         self.ready_diff()
@@ -6531,7 +6767,7 @@ sys.exit(mr.main())
         (self.repo / 'a.txt').write_text('未変更\n' + 'x' * mr.JA_BATCH_LIMIT + '\nnew\n')
         second = self.run / 'iter-2'
         # 明示して起動しても、日本語に触れない変更なら ja-review のジョブを作らない。
-        self.assertFalse(any(j['cli'] == 'agy' for j in self.call('prompts', second, '--ja-review')['reviewers']))
+        self.assertFalse(any(j['source'] == 'ja-review' for j in self.call('prompts', second, '--ja-review')['reviewers']))
         (self.repo / 'a.txt').write_text('未変更\n' + 'x' * mr.JA_BATCH_LIMIT + '\n変更行\n')
         self.call('prompts', second, '--ja-review')
         text = (second / 'ja-review/batch-1.txt').read_text()
