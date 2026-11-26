@@ -4128,31 +4128,37 @@ Path('leaked').touch()
         carried_path = directory / 'carried.json'
         original = carried_path.read_bytes()
         first = directory / 'iter-1'
+        target = self.archive_dir('copy-fixes')
+        archived = target / 'carried.json'
+        self.assertFalse((first / 'fixdiff.json').exists())
+        self.assertFalse((first / 'fix.diff').exists())
+        self.call('archive', directory, '--to', target)
+        self.assertEqual(archived.read_bytes(), original)
         self.fail_tree_generation()
         self.assertEqual(self.call('snapshot', first)['mode'], 'copy')
         (self.repo / 'a.txt').write_text('fixed again\n')
         self.call('fixdiff', first)
         patch = first / 'fix.diff'
-        self.assertTrue(patch.read_bytes().startswith(b'--- a/a.txt'))
+        patch_data = patch.read_bytes()
+        self.assertTrue(patch_data.startswith(b'--- a/a.txt'))
         job = self.call('prompts', directory / 'iter-2')['reviewers'][0]
         text = Path(job['prompt']).read_text()
         self.assertNotIn('\nP1 ', text)
         self.assertIn('\nP2 b.txt:1 不備2', text)
-        target = self.archive_dir('copy-fixes')
         self.call('archive', directory, '--to', target)
-        archived = target / 'carried.json'
         self.assertEqual([item['changed'] for item in self.read_json(archived)['findings']], [True, False, False])
-        patch.write_bytes(patch.read_bytes() + b'\n')
+        patch.write_bytes(patch_data + b'\n')
         result = self.call('archive', directory, '--to', target)
         self.assertIsNone(result['carryMeta']['tree'])
         self.assertEqual([item['changed'] for item in self.read_json(archived)['findings']], [True, True, True])
+        patch.write_bytes(patch_data)
         body = self.root / 'task.md'
         body.write_text('修正を再委譲する\n')
         self.call('task', first, '--input', body)
         self.assertFalse((first / 'fixdiff.json').exists())
-        self.assertTrue(patch.is_file())
+        self.assertEqual(patch.read_bytes(), patch_data)
         self.call('archive', directory, '--to', target)
-        self.assertEqual(archived.read_bytes(), original)
+        self.assertEqual([item['changed'] for item in self.read_json(archived)['findings']], [True, True, True])
         self.assertEqual(carried_path.read_bytes(), original)
 
     def test_init_checks_decisions_limit_after_merging_sources(self):

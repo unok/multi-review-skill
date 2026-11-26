@@ -3023,6 +3023,9 @@ def archive(args, root, run):
                 directory = iteration_dir(root, number)
                 if (directory / FIXDIFF_FILE).exists():
                     valid_diff(directory, touched=touched)
+                elif (directory / FIX_DIFF_FILE).exists():
+                    unknown = True
+                    break
         except EXPECTED_ERRORS:
             # 判定できない修正があれば、次の実行で全項目を見直せるようにする。
             unknown = True
