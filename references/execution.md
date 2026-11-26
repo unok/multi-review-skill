@@ -201,9 +201,9 @@ init の stdout は run.json のキー（取り込みがあれば `decisionSeque
 
 ## 引き継ぎ `mr init --carry-from`（Step 2）
 
-`mr init R ... --carry-from DIR` は、`mr archive` が作った写し DIR から前回の却下・保留と決定事項を取り込む。指定がなければ何もせず、写しを自動では探さない。相対パスは `--cwd` から解釈する。DIR はリンクでないディレクトリとし、`carry-meta.json`・`findings.json`・`decisions.json` と、あれば `carried.json` はリンクでない通常ファイルを受け付ける。`carry-meta.json` には `version`（整数の1）・`reviewId`・`cwd`・`branch`・`tree` が必要で、`tree` は木の ID または null。真偽値の `carried` は `carried.json` の有無と一致することが必要で、キーがない旧版の写しでは false として扱う。台帳と決定事項は通常の検証を通り（決定事項の採番の上限は除く）、要約・台帳・決定事項の reviewId が一致することを確かめる。`carry-meta.json` の `ledger` は、`findings.json` の状態別件数と一致する必要がある。`digests` があれば、ファイル名の集合と各ファイルの SHA-256 が写しと一致することも確かめる。`carried.json` があれば下記の形式と、ID および元の reviewId と元の ID の組に重複がないことを検証する。`cwd` は今回の対象ルートと一致し、今回の対象は git で、写しと同じブランチにあることが必要（どちらかが detached HEAD なら拒否）。却下・保留の前提はそのブランチの変更に対するものなので、同じブランチでだけ引き継ぐ。条件を満たさなければ終了1で、R には状態ファイルを残さない。R に `carried.json` やそのリンクが残っていれば、`--carry-from` の指定にかかわらず初期化済みとして拒否する。
+`mr init R ... --carry-from DIR` は、`mr archive` が作った写し DIR から前回の却下・保留と決定事項を取り込む。指定がなければ何もせず、写しを自動では探さない。相対パスは `--cwd` から解釈する。DIR はリンクでないディレクトリとし、`carry-meta.json`・`findings.json`・`decisions.json` と、あれば `carried.json` はリンクでない通常ファイルを受け付ける。`carry-meta.json` には `version`（整数の1）・`reviewId`・`cwd`・`branch`・`tree` が必要で、`tree` は木の ID または null。真偽値の `carried` は `carried.json` の有無と一致することが必要で、キーがない旧版の写しでは false として扱う。台帳と決定事項は通常の検証を通り（決定事項の採番の上限は除く）、要約・台帳・決定事項の reviewId が一致することを確かめる。`carry-meta.json` の `ledger` は、`findings.json` の状態別件数と一致する必要がある。`carried` キーがあれば `digests` は必須で、`digests` を持つ写しではファイル名の集合と各ファイルの SHA-256 の一致を確かめる。`carried.json` があれば下記の形式と、ID および元の reviewId と元の ID の組に重複がないことを検証する。`cwd` は今回の対象ルートと一致し、今回の対象は git で、写しと同じブランチにあることが必要（どちらかが detached HEAD なら拒否）。却下・保留の前提はそのブランチの変更に対するものなので、同じブランチでだけ引き継ぐ。条件を満たさなければ終了1で、R には状態ファイルを残さない。R に `carried.json` やそのリンクが残っていれば、`--carry-from` の指定にかかわらず初期化済みとして拒否する。
 
-前回の台帳の `rejected`・`on_hold` の指摘を R 直下の `carried.json` に保存する（台帳には入れない）。`fixed`・`unresolved` は取り込まず、未解決は件数だけを残す。写しに `carried.json` があれば、その項目も世代を1つ進めて引き継ぎ、3世代を超えた項目は落とす。元の reviewId と元の ID の組で重複を除き、元の reviewId と元の ID の順に `P1, P2, …` を振る。今回の対象範囲にないファイルと、今は存在しないファイルの項目は取り込まない。`changed` は、写しの `tree` のそのファイルと今の作業ツリー（未コミットを含む）が違えば true、同じなら false、`tree` がない・木にファイルがない・木を読めない場合は null。
+前回の台帳の `rejected`・`on_hold` の指摘を R 直下の `carried.json` に保存する（台帳には入れない）。`fixed`・`unresolved` は取り込まず、未解決は件数だけを残す。写しに `carried.json` があれば、その項目も世代を1つ進めて引き継ぎ、3世代を超えた項目は落とす。写しの `carried.json` に写し自身と同じ reviewId を持つ指摘があれば、取り込みを拒否するので、別の名前のレビューディレクトリで始め直す。元の reviewId と元の ID の順に `P1, P2, …` を振る。ファイルは対象ルートからの相対パスに正規化して照合し、対象範囲外や存在しないファイルの項目は取り込まない。保存する `file` には元の表記を残す。`changed` は、写しの `tree` のそのファイルと今の作業ツリー（未コミットを含む）が違えば true、同じなら false、`tree` がない・木にファイルがない・木を読めない場合は null。
 
 ```json
 {"version": 1, "from": "<写しの reviewId>", "tree": "<写しの tree または null>",
@@ -310,7 +310,7 @@ git の対象だけを受け付け、非 git は拒否する（写しを次の�
 - 判定: `git check-ignore -q .multi-review/<タイムスタンプ>/report.md` を実行する。終了コード 0（すでに無視されている）なら追記不要でそのまま書き出す。
 - 追記: 終了コード 1（無視されていない）なら、`git rev-parse --git-path info/exclude` が指すパスの親ディレクトリ（`info/`）がなければ作成し、`.multi-review/` を1行追記する。作業ツリー専用の常設ファイル `.multi-review/decisions.json` も無視対象になる。追記後にもう一度 `git check-ignore -q` を実行し、無視されるようになったか確かめる。
 - 追記できない（`.git` が読み取り専用など）場合、または追記しても無視されない場合（`.gitignore` の `!.multi-review/` のような否定パターンが exclude より優先される場合を含む）は、レビューディレクトリ直下に `report.md` を置き（非 git と同じ扱い）、その理由を会話の最終レポートに書く。
-- 写し: `mr archive` が写しのファイルを無視対象でないとして拒否した場合（`.gitignore` が report.md だけを無視している場合など）は、report.md の判定が終了コード 0 でも、拒否されたファイル（例: `.multi-review/<タイムスタンプ>/findings.json`）で同じ判定をし、終了コード 1 なら `.multi-review/` を追記して同じファイルで確かめ直してから再実行する。追記できない・追記しても無視されない場合は写しを作らず、その理由を会話の最終レポートに書く。
+- 写し: `mr archive` が写しのファイルを無視対象でないとして拒否した場合（`.gitignore` が report.md だけを無視している場合など）は、拒否されたファイル（例: `.multi-review/<タイムスタンプ>/carried.json`）が追跡済みか `git ls-files --error-unmatch -- <パス>` で確かめる。追跡済みのファイルには無視設定が効かない。追跡をやめる意図がある場合は `git rm --cached -- <パス>` で作業ツリーのファイルを残して索引から外す。未追跡のファイルは report.md の判定が終了コード 0 でも同じ手順で判定し、終了コード 1 なら `.multi-review/` を追記する。拒否されたファイルが `git check-ignore -q -- <パス>` で無視対象になることを確かめてから再実行する。追記できない・追記しても無視されない場合は写しを作らず、その理由を会話の最終レポートに書く。
 
 ## 品質チェック（Step 6 の基準・Step 7 の判定）
 

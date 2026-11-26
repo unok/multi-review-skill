@@ -962,6 +962,23 @@ def target_root(args, root):
     return requested, cwd, is_git
 
 
+def restore_state(originals, created, error):
+    for path, original in originals.items():
+        try:
+            if original is None:
+                path.unlink(missing_ok=True)
+            else:
+                write_atomic(path, original)
+        except BaseException as rollback_error:
+            error.__notes__ = [*getattr(error, '__notes__', []), f'{display_path(str(path))}: {rollback_error}']
+    for directory in reversed(created):
+        try:
+            if directory.is_dir() and not any(directory.iterdir()):
+                directory.rmdir()
+        except BaseException as rollback_error:
+            error.__notes__ = [*getattr(error, '__notes__', []), f'{display_path(str(directory))}: {rollback_error}']
+
+
 def init(args, root, run):
     require(not (root / RUN_FILE).exists() and not (root / LEDGER_FILE).exists() and
             not (root / DECISIONS_FILE).exists() and not (root / DECISIONS_FILE).is_symlink() and
@@ -1050,18 +1067,13 @@ def init(args, root, run):
         if carried:
             data = validate_carried(carried[0])
             findings = data['findings']
-            changes = carried_changes(cwd, data['tree'], {item['file'] for item in findings})
+            names_by_file = {item['file']: str(Path(item['file'])) for item in findings}
+            changes = carried_changes(cwd, data['tree'], set(names_by_file.values()))
             for item in findings:
-                item['changed'] = changes.get(item['file'])
+                item['changed'] = changes.get(names_by_file[item['file']])
             save_json(root / CARRIED_FILE, data)
-    except BaseException:
-        for path, original in originals.items():
-            if original is None:
-                path.unlink(missing_ok=True)
-            else:
-                write_atomic(path, original)
-        if not existed and directory.is_dir():
-            directory.rmdir()
+    except BaseException as error:
+        restore_state(originals, [] if existed else [directory], error)
         raise
     return dict(run, standingDecisions=imported, **({'carried': carried[1]} if carried else {}))
 
@@ -1144,7 +1156,7 @@ def read_carry_source(directory):
             meta['reviewId'] == ledger['reviewId'] and isinstance(meta['cwd'], str) and
             (meta['branch'] is None or isinstance(meta['branch'], str)) and
             (meta['tree'] is None or isinstance(meta['tree'], str) and re.fullmatch(TREE_ID, meta['tree'])) and
-            type(meta.get('carried', False)) is bool,
+            type(meta.get('carried', False)) is bool and ('carried' not in meta or 'digests' in meta),
             meta_path + ': invalid carry source')
     counts = meta.get('ledger')
     require(counts == ledger_counts(ledger) and all(type(count) is int for count in counts.values()),
@@ -1176,16 +1188,22 @@ def carry_from(source, run, value, ledger):
              for item in previous['findings'] if item['status'] in CARRIED_STATES}
     skipped = {'outOfScope': 0, 'missing': 0, 'generation': 0}
     for item in (carried or {'findings': []})['findings']:
+        require(item['reviewId'] != meta['reviewId'], prefix + 'carry source review id collides with a carried finding'
+                ' (start again with a different review directory name)')
         if item['generation'] + 1 > CARRY_MAX_GENERATIONS:
             skipped['generation'] += 1
             continue
-        items.setdefault((item['reviewId'], item['originalId']), dict(item, generation=item['generation'] + 1))
+        items[item['reviewId'], item['originalId']] = dict(item, generation=item['generation'] + 1)
+    cwd = Path(run['cwd'])
     scope = set(scope_files(run))
     kept = []
     for key in sorted(items, key=lambda key: (key[0], natural_id_key(key[1]))):
         item = items[key]
-        path = Path(run['cwd']) / item['file']
-        if item['file'] not in scope:
+        try:
+            path = safe_relative(cwd, item['file'])
+        except (Failure, OSError, ValueError, RuntimeError):
+            path = None
+        if path is None or str(path.relative_to(cwd)) not in scope:
             skipped['outOfScope'] += 1
         # 対象範囲と同じくリンク自体をファイルとして扱い、切れたリンクも存在するとみなす。
         elif not path.is_symlink() and not path.exists():
@@ -1670,12 +1688,7 @@ def prompts(args, root, run):
         save_json(directory / 'prompts.json', result)
     except BaseException as error:
         # 生成失敗では確認回数と台帳のイテレーションを進めない。
-        for path, original in originals.items():
-            try:
-                write_atomic(path, original)
-            except BaseException as rollback_error:
-                # ほかの復元も試み、生成時の例外を呼び出し元へ返す。
-                error.__notes__ = [*getattr(error, '__notes__', []), f'{display_path(str(path))}: {rollback_error}']
+        restore_state(originals, [], error)
         raise
     return result
 
@@ -2936,21 +2949,7 @@ def archive(args, root, run):
                 continue
             replaced.append(file)
     except BaseException as error:
-        # 更新したファイルだけを戻す。1つの復元に失敗しても残りを続け、元のエラーに追記する。
-        for file in replaced:
-            try:
-                if originals[file] is None:
-                    file.unlink()
-                else:
-                    write_atomic(file, originals[file])
-            except BaseException as rollback_error:
-                error.__notes__ = [*getattr(error, '__notes__', []), f'{display_path(str(file))}: {rollback_error}']
-        for directory in reversed(created):
-            try:
-                if directory.is_dir() and not any(directory.iterdir()):
-                    directory.rmdir()
-            except BaseException as rollback_error:
-                error.__notes__ = [*getattr(error, '__notes__', []), f'{display_path(str(directory))}: {rollback_error}']
+        restore_state({file: originals[file] for file in replaced}, created, error)
         raise
     return {'files': [str(target / name) for name, data in files.items() if data is not None], 'carryMeta': meta}
 
